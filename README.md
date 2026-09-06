@@ -6,6 +6,12 @@ A dsh plugin: maintains "working topic memory" as an [OKF (Open Knowledge Format
 
 > **Requires dsh >= 0.1.2-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
 
+## Demo
+
+The full flow in about four minutes: topics captured, distilled, and injected in a real session.
+
+https://github.com/user-attachments/assets/8c06cc98-b1ed-402b-9110-4f9a93eb15bc
+
 ## The problem it solves
 
 Long sessions forget. Cross-session, even more so. This plugin maintains **structured topic memory**: each Topic records a matter's **name, dependencies, open questions, current conclusion, impact, and recommendations**. When a conclusion changes, edit the file and commit — `git log` directly answers "when, by whom, and why did this conclusion change".
