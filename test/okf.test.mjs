@@ -147,6 +147,17 @@ test('bodyLinkSlugs: wikilinks + markdown links → graph edges', () => {
   assert.deepEqual(bodyLinkSlugs(body).sort(), ['dsh-cron-panel', 'dsh-cron-定时', 'dsh-dcp', 'dsh-plugin-api', '发版流程'])
 })
 
+test('bodyLinkSlugs: inline code and fenced blocks never mint edges', () => {
+  const body = [
+    '真引用 [[real-target]]。',
+    '示例语法 `[[wikilink]]` 与 `[x](not-an-edge.md)` 是行内代码。',
+    '```md',
+    '嵌在代码块里的 [[fenced-phantom]] 也不算。',
+    '```',
+  ].join('\n')
+  assert.deepEqual(bodyLinkSlugs(body), ['real-target'])
+})
+
 test('normalizeLinkTarget: 边界形态', () => {
   assert.equal(normalizeLinkTarget('foo'), 'foo')
   assert.equal(normalizeLinkTarget('foo.md'), 'foo')

@@ -484,7 +484,11 @@ export class TopicsService {
       type: 'Topic',
       title: input.title,
       tags: dedupeLower(input.tags ?? existing?.fm.tags ?? []),
-      depends: (input.depends ?? existing?.fm.depends ?? []).map(okf.slugToPath),
+      // normalizeDependsEntry, never bare slugToPath: the preserved-on-update
+      // fallback feeds already-canonical `topics/<slug>.md` entries back in,
+      // and wrapping those again stacked one layer per save (the double-wrap
+      // bug repaired on startup by BundleStore.repairDepends).
+      depends: dedupePaths((input.depends ?? existing?.fm.depends ?? []).map(okf.normalizeDependsEntry)),
       open_questions: input.openQuestions ?? existing?.fm.open_questions ?? [],
       impact: input.impact ?? existing?.fm.impact ?? [],
       status: input.status ?? existing?.fm.status ?? 'draft',
@@ -573,6 +577,17 @@ function dedupeLower(tags: string[]): string[] {
     if (key === '' || seen.has(key)) continue
     seen.add(key)
     out.push(key)
+  }
+  return out
+}
+
+function dedupePaths(paths: string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const p of paths) {
+    if (p === '' || seen.has(p)) continue
+    seen.add(p)
+    out.push(p)
   }
   return out
 }

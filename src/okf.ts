@@ -254,9 +254,43 @@ export function slugToPath(slug: string): string {
   return `topics/${slug}.md`
 }
 
-/** Bundle-relative paths of `depends` entries that point at topics. */
+/**
+ * Strip every `topics/` (or `topics:` — a colon form the wild has produced)
+ * prefix and `.md` suffix. The canonical depends entry carries exactly one
+ * of each, but bundles written by the save path that re-wrapped preserved
+ * values (fixed in the same release) can carry any number — idempotent by
+ * construction.
+ */
+export function unwrapTopicRef(raw: string): string {
+  let t = raw.trim()
+  for (;;) {
+    if (t.startsWith('topics/')) t = t.slice('topics/'.length)
+    else if (t.startsWith('topics:')) t = t.slice('topics:'.length)
+    else break
+  }
+  while (t.endsWith('.md')) t = t.slice(0, -3)
+  return t
+}
+
+/**
+ * Canonical bundle-relative path for a `depends` entry, accepting every form
+ * the wild has produced: bare slug (`foo`), canonical path (`topics/foo.md`),
+ * multi-wrapped (`topics/topics/foo.md.md`). Idempotent. A value that still
+ * carries a path separator or scheme after unwrapping is not a bundle-internal
+ * topic reference and comes back as its unwrapped self (a dead edge for the
+ * graph, but never re-wrapped into a fake one); the empty string means the
+ * entry unwrapped to nothing and should be dropped by the caller.
+ */
+export function normalizeDependsEntry(raw: string): string {
+  const t = unwrapTopicRef(raw)
+  if (t === '') return ''
+  if (t.includes('/') || t.includes(':')) return t
+  return slugToPath(t)
+}
+
+/** Topic slugs referenced by `depends`, tolerant of wrapped entries. */
 export function dependsSlugs(fm: { depends: readonly string[] }): string[] {
-  return fm.depends.map(pathToSlug)
+  return fm.depends.map(unwrapTopicRef)
 }
 
 export interface IndexEntry {
@@ -312,15 +346,20 @@ export function normalizeLinkTarget(target: string): string | undefined {
  * Topic slugs referenced from a body: `[[wikilinks]]` (with optional
  * `#heading` / `|alias`) plus markdown links pointing at bundle paths.
  * These are the human-authored edges alongside `depends` — both feed the
- * retrieval graph walk and the backlinks index.
+ * retrieval graph walk and the backlinks index. Inline code and fenced
+ * code blocks are stripped first: topics that document link syntax would
+ * otherwise mint permanent phantom edges out of their own examples.
  */
 export function bodyLinkSlugs(body: string): string[] {
   const out = new Set<string>()
-  for (const m of body.matchAll(WIKILINK)) {
+  const prose = body
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/`[^`\n]*`/g, '')
+  for (const m of prose.matchAll(WIKILINK)) {
     const slug = normalizeLinkTarget(m[1])
     if (slug !== undefined) out.add(slug)
   }
-  for (const m of body.matchAll(MD_LINK)) {
+  for (const m of prose.matchAll(MD_LINK)) {
     const slug = normalizeLinkTarget(m[1])
     if (slug !== undefined) out.add(slug)
   }

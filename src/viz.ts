@@ -11,6 +11,7 @@
  */
 
 import type { RetrievableTopic } from './retrieval.ts'
+import { unwrapTopicRef } from './okf.ts'
 
 export interface VizNode {
   id: string
@@ -51,7 +52,9 @@ export function buildGraph(roster: readonly RetrievableTopic[]): VizGraph {
   }
   for (const topic of roster) {
     for (const dep of topic.depends) {
-      const target = dep.replace(/^topics\//, '').replace(/\.md$/, '')
+      // unwrapTopicRef, not a single strip: pre-repair bundles can carry
+      // multi-wrapped depends entries, which would render a dead node here.
+      const target = unwrapTopicRef(dep)
       addEdge(topic.slug, target, 'depends')
     }
     for (const link of topic.links ?? []) addEdge(topic.slug, link, 'link')

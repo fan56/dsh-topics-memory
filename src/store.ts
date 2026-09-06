@@ -77,6 +77,21 @@ async function atomicWrite(file: string, content: string): Promise<void> {
   await rename(tmp, file)
 }
 
+function dedupePaths(paths: readonly string[]): string[] {
+  const seen = new Set<string>()
+  const out: string[] = []
+  for (const p of paths) {
+    if (p === '' || seen.has(p)) continue
+    seen.add(p)
+    out.push(p)
+  }
+  return out
+}
+
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i])
+}
+
 export interface BundleStoreOptions {
   /** Override the stamped actor (tests). Defaults to `agent:dsh-topics-memory@<host>`. */
   actor?: string
@@ -146,7 +161,8 @@ export class BundleStore {
     }
   }
 
-  /** Create the directory skeleton, git repo, and initial index (idempotent). */
+  /** Create the directory skeleton, git repo, initial index, and repair
+   * wrapped depends entries left by older save paths (idempotent). */
   async ensure(): Promise<void> {
     await mkdir(this.topicsDir(), { recursive: true })
     await mkdir(this.metaDir(), { recursive: true })
@@ -156,6 +172,7 @@ export class BundleStore {
     if (!(await existsSync(join(this.root, 'index.md')))) {
       await this.enqueue(() => this.regenerateIndex())
     }
+    await this.repairDepends()
   }
 
   /** Repo initialized and not gitDisabled. */
@@ -232,6 +249,45 @@ export class BundleStore {
 
   async exists(slug: string): Promise<boolean> {
     return existsSync(this.topicPath(slug))
+  }
+
+  /**
+   * Upgrade repair for bundles written by the save path that stacked another
+   * `topics/….md` wrap onto preserved-on-update depends entries, leaving
+   * multi-wrapped references (`topics/topics/foo.md.md`) whose edges resolve
+   * to nothing. Unwraps in place behind the write queue, regenerates the
+   * derived files, and lands the result as one traceable commit; file
+   * rewrites happen even without git, the commit just doesn't. Idempotent —
+   * every clean startup re-scans and finds nothing to change.
+   */
+  private async repairDepends(): Promise<void> {
+    await this.enqueue(async () => {
+      let files: string[]
+      try {
+        files = await readdir(this.topicsDir())
+      } catch {
+        return
+      }
+      const changed: string[] = []
+      for (const f of files) {
+        if (!f.endsWith('.md') || f === 'index.md') continue
+        const file = join(this.topicsDir(), f)
+        let doc: okf.TopicDoc
+        try {
+          doc = okf.parseTopicDoc(await readFile(file, 'utf8'))
+        } catch {
+          continue // broken files are status()'s business, not the repair's
+        }
+        const normalized = dedupePaths(doc.fm.depends.map(okf.normalizeDependsEntry))
+        if (sameStrings(normalized, doc.fm.depends)) continue
+        doc.fm.depends = normalized
+        await atomicWrite(file, okf.serializeTopicDoc(doc))
+        changed.push(`topics/${f}`)
+      }
+      if (changed.length === 0) return
+      await this.regenerateIndex()
+      await this.commit([...changed, 'index.md'], `topics(migrate): repair wrapped depends entries in ${changed.length} topic file(s)`)
+    })
   }
 
   /** First free slug: `foo`, then `foo-2`, `foo-3`, … */
@@ -575,12 +631,18 @@ export class BundleStore {
 
   async setConflicts(paths: readonly string[]): Promise<void> {
     await this.enqueue(async () => {
-      if (paths.length === 0) {
+      // Only topic files belong here: a rebase can also conflict on meta
+      // sidecars (observations.jsonl is appended on both machines), and
+      // storing those leaked non-topic paths into the conflicts mark, where
+      // /topics status displayed them as if they were topics and the demote
+      // gate keyed on slugs that can never exist.
+      const topics = [...new Set(paths.filter((p) => /^topics\/.+\.md$/.test(p)))]
+      if (topics.length === 0) {
         await atomicWrite(this.conflictsPath(), '[]\n')
       } else {
-        await atomicWrite(this.conflictsPath(), `${JSON.stringify([...paths], null, 2)}\n`)
+        await atomicWrite(this.conflictsPath(), `${JSON.stringify(topics, null, 2)}\n`)
       }
-      await this.commit(['meta/conflicts.json'], `topics(meta): mark ${paths.length} conflicted topic(s)`)
+      await this.commit(['meta/conflicts.json'], `topics(meta): mark ${topics.length} conflicted topic(s)`)
     })
   }
 

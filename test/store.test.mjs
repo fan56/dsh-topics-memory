@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BundleStore } from '../lib/store.js'
@@ -155,6 +155,20 @@ test('store: conflicts set/clear with slug normalization', async () => {
     assert.deepEqual([...(await store.getConflicts())].sort(), ['a', 'b'])
     await store.setConflicts([])
     assert.equal((await store.getConflicts()).size, 0)
+  } finally {
+    cleanup()
+  }
+})
+
+test('store: setConflicts drops non-topic paths (meta sidecar leak)', async () => {
+  const { store, cleanup } = tmpStore()
+  try {
+    await store.ensure()
+    // A rebase can conflict on meta sidecars; only topic files may be marked.
+    await store.setConflicts(['topics/a.md', 'meta/observations.jsonl', 'index.md'])
+    assert.deepEqual(await store.getConflicts(), new Set(['a']))
+    const raw = JSON.parse(readFileSync(join(store.root, 'meta', 'conflicts.json'), 'utf8'))
+    assert.deepEqual(raw, ['topics/a.md'])
   } finally {
     cleanup()
   }
