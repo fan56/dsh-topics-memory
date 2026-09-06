@@ -10,15 +10,17 @@ A dsh plugin: maintains "working topic memory" as an [OKF (Open Knowledge Format
 
 Long sessions forget. Cross-session, even more so. This plugin maintains **structured topic memory**: each Topic records a matter's **name, dependencies, open questions, current conclusion, impact, and recommendations**. When a conclusion changes, edit the file and commit — `git log` directly answers "when, by whom, and why did this conclusion change".
 
-## Why this plugin exists — the author's stance on memory
+## Why this plugin exists: memory is edited, not accumulated
 
-**More memory is not better memory.** The default assumption of most "memory" tools — record everything, retrieve more — is exactly backwards for LLMs. Model attention is finite: a giant memory bank dilutes it on every single turn, and plenty of wrong *process* memories will steer the model into wrong decisions. This plugin bets the other way:
+The short version: **more memory is not better memory.**
 
-- **Memory is about quality, and quality is editorial.** The unit of long-term memory is a **topic**: a topic records the **question that started it, the conclusion reached, its impact, and the topics it may depend on**. **The process is not important** — process belongs to the session and should be let go when the session ends; only distilled conclusions earn a place in the bundle.
-- **Short-term memory is the session's job.** Conversation context already covers it; a "memory" that feeds the session back to the model is noise.
-- **Long-term memory should be topic-shaped: LLM-friendly.** Small, structured, git-traceable, injected in budgeted slices: the hot path is LLM-free lexical matching (milliseconds), capped at ≤300 tokens per topic and ≤1.5k per turn, zero matches = zero injection — the design goal is **the minimum high-value context per turn**, not maximum recall.
+Most memory tools assume accumulation — record everything, retrieve broadly. That may work for humans; for LLMs it backfires twice over. Model attention is a finite resource, so a giant memory bank means every turn is spent digging for signal in noise. Worse, process memories hoard intermediate judgments that were right once and wrong later — and they will confidently steer the model into bad decisions.
 
-The pipeline is therefore an **editorial** one: sessions produce atomic observations, a background lane distills them into topics, and only topics (question, conclusion, impact, dependencies) are ever injected. What the model sees is what a competent colleague would have briefed it with — not the meeting recording.
+So this plugin takes a hard editorial line on what deserves to be remembered: **a topic records exactly four things — the question that started it, the conclusion it reached, what it impacts, and what it depends on. Everything in between — the discussion, the dead ends, the wrong turns — is deliberately not memory.** Process belongs to the session; when the session ends, it goes. Only conclusions that survive distillation make it into the bundle.
+
+Short-term memory is the session's own job — the conversation context already is one, and a plugin that feeds it back is noise. Long-term memory belongs to topics: small, structured, git-traceable, injected in budgeted slices with zero hits meaning zero injection. Every turn hands the model the **minimum high-value context**, not the biggest warehouse.
+
+This plugin is not trying to be the model's notebook. It is trying to be the model's editor: deciding what is worth keeping — and, more importantly, what should be forgotten.
 
 ## Core features
 
