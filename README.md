@@ -10,6 +10,16 @@ A dsh plugin: maintains "working topic memory" as an [OKF (Open Knowledge Format
 
 Long sessions forget. Cross-session, even more so. This plugin maintains **structured topic memory**: each Topic records a matter's **name, dependencies, open questions, current conclusion, impact, and recommendations**. When a conclusion changes, edit the file and commit — `git log` directly answers "when, by whom, and why did this conclusion change".
 
+## Why this plugin exists — the author's stance on memory
+
+**More memory is not better memory.** The default assumption of most "memory" tools — record everything, retrieve more — is exactly backwards for LLMs. Model attention is finite: a giant memory bank dilutes it on every single turn, and plenty of wrong *process* memories will steer the model into wrong decisions. This plugin bets the other way:
+
+- **Memory is about quality, and quality is editorial.** The unit of long-term memory is a **topic**: a topic records the **question that started it, the conclusion reached, its impact, and the topics it may depend on**. **The process is not important** — process belongs to the session and should be let go when the session ends; only distilled conclusions earn a place in the bundle.
+- **Short-term memory is the session's job.** Conversation context already covers it; a "memory" that feeds the session back to the model is noise.
+- **Long-term memory should be topic-shaped: LLM-friendly.** Small, structured, git-traceable, injected in budgeted slices: the hot path is LLM-free lexical matching (milliseconds), capped at ≤300 tokens per topic and ≤1.5k per turn, zero matches = zero injection — the design goal is **the minimum high-value context per turn**, not maximum recall.
+
+The pipeline is therefore an **editorial** one: sessions produce atomic observations, a background lane distills them into topics, and only topics (question, conclusion, impact, dependencies) are ever injected. What the model sees is what a competent colleague would have briefed it with — not the meeting recording.
+
 ## Core features
 
 - **Strict OKF v0.2 compliance**: each Topic is a `markdown + YAML frontmatter` concept document (`type: Topic`) that the whole OKF ecosystem (Obsidian, OKF validators) can consume directly; ships with the provenance (`sources`), trust (`generated`/`verified`), and lifecycle (`status`/`stale_after`) field families.
@@ -30,7 +40,7 @@ Long sessions forget. Cross-session, even more so. This plugin maintains **struc
 
 | Model tools | Purpose |
 |---|---|
-| `topic_save` | Distill/revise a Topic (name / dependencies / open questions / conclusion / impact / recommendations) |
+| `topic_save` | Save/revise a Topic (name / dependencies / open questions / conclusion / impact / recommendations) |
 | `topic_observe` | Jot an atomic observation (decision/finding/constraint/question), pending distill |
 | `topic_search` | LLM-free keyword search over memory |
 | `topic_history` | A topic's conclusion change history (git log as a tool) |
