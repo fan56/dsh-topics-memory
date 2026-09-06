@@ -1,7 +1,7 @@
 {
   "name": "@aiwayds/dsh-topics-memory",
   "version": "0.6.0",
-  "description": "dsh-plugin: quality-first topic memory for dsh — a topic keeps the starting question, conclusion, impact and dependencies, not the process; local-first git-traced OKF bundle, budgeted LLM-free injection",,
+  "description": "dsh-plugin: quality-first topic memory for dsh — a topic keeps the starting question, conclusion, impact and dependencies, not the process; local-first git-traced OKF bundle, budgeted LLM-free injection",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
