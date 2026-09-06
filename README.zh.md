@@ -6,6 +6,12 @@
 
 > **要求 dsh >= 0.1.2-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
 
+## 演示
+
+约 4 分钟的完整流程：topic 沉淀、蒸馏、注入在真实会话里跑起来。
+
+https://github.com/user-attachments/assets/6e9b346d-2ec9-4148-ae62-7087797d3188
+
 ## 它解决什么问题
 
 长会话会失忆，跨会话更会。本插件维护一份**结构化的 topic 记忆**：每个 Topic 记录一件事的**名字、依赖、未决问题、目前结论、影响、建议**。结论变了就改文件、打 commit——`git log` 直接回答「这个结论什么时候、被谁、为什么改的」。
