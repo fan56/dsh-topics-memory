@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.12.0 (2026-09-08)
+
+统计/状态类命令输出全面 markdown 表格化（TUI 对含 GFM 分隔行的命令输出自动切 Markdown 渲染，`/topics list` 的表格已在 0.11.0 验证渲染效果）：
+
+- **`/topics list` 加 `#` 序号列 + 最新优先 + 100 条封顶**：表头变 `| # | Slug | 标题 | 状态 | 标签 | 更新 |`；排序从 slug 序改为 `generated.at` 降序（store 每次写 topic 都重盖该戳，即更新时间；同戳以 slug 稳定）；超过 100 条只显示最新 100 行，末尾以「… 其余 N 个更早的 Topic 未显示（/topics show \<slug\> 直达）」提示，总数仍在表头。
+- **`/topics status` 表格化**：`字段/值` 两列表，复合行（draft/stable/deprecated、注入参数、蒸馏路由）语义不变；路径头行与条件行（最近蒸馏 / 上次推送 / 同步错误）保留，仅出错时出现的行仍条件出现。
+- **`/topics stats` 表格化**：概览指标进 `指标/值` 表（hit rate、零命中轮、平均命中、预算占用、慢道参与轮、指针打开率、回声抑制，条件行照旧条件出现）；Top-N（Slug/注入次数）与 Near-miss 分布（分数段/次数）各自成表；调参 hint 保留在表外。
+- **`/topics history` 表格化**：`Hash/时间/变更/当时的结论` 四列表，无结论以 — 占位，`└` 次行结构并入结论列。
+- **`/topics config` 表格化**：`配置项/值` 两列表，键名仍是 displayKey（kebab-case）。
+- `/topics show`（文档阅读页）、`/topics graph`（HTML 关系图）、onboard 向导与操作类结果不表格化——它们不是统计清单。
+- 测试 262 → 263：list 序号/最新序/截断+溢出提示（102 条夹具，1ms 间隔保证 generated.at 严格递增），status/stats/history 断言随新格式重写。
+
 ## 0.11.0 (2026-09-08)
 
 注入价值审计落地（2026-09-08 审计：40% 有帮助率，三大发现各对应一项修复）：

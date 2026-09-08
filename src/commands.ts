@@ -114,18 +114,17 @@ function fail(text: string): CommandResult {
 async function renderStatus(service: TopicsService): Promise<string> {
   const s = await service.store.status()
   const cfg = service.cfg
-  const lines = [
-    `dsh-topics-memory @ ${s.root}`,
-    `  模式：${service.githubMode ? `github（${cfg.repo}）` : 'local-only'}`,
-    `  Topics：${s.topicCount}（draft ${s.byStatus.draft} / stable ${s.byStatus.stable} / deprecated ${s.byStatus.deprecated}）`,
-    `  观察积压：${s.observationsPending} 未蒸馏 / ${s.observationsTotal} 总量`,
-    `  冲突：${s.conflicts.length === 0 ? '无' : s.conflicts.join('、')}`,
-    `  损坏文件：${s.broken.length === 0 ? '无' : s.broken.join('、')}`,
-    `  git：${s.git ? `是（HEAD ${s.head?.slice(0, 10) ?? '??'}）` : '否'}`,
-    `  注入：${cfg.autoInject ? `${cfg.injectMode === 'digest' ? 'digest' : 'pointer'} 模式（topK ${cfg.topK}，预算 ${cfg.injectMode === 'digest' ? cfg.totalBudget : Math.min(cfg.totalBudget, 600)} tok，阈值 ${cfg.matchThreshold}）` : '关'}`,
-    `  去重：${cfg.injectDedup ? '开（同会话已注入的 Topic 不重注）' : '关'}`,
-    `  慢道：${cfg.qualityLane === 'off' ? '关' : cfg.qualityLane === 'always' ? `每轮（${cfg.distillProvider}/${cfg.distillModel}）` : `采样 1/3（${cfg.distillProvider}/${cfg.distillModel}）`}`,
-    `  蒸馏：${cfg.distillProvider !== '' && cfg.distillModel !== '' ? `${cfg.distillProvider}/${cfg.distillModel}，每 ${cfg.distillEveryTurns} 轮` : '未配置模型（/topics set distill-provider / distill-model）'}`,
+  const rows: [string, string][] = [
+    ['模式', service.githubMode ? `github（${cell(cfg.repo)}）` : 'local-only'],
+    ['Topics', `${s.topicCount}（draft ${s.byStatus.draft} / stable ${s.byStatus.stable} / deprecated ${s.byStatus.deprecated}）`],
+    ['观察积压', `${s.observationsPending} 未蒸馏 / ${s.observationsTotal} 总量`],
+    ['冲突', s.conflicts.length === 0 ? '无' : s.conflicts.map((c) => cell(c)).join('、')],
+    ['损坏文件', s.broken.length === 0 ? '无' : s.broken.map((b) => cell(b)).join('、')],
+    ['git', s.git ? `是（HEAD ${s.head?.slice(0, 10) ?? '??'}）` : '否'],
+    ['注入', cfg.autoInject ? `${cfg.injectMode === 'digest' ? 'digest' : 'pointer'} 模式（topK ${cfg.topK}，预算 ${cfg.injectMode === 'digest' ? cfg.totalBudget : Math.min(cfg.totalBudget, 600)} tok，阈值 ${cfg.matchThreshold}）` : '关'],
+    ['注入去重', cfg.injectDedup ? '开（同会话已注入的 Topic 不重注）' : '关'],
+    ['慢道', cfg.qualityLane === 'off' ? '关' : cfg.qualityLane === 'always' ? `每轮（${cfg.distillProvider}/${cfg.distillModel}）` : `采样 1/3（${cfg.distillProvider}/${cfg.distillModel}）`],
+    ['蒸馏', cfg.distillProvider !== '' && cfg.distillModel !== '' ? `${cfg.distillProvider}/${cfg.distillModel}，每 ${cfg.distillEveryTurns} 轮` : '未配置模型（/topics set distill-provider / distill-model）'],
   ]
   // Last lane outcome (distill-state summary) — what "checkable via
   // /topics status" promises; absent until the first run of this bundle.
@@ -136,13 +135,19 @@ async function renderStatus(service: TopicsService): Promise<string> {
         ? `标记 ${String(lastRun.marked ?? 0)} 条观察`
         : `失败（${String(lastRun.reason ?? 'unknown')}）`
     const gc = typeof lastRun.gcDropped === 'number' && lastRun.gcDropped > 0 ? `，GC 回收 ${lastRun.gcDropped}` : ''
-    lines.push(`  最近蒸馏：${outcome}${gc} @ ${String(lastRun.at ?? '').slice(0, 19).replace('T', ' ')}`)
+    rows.push(['最近蒸馏', `${outcome}${gc} @ ${cell(String(lastRun.at ?? '').slice(0, 19).replace('T', ' '))}`])
   }
   if (service.sync !== undefined) {
-    lines.push(`  上次推送：${service.sync.lastPushAt ?? '从未'}`)
-    if (service.sync.lastError !== '') lines.push(`  同步错误：${service.sync.lastError.split('\n').at(-1)}`)
+    rows.push(['上次推送', cell(String(service.sync.lastPushAt ?? '从未'))])
+    if (service.sync.lastError !== '') rows.push(['同步错误', cell(service.sync.lastError.split('\n').at(-1) ?? '')])
   }
-  return lines.join('\n')
+  return [
+    `dsh-topics-memory @ ${s.root}`,
+    '',
+    '| 字段 | 值 |',
+    '| --- | --- |',
+    ...rows.map(([k, v]) => `| ${k} | ${v} |`),
+  ].join('\n')
 }
 
 /**
@@ -178,9 +183,13 @@ async function renderStats(service: TopicsService): Promise<string> {
   if (records.length === 0) return '还没有注入记录 —— 用起来之后这里会有 hit rate / top-N / near-miss 分布。'
   const lines = [
     `注入统计（最近 ${records.length} 轮）：`,
-    `  hit rate：${(stats.hitRate * 100).toFixed(1)}%（${stats.injectedRounds}/${stats.rounds} 轮注入）`,
-    `  零命中轮：${stats.zeroHitRounds}；平均命中 ${stats.avgHitsPerRound} 条/轮`,
-    `  平均预算占用：${stats.avgBudgetUtilization} tok`,
+    '',
+    '| 指标 | 值 |',
+    '| --- | --- |',
+    `| hit rate | ${(stats.hitRate * 100).toFixed(1)}%（${stats.injectedRounds}/${stats.rounds} 轮注入） |`,
+    `| 零命中轮 | ${stats.zeroHitRounds} |`,
+    `| 平均命中 | ${stats.avgHitsPerRound} 条/轮 |`,
+    `| 平均预算占用 | ${stats.avgBudgetUtilization} tok |`,
   ]
   // v4 lane split — how much of the injection traffic each lane carries.
   const slowRounds = records.filter((r) => r.lane === 'slow' || r.lane === 'mixed').length
@@ -193,7 +202,7 @@ async function renderStats(service: TopicsService): Promise<string> {
         .sort((a, b) => a - b)
       medianLag = `，赶上中位时延 ${(lags[Math.floor(lags.length / 2)] / 1000).toFixed(1)}s`
     }
-    lines.push(`  慢道参与轮：${slowRounds}（快 ${(records.length - slowRounds)} / 慢或混合 ${slowRounds}${medianLag}）`)
+    lines.push(`| 慢道参与轮 | ${slowRounds}（快 ${records.length - slowRounds} / 慢或混合 ${slowRounds}${medianLag}） |`)
   }
   // Pointer open rate (v4 §4.3): topic_open calls vs pointer entries injected.
   // Echoed hits ride the retrieval but never became pointers — excluded here.
@@ -207,21 +216,21 @@ async function renderStats(service: TopicsService): Promise<string> {
       0,
     )
     const rate = entries === 0 ? 0 : Math.min(1, opens.length / entries)
-    lines.push(`  指针打开率：${(rate * 100).toFixed(1)}%（${opens.length} 次 topic_open / ${entries} 条注入指针）`)
+    lines.push(`| 指针打开率 | ${(rate * 100).toFixed(1)}%（${opens.length} 次 topic_open / ${entries} 条注入指针） |`)
   }
   const echoedCount = records.reduce((acc, r) => acc + (r.echoed?.length ?? 0), 0)
   if (echoedCount > 0) {
-    lines.push(`  回声抑制：${echoedCount} 次（本会话蒸馏出的 topic 不回注）`)
+    lines.push(`| 回声抑制 | ${echoedCount} 次（本会话蒸馏出的 topic 不回注） |`)
   }
   if (stats.topTopics.length > 0) {
-    lines.push('  Top-N 被注入 Topic：')
-    for (const t of stats.topTopics.slice(0, 5)) lines.push(`    ${t.slug} ×${t.count}`)
+    lines.push('', 'Top-N 被注入 Topic：', '', '| Slug | 注入次数 |', '| --- | --- |')
+    for (const t of stats.topTopics.slice(0, 5)) lines.push(`| \`${cell(t.slug)}\` | ${t.count} |`)
   }
   if (stats.nearMissHistogram.length > 0) {
-    lines.push('  Near-miss 分布（低于阈值或被结构门挡下）：')
-    for (const b of stats.nearMissHistogram) lines.push(`    ${b.bucket}: ${b.count}`)
+    lines.push('', 'Near-miss 分布（低于阈值或被结构门挡下）：', '', '| 分数段 | 次数 |', '| --- | --- |')
+    for (const b of stats.nearMissHistogram) lines.push(`| ${cell(b.bucket)} | ${b.count} |`)
     const hint = tuningHint(stats, service.cfg.matchThreshold)
-    if (hint !== undefined) lines.push(`  💡 ${hint}`)
+    if (hint !== undefined) lines.push('', `💡 ${hint}`)
   }
   return lines.join('\n')
 }
@@ -237,19 +246,31 @@ export function tuningHint(stats: ReturnType<typeof aggregateStats>, threshold: 
   return undefined
 }
 
+/** /topics list caps the table at this many newest topics. */
+const LIST_LIMIT = 100
+
 async function renderList(service: TopicsService): Promise<string> {
   const metas = await service.store.listTopics()
   if (metas.length === 0) return 'Bundle 里还没有 Topic —— 在会话里让我记点什么，或 /topics set 配置好蒸馏。'
-  metas.sort((a, b) => a.slug.localeCompare(b.slug))
+  // Newest first, capped: with a large bundle the table is for scanning
+  // recent work, not an exhaustive roster — /topics show <slug> reaches any
+  // topic the cap hides. (store.ts re-stamps generated.at on every topic
+  // write, so it IS the updated-at time; the slug tiebreak keeps same-stamp
+  // rows stable.)
+  metas.sort((a, b) => b.generatedAt.localeCompare(a.generatedAt) || a.slug.localeCompare(b.slug))
+  const shown = metas.slice(0, LIST_LIMIT)
   const lines = [
-    `共 ${metas.length} 个 Topic：`,
+    `共 ${metas.length} 个 Topic（按最近更新排序）：`,
     '',
-    '| Slug | 标题 | 状态 | 标签 | 更新 |',
-    '| --- | --- | --- | --- | --- |',
+    '| # | Slug | 标题 | 状态 | 标签 | 更新 |',
+    '| --- | --- | --- | --- | --- | --- |',
   ]
-  for (const m of metas) {
+  shown.forEach((m, i) => {
     const tags = m.tags.length > 0 ? m.tags.map((t) => `#${cell(t)}`).join(' ') : '—'
-    lines.push(`| \`${cell(m.slug)}\` | ${cell(m.title)} | ${m.status} | ${tags} | ${cell(m.generatedAt.slice(0, 10))} |`)
+    lines.push(`| ${i + 1} | \`${cell(m.slug)}\` | ${cell(m.title)} | ${m.status} | ${tags} | ${cell(m.generatedAt.slice(0, 10))} |`)
+  })
+  if (metas.length > shown.length) {
+    lines.push('', `… 其余 ${metas.length - shown.length} 个更早的 Topic 未显示（/topics show <slug> 直达）。`)
   }
   return lines.join('\n')
 }
@@ -281,10 +302,15 @@ async function renderHistory(service: TopicsService, slug: string | undefined): 
   if (slug === undefined || slug === '') return fail('用法：/topics history <slug>')
   const { entries } = await service.history(slug, 30)
   if (entries.length === 0) return fail(`Topic “${slug}” 没有历史（不存在或 bundle 不是 git 仓库）`)
-  const lines = [`${slug} 的变更史（${entries.length} 条）：`]
+  const lines = [
+    `${slug} 的变更史（${entries.length} 条）：`,
+    '',
+    '| Hash | 时间 | 变更 | 当时的结论 |',
+    '| --- | --- | --- | --- |',
+  ]
   for (const e of entries) {
-    lines.push(`  ${e.hash} ${e.date.slice(0, 19).replace('T', ' ')} ${e.message}`)
-    if (e.conclusion !== undefined && e.conclusion !== '') lines.push(`      └ 结论当时：${e.conclusion}`)
+    const conclusion = e.conclusion !== undefined && e.conclusion !== '' ? cell(e.conclusion) : '—'
+    lines.push(`| \`${cell(e.hash)}\` | ${cell(e.date.slice(0, 19).replace('T', ' '))} | ${cell(e.message)} | ${conclusion} |`)
   }
   return ok(lines.join('\n'))
 }
@@ -341,9 +367,14 @@ async function doSync(service: TopicsService, direction: string | undefined): Pr
 }
 
 function renderConfig(cfg: TopicsConfigValue): string {
-  const lines = ['当前配置：']
+  const lines = [
+    '当前配置：',
+    '',
+    '| 配置项 | 值 |',
+    '| --- | --- |',
+  ]
   for (const key of CONFIG_KEYS) {
-    lines.push(`  ${displayKey(key)} = ${String(cfg[key])}`)
+    lines.push(`| ${displayKey(key)} | ${cell(String(cfg[key]))} |`)
   }
   return lines.join('\n')
 }

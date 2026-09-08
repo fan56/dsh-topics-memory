@@ -89,9 +89,9 @@ test('command: status shows mode, counts, injection settings', async () => {
     const r = await cmd.handler(inv('status'))
     assert.equal(r.kind, 'success')
     assert.match(r.text, /local-only/)
-    assert.match(r.text, /Topics：0/)
+    assert.match(r.text, /\| Topics \| 0（draft 0/)
     assert.match(r.text, /topK 4/)
-    assert.match(r.text, /去重：开/)
+    assert.match(r.text, /\| 注入去重 \| 开/)
   } finally {
     cleanup()
   }
@@ -108,7 +108,7 @@ test('command: stats empty vs populated + list + show', async () => {
     await service.store.appendInjectionRecord({ at: 't', queryTokenCount: 3, rosterSize: 1, hits: [{ slug: 'alpha-topic', score: 1.2, reasons: [], viaGraph: false }], nearMisses: [], injected: true, usedTokens: 120 })
     const stats = await cmd.handler(inv('stats'))
     assert.match(stats.text, /100\.0%/)
-    assert.match(stats.text, /alpha-topic ×1/)
+    assert.match(stats.text, /\| `alpha-topic` \| 1 \|/)
     const list = await cmd.handler(inv('list'))
     assert.match(list.text, /alpha topic/)
     const show = await cmd.handler(inv('show alpha-topic'))
@@ -120,7 +120,7 @@ test('command: stats empty vs populated + list + show', async () => {
   }
 })
 
-test('command: list renders a markdown table (sort, tags, escaping)', async () => {
+test('command: list renders a markdown table (newest first, index, tags, escaping)', async () => {
   const { service, mutate, cleanup } = makeService()
   try {
     await service.store.ensure()
@@ -130,19 +130,50 @@ test('command: list renders a markdown table (sort, tags, escaping)', async () =
     const r = await cmd.handler(inv('list'))
     assert.equal(r.kind, 'success')
     assert.match(r.text, /共 2 个 Topic/)
-    assert.match(r.text, /\| Slug \| 标题 \| 状态 \| 标签 \| 更新 \|/)
-    assert.match(r.text, /\| --- \| --- \| --- \| --- \| --- \|/)
-    const rows = r.text.split('\n').filter((l) => l.startsWith('| `'))
+    assert.match(r.text, /\| # \| Slug \| 标题 \| 状态 \| 标签 \| 更新 \|/)
+    assert.match(r.text, /\| --- \| --- \| --- \| --- \| --- \| --- \|/)
+    const rows = r.text.split('\n').filter((l) => /^\| \d+ \|/.test(l))
     assert.equal(rows.length, 2)
-    // Exact rows: slug sort order, pipes in title escaped, tags lowercased,
-    // date-only stamp. (Regex literals would need every `|` escaped — exact
-    // strings pin the rendering harder.)
+    // Exact rows: newest first (alpha was saved last), 1-based index, pipes
+    // in title escaped, tags lowercased, date-only stamp. (Regex literals
+    // would need every `|` escaped — exact strings pin the rendering harder.)
     const dateOf = (slug) => service.store.listTopics().then((ms) => ms.find((m) => m.slug === slug).generatedAt.slice(0, 10))
-    assert.equal(rows[0], `| \`alpha-topic\` | alpha topic | draft | — | ${await dateOf('alpha-topic')} |`)
-    assert.equal(rows[1], `| \`bravo-beta\` | bravo \\| beta | draft | #x #y | ${await dateOf('bravo-beta')} |`)
+    assert.equal(rows[0], `| 1 | \`alpha-topic\` | alpha topic | draft | — | ${await dateOf('alpha-topic')} |`)
+    assert.equal(rows[1], `| 2 | \`bravo-beta\` | bravo \\| beta | draft | #x #y | ${await dateOf('bravo-beta')} |`)
     assert.doesNotMatch(r.text, /T\d{2}:/)
   } finally {
     cleanup()
+  }
+})
+
+test('command: list caps the table at 100 newest with an overflow notice', async () => {
+  const { service, mutate, cleanup } = makeService()
+  try {
+    await service.store.ensure()
+    for (let i = 0; i < 102; i++) {
+      await service.saveTopic({ title: `bulk topic ${i}`, conclusion: `c${i}` })
+      // generated.at is millisecond-precision; a 1ms stagger guarantees the
+      // newest-first order the exact-row assertions below rely on (the slug
+      // tiebreak sorts bulk-topic-10 before bulk-topic-2 lexicographically).
+      await new Promise((resolve) => setTimeout(resolve, 1))
+    }
+    const cmd = buildTopicsCommand(service, mutate)
+    const r = await cmd.handler(inv('list'))
+    assert.equal(r.kind, 'success')
+    assert.match(r.text, /共 102 个 Topic/)
+    const rows = r.text.split('\n').filter((l) => /^\| \d+ \|/.test(l))
+    assert.equal(rows.length, 100, 'exactly the cap: 100 data rows')
+    assert.ok(rows[0].startsWith(expectIndex(1)), `row 1 is the newest: ${rows[0]}`)
+    assert.ok(rows[99].startsWith(expectIndex(100)), `row 100 is the 100th newest: ${rows[99]}`)
+    assert.match(r.text, /其余 2 个更早的 Topic 未显示/)
+  } finally {
+    cleanup()
+  }
+
+  /** The expected table row prefix for the n-th newest bulk topic (slug bulk-topic-N). */
+  function expectIndex(n) {
+    const i = 102 - n
+    return `| ${n} | \`bulk-topic-${i}\` | bulk topic ${i} | draft | — | `
   }
 })
 
@@ -156,7 +187,7 @@ test('command: history works on git-backed bundle', async () => {
     const r = await cmd.handler(inv('history evolving'))
     assert.equal(r.kind, 'success')
     assert.match(r.text, /变更史/)
-    assert.match(r.text, /结论当时/)
+    assert.match(r.text, /当时的结论/)
   } finally {
     cleanup()
   }
