@@ -196,14 +196,22 @@ async function renderStats(service: TopicsService): Promise<string> {
     lines.push(`  慢道参与轮：${slowRounds}（快 ${(records.length - slowRounds)} / 慢或混合 ${slowRounds}${medianLag}）`)
   }
   // Pointer open rate (v4 §4.3): topic_open calls vs pointer entries injected.
+  // Echoed hits ride the retrieval but never became pointers — excluded here.
   const opens = await service.store.readOpenRecords()
   if (opens.length > 0 || records.some((r) => r.lane !== undefined)) {
     const entries = records.reduce(
-      (acc, r) => acc + r.hits.filter((h) => !(r.deduped ?? []).includes(h.slug)).length + (r.slow?.length ?? 0),
+      (acc, r) =>
+        acc +
+        r.hits.filter((h) => !(r.deduped ?? []).includes(h.slug) && !(r.echoed ?? []).includes(h.slug)).length +
+        (r.slow?.length ?? 0),
       0,
     )
     const rate = entries === 0 ? 0 : Math.min(1, opens.length / entries)
     lines.push(`  指针打开率：${(rate * 100).toFixed(1)}%（${opens.length} 次 topic_open / ${entries} 条注入指针）`)
+  }
+  const echoedCount = records.reduce((acc, r) => acc + (r.echoed?.length ?? 0), 0)
+  if (echoedCount > 0) {
+    lines.push(`  回声抑制：${echoedCount} 次（本会话蒸馏出的 topic 不回注）`)
   }
   if (stats.topTopics.length > 0) {
     lines.push('  Top-N 被注入 Topic：')

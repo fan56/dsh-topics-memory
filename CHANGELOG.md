@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.11.0 (2026-09-08)
+
+注入价值审计落地（2026-09-08 审计：40% 有帮助率，三大发现各对应一项修复）：
+
+- **修 `topic_open` 的 INVALID_TOOL_OUTPUT（审计发现 #2 的根因）**：宿主工具输出校验把任何含 undefined 值键的对象判为非 lossless JSON；无 description 的 topic 每次 open 都会报错（审计 ②⑦ 的实锤路径）。`openTopic` 现在省略而非以 undefined 传可选字段（description；`topic_history` 的 conclusion 同修），输出以宿主同款 `isJsonValue` 断言钉进测试。
+- **`topic_open` slug 归一化（审计 ⑨）**：指针渲染为 `(topics:<slug>)`，模型会整段复制回来当参数；现在经 `unwrapTopicRef` 解包（`topics:` / `topics/` / `.md` 均容错），open 流水记录干净 slug。
+- **蒸馏回声抑制（审计发现 #3，新配置 `suppress-echo`，默认 on）**：本会话蒸馏出的 topic 不再回注同会话——provenance 走 observations 日志的 `sessionId → distilledInto`（`TopicsService.echoSlugsSync`，mtime 缓存），快/慢两道都滤，ilog 新增 `echoed` 字段、Top-N 与指针打开率分母均不计回声，`/topics stats` 增「回声抑制」行。
+- **慢道 produce 侧排除已携带 slug（审计 dedup×2 空转的根源）**：`dispatch` 新增 `exclude`（会话已注入 ∪ 回声集），候选带先滤后切（过采样 6 补位）——旧路径会把注定被消费侧 dedup 吞掉的候选送进 rerank，白烧一次 aux 调用并产出一个必死的 pending。
+- **快慢双包修复**：消费轮中慢道 pick 若恰为快道命中，此前会打包成第二个重复块；现在计入慢道交付（`record.slow` 照记、lane 仍为 mixed）但不再重复渲染。
+- **慢道 ttl×1 归因（不改行为）**：pending 产出（turn/end）与下一 spliced 间隔超 10min TTL——交互间隙的正常硬界，非缺陷；过期已入 ilog（`slow-expired-ttl`）。
+- **`/topics list` 改 markdown 表格**：列 = Slug（反引号，可直接复制给 show/history）/ 标题 / 状态 / 标签 / 更新（仅日期）；单元格内 `|` 转义、换行拍平，仍按 slug 排序。
+- 测试 254 → 262：open 解包/lossless、history lossless、echoSlugsSync 分组与缓存重建、echo 过滤与 ilog、exclude 优先级、慢道 exclude 带过滤、双包单渲染、list 表格精确行断言。
+
 ## 0.10.0 (2026-09-08)
 
 退出/启动同步时机改造——消除宿主进出时最长可达数十秒的网络等待（实测本机 git 双程 8s + 退出蒸馏共享 90s 有界窗口）：

@@ -324,3 +324,63 @@ test('dedup: pointer mode budget drop keeps the same registry discipline', async
     h.cleanup()
   }
 })
+
+// ---------------------------------------------------------------------------
+// Echo suppression (2026-09 audit #3): a topic distilled from the CURRENT
+// session's own turns is a lagging echo of what the model already said —
+// it must not inject back into that session (suppressEcho, provenance via
+// the observations log: sessionId → distilledInto).
+// ---------------------------------------------------------------------------
+
+test('echo: echoSlugsSync groups distilledInto by session (mtime-cached)', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'topics-echo-'))
+  t.after(() => rmRetry(root))
+  const store = new BundleStore(root)
+  await store.ensure()
+  const service = new TopicsService(store, () => ({ ...DEFAULT_CFG }))
+  await service.saveTopic(TOPIC_A)
+  const o1 = await store.appendObservation({ kind: 'turn', source: 'auto', sessionId: 's1', text: '用户: a\n助手: b' })
+  await store.appendObservation({ kind: 'turn', source: 'auto', sessionId: 's2', text: '用户: c\n助手: d' })
+  await store.markDistilled([o1.id], [SLUG_A])
+  assert.deepEqual([...service.echoSlugsSync('s1')], [SLUG_A])
+  assert.deepEqual([...service.echoSlugsSync('s2')], [], 'other sessions have no echo set')
+  assert.deepEqual([...service.echoSlugsSync('s3')], [], 'unknown sessions have no echo set')
+  // New distill lands → mtime changes → cache rebuilds.
+  const o2 = await store.appendObservation({ kind: 'turn', source: 'auto', sessionId: 's2', text: '用户: e\n助手: f' })
+  await store.markDistilled([o2.id], [SLUG_A])
+  assert.deepEqual([...service.echoSlugsSync('s2')], [SLUG_A], 'cache rebuilds after the log rewrite')
+})
+
+test('echo: echo-filtered hits never pack and log record.echoed', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'topics-echo-svc-'))
+  t.after(() => rmRetry(root))
+  const store = new BundleStore(root)
+  await store.ensure()
+  const service = new TopicsService(store, () => ({ ...DEFAULT_CFG }))
+  await service.saveTopic(TOPIC_A)
+  const r = service.retrieveSync(QUERY_A, 's1', { echo: new Set([SLUG_A]) })
+  assert.equal(r.text, '')
+  assert.deepEqual(r.echoed, [SLUG_A])
+  assert.deepEqual(r.included, [])
+  assert.deepEqual(r.deduped, [], 'echo is reported separately from dedup')
+  const records = await readRecords(store, 1)
+  const rec = records[records.length - 1]
+  assert.deepEqual(rec.echoed, [SLUG_A])
+  // Other topics in the same round are unaffected.
+  const other = service.retrieveSync(QUERY_A, 's1', { echo: new Set(['totally-unrelated-topic']) })
+  assert.deepEqual(other.included, [SLUG_A])
+  assert.deepEqual(other.echoed, [])
+})
+
+test('echo: exclude wins when a slug is both deduped and echoed', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'topics-echo-both-'))
+  t.after(() => rmRetry(root))
+  const store = new BundleStore(root)
+  await store.ensure()
+  const service = new TopicsService(store, () => ({ ...DEFAULT_CFG }))
+  await service.saveTopic(TOPIC_A)
+  const r = service.retrieveSync(QUERY_A, 's1', { exclude: new Set([SLUG_A]), echo: new Set([SLUG_A]) })
+  assert.equal(r.text, '')
+  assert.deepEqual(r.deduped, [SLUG_A])
+  assert.deepEqual(r.echoed, [])
+})

@@ -261,7 +261,19 @@ export function buildTopicTools(service: TopicsService) {
     },
     async execute(args) {
       const { entries } = await service.history(args.slug, args.limit ?? 20)
-      return { entries: entries.map((e) => ({ ...e, conclusion: e.conclusion as string | undefined })) }
+      // conclusion is omitted, never present-as-undefined — the host rejects
+      // undefined-valued keys as non-lossless JSON (INVALID_TOOL_OUTPUT).
+      return {
+        entries: entries.flatMap((e) => {
+          const entry: { hash: string; date: string; message: string; conclusion?: string } = {
+            hash: e.hash,
+            date: e.date,
+            message: e.message,
+          }
+          if (typeof e.conclusion === 'string') entry.conclusion = e.conclusion
+          return [entry]
+        }),
+      }
     },
   })
 

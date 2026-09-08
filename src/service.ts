@@ -48,6 +48,8 @@ export interface SlowDelivery {
 
 export class TopicsService {
   private cache = new Map<string, CacheEntry>()
+  /** mtime-keyed parse of the observations log, grouped by session. */
+  private echoCache: { mtimeMs: number; size: number; bySession: Map<string, Set<string>> } | undefined
   readonly store: BundleStore
   private readonly getConfig: () => TopicsConfigValue
   readonly sync?: Sync
@@ -116,6 +118,55 @@ export class TopicsService {
   /** Drop the roster cache (tests, bulk external edits). */
   invalidate(): void {
     this.cache.clear()
+    this.echoCache = undefined
+  }
+
+  /**
+   * Slugs distilled from THIS session's own turns — the echo set (2026-09
+   * audit finding #3: a topic distilled from in-session knowledge injected
+   * back into the same session is a lagging echo of what the model already
+   * said, occasionally stale enough to contradict the newer in-session
+   * conclusion). Provenance is durable in the observations log: each line
+   * carries `sessionId` and, once distilled, `distilledInto`. Sync read on
+   * the injection hot path, mtime-cached like the roster.
+   */
+  echoSlugsSync(sessionId: string): Set<string> {
+    const file = join(this.store.metaDir(), 'observations.jsonl')
+    let st
+    try {
+      st = statSync(file)
+    } catch {
+      return new Set()
+    }
+    let bySession = this.echoCache
+    if (bySession === undefined || bySession.mtimeMs !== st.mtimeMs || bySession.size !== st.size) {
+      bySession = { mtimeMs: st.mtimeMs, size: st.size, bySession: new Map() }
+      try {
+        const lines = readFileSync(file, 'utf8').split('\n')
+        for (const line of lines) {
+          if (line.trim() === '') continue
+          let obs: { sessionId?: unknown; distilled?: unknown; distilledInto?: unknown }
+          try {
+            obs = JSON.parse(line)
+          } catch {
+            continue // torn tail line
+          }
+          if (obs.distilled !== true || typeof obs.sessionId !== 'string' || !Array.isArray(obs.distilledInto)) continue
+          let set = bySession.bySession.get(obs.sessionId)
+          if (set === undefined) {
+            set = new Set()
+            bySession.bySession.set(obs.sessionId, set)
+          }
+          for (const slug of obs.distilledInto) {
+            if (typeof slug === 'string' && slug !== '') set.add(okf.slugify(slug))
+          }
+        }
+      } catch {
+        return new Set() // unreadable log: fail open (no suppression)
+      }
+      this.echoCache = bySession
+    }
+    return bySession.bySession.get(sessionId) ?? new Set()
   }
 
   /**
@@ -183,17 +234,21 @@ export class TopicsService {
    *
    * `dedup.exclude` (session-level injection dedup) filters hits AND slow
    * picks before assembly; excluded slugs are reported back as `deduped`
-   * (and logged as `record.deduped`), never packed. `included` mirrors the
-   * fast pointers that entered the context and `slowIncluded` the slow ones
-   * — only these may be marked as injected by the caller; budget-dropped
-   * slugs stay injectable later.
+   * (and logged as `record.deduped`), never packed. `dedup.echo` (蒸馏回声,
+   * v4 audit) filters the same way but reports separately as `echoed` /
+   * `record.echoed`: slugs distilled from THIS session's own turns.
+   * `included` mirrors the fast pointers that entered the context and
+   * `slowIncluded` the slow ones — only these may be marked as injected by
+   * the caller; budget-dropped slugs stay injectable later.
    *
    * `slow` (v4 §4.2) carries the consumed pending when one exists: picks are
    * packed after the fast pointers under the same budget, take log-only
    * shadow re-gate verdicts against the CURRENT query (B3: record, never
-   * block), and fill the record's lane field family.
+   * block), and fill the record's lane field family. A pick the fast lane
+   * already delivers THIS round is counted as slow-delivered (it entered the
+   * context) but not packed twice.
    */
-  retrieveSync(query: string, sessionId?: string, dedup?: { exclude?: ReadonlySet<string> }, slow?: SlowDelivery, slowExpired?: 'ttl' | 'turn-lag'): { text: string; outcome: SearchOutcome; deduped: string[]; included: string[]; slowIncluded: string[] } {
+  retrieveSync(query: string, sessionId?: string, dedup?: { exclude?: ReadonlySet<string>; echo?: ReadonlySet<string> }, slow?: SlowDelivery, slowExpired?: 'ttl' | 'turn-lag'): { text: string; outcome: SearchOutcome; deduped: string[]; echoed: string[]; included: string[]; slowIncluded: string[] } {
     const cfg = this.cfg
     const roster = this.rosterSync()
     const empty: SearchOutcome = { hits: [], nearMisses: [], rosterSize: roster.length }
@@ -224,7 +279,7 @@ export class TopicsService {
         }
         void this.store.appendInjectionRecord(trace).catch(() => undefined)
       }
-      return { text: '', outcome: empty, deduped: [], included: [], slowIncluded: [] }
+      return { text: '', outcome: empty, deduped: [], echoed: [], included: [], slowIncluded: [] }
     }
     const conflicts = this.store.getConflictsSync()
     const outcome = searchTopics(query, roster, {
@@ -236,12 +291,18 @@ export class TopicsService {
       conflicts,
     })
     const exclude = dedup?.exclude
+    const echo = dedup?.echo
     const deduped = exclude === undefined ? [] : outcome.hits.filter((h) => exclude.has(h.slug)).map((h) => h.slug)
+    const echoed: string[] = []
     const bySlug = new Map(roster.map((r) => [r.slug, r]))
     const entries: DigestInput[] = []
     const unreadable: string[] = []
     for (const hit of outcome.hits) {
       if (exclude?.has(hit.slug)) continue
+      if (echo?.has(hit.slug)) {
+        echoed.push(hit.slug)
+        continue
+      }
       const doc = this.readDocSync(hit.slug)
       if (doc === undefined) {
         // The hit has no readable doc — without this accounting it used to
@@ -264,8 +325,19 @@ export class TopicsService {
           if (!deduped.includes(item.slug)) deduped.push(item.slug)
           continue
         }
+        if (echo?.has(item.slug)) {
+          if (!echoed.includes(item.slug)) echoed.push(item.slug)
+          continue
+        }
         const meta = bySlug.get(item.slug)
         if (meta === undefined) continue // vanished between production and consumption
+        if (entries.some((e) => e.slug === item.slug)) {
+          // The fast lane delivers the same slug THIS round — the content
+          // enters the context exactly once (never packed twice), and the
+          // pick still counts as delivered for the lane bookkeeping.
+          slowDelivered.push({ slug: item.slug, why: item.why })
+          continue
+        }
         const verdict = scoreTopic(queryTokens, meta, {
           threshold: cfg.matchThreshold,
           topK: cfg.topK,
@@ -313,6 +385,7 @@ export class TopicsService {
     }
     if (sessionId !== undefined) record.sessionId = sessionId
     if (deduped.length > 0) record.deduped = deduped
+    if (echoed.length > 0) record.echoed = echoed
     if (unreadable.length > 0) {
       record.dropped = [...(record.dropped ?? []), ...unreadable.map((slug) => ({ slug, reason: 'doc-unreadable' }))]
     }
@@ -347,7 +420,7 @@ export class TopicsService {
     if (slowExpired !== undefined && injection.text === '') record.lane = 'slow'
     if (injection.dropped.length > 0) record.dropped = [...(record.dropped ?? []), ...injection.dropped]
     void this.store.appendInjectionRecord(record).catch(() => undefined)
-    return { text: injection.text, outcome, deduped, included: injection.included, slowIncluded }
+    return { text: injection.text, outcome, deduped, echoed, included: injection.included, slowIncluded }
   }
 
   /**
@@ -356,7 +429,7 @@ export class TopicsService {
    * the store stamps it on every write, so it IS the last-updated instant).
    * Logs an open record for the pointer-open-rate stat.
    */
-  async openTopic(slug: string, sessionId?: string): Promise<{
+  async openTopic(rawSlug: string, sessionId?: string): Promise<{
     found: boolean
     slug: string
     title?: string
@@ -367,24 +440,44 @@ export class TopicsService {
     openQuestions?: string[]
     recommendations?: string
   }> {
-    const doc = await this.store.readTopic(slug).catch(() => undefined)
+    // Pointers render slugs as `(topics:<slug>)` and models copy that whole
+    // token back as the argument — unwrap every `topics:`/`topics/` wrap the
+    // same way the depends edges do (audit ⑨: the wrapped form read as a
+    // missing topic).
+    const slug = okf.unwrapTopicRef(rawSlug)
+    const doc = slug === '' ? undefined : await this.store.readTopic(slug).catch(() => undefined)
     if (doc === undefined) return { found: false, slug }
     // Awaited (tool path, not hot): a settled write makes the pointer-open
     // stat reliable; a failed log write must not fail the tool.
     await this.store
       .appendOpenRecord({ slug, at: new Date().toISOString(), ...(sessionId !== undefined ? { sessionId } : {}) })
       .catch(() => undefined)
-    return {
+    // Optional fields are OMITTED, never present-as-undefined: the host's
+    // tool-output validation rejects any object carrying an undefined-valued
+    // key as non-lossless JSON (INVALID_TOOL_OUTPUT; audit ②⑦ — topics
+    // without a description made every open of them fail).
+    const found: {
+      found: boolean
+      slug: string
+      title: string
+      status: okf.TopicStatus
+      updatedAt: string
+      description?: string
+      conclusion: string
+      openQuestions: string[]
+      recommendations: string
+    } = {
       found: true,
       slug,
       title: doc.fm.title,
       status: doc.fm.status,
       updatedAt: doc.fm.generated.at,
-      description: doc.fm.description,
       conclusion: okf.sectionOf(doc.body, okf.CONCLUSION_HEADING) ?? '',
       openQuestions: doc.fm.open_questions,
       recommendations: okf.sectionOf(doc.body, okf.RECOMMENDATIONS_HEADING) ?? '',
     }
+    if (doc.fm.description !== undefined) found.description = doc.fm.description
+    return found
   }
 
   /** Sync roster read (same mtime cache as roster()). */

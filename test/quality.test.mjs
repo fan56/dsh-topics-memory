@@ -183,6 +183,27 @@ test('slow lane: model errors are contained — no pending, no throw', async (t)
   assert.equal(lane.hasInFlight('s1'), false)
 })
 
+test('slow lane: dispatch exclude keeps already-carried slugs out of the band', async (t) => {
+  const { service, cleanup } = tmpService({ qualityLane: 'always' })
+  t.after(cleanup)
+  await service.store.ensure()
+  await service.saveTopic({ title: 'Echo Marker QX7QZ', conclusion: 'exists.' })
+  const lane = new SlowLane(service, fakeCaller())
+  // The only candidate is already carried by the session (injected earlier /
+  // echo) → empty band after filtering, no rerank spent, no pending: the old
+  // behavior produced a pending that the consumption-side dedup silently
+  // swallowed (2026-09 audit: 2 dead slow rounds).
+  lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3, exclude: new Set(['echo-marker-qx7qz']) })
+  await waitMs(50)
+  assert.equal(lane.hasPending('s1'), false, 'fully-excluded band produces no pending')
+  assert.equal(lane.hasInFlight('s1'), false)
+  // An unrelated exclude set must not block the pick.
+  lane.dispatch('s2', { ring: [ringEntry('u', 'a')], turnId: 3, exclude: new Set(['some-other-topic']) })
+  await waitPending(lane, 's2')
+  const consumed = lane.consume('s2', 4)
+  assert.ok(consumed !== undefined && 'pending' in consumed, 'unrelated exclusion leaves the band intact')
+})
+
 test('slow lane: rerank picks are validated against the candidate band', async (t) => {
   const { service, cleanup } = tmpService({ qualityLane: 'always' })
   t.after(cleanup)
@@ -284,8 +305,12 @@ test('retrieveSync: lane is mixed when both lanes deliver; expired pending is vi
     ms: 1,
   })
   assert.ok(r.text.includes('Echo Marker QX7QZ'))
-  assert.deepEqual(r.slowIncluded, ['echo-marker-qx7qz'])
+  // The pick rides the fast pointer this round: content enters exactly once,
+  // never as a duplicated second block (fast/slow double-pack fix).
   assert.deepEqual(r.included, ['echo-marker-qx7qz'])
+  assert.deepEqual(r.slowIncluded, [], 'fast-covered pick is not packed twice')
+  assert.equal((r.text.match(/\(topics:echo-marker-qx7qz[ )]/g) ?? []).length, 1, 'one pointer header only')
+  assert.ok(!r.text.includes('为什么相关'), 'no slow-why line when the fast pointer carries it')
   let records = []
   for (let i = 0; i < 100; i += 1) {
     records = await service.store.readInjectionRecords()
@@ -294,7 +319,7 @@ test('retrieveSync: lane is mixed when both lanes deliver; expired pending is vi
   }
   const rec = records.find((x) => x.lane === 'mixed')
   assert.notEqual(rec, undefined)
-  assert.equal(rec.slow.length, 1)
+  assert.equal(rec.slow.length, 1, 'fast-covered pick still counts as slow-delivered')
   // Expired pending, no fast hits: injected=false, why carries the reason.
   service.retrieveSync('完全无关的火锅菜谱', 's1', undefined, undefined, 'ttl')
   let recs = []

@@ -14,6 +14,11 @@ export const TopicsConfig = z.object({
   autoInject: z.boolean().default(true),
   /** Skip re-injecting topics already injected earlier in the same session. */
   injectDedup: z.boolean().default(true),
+  /** Skip re-injecting topics distilled from the CURRENT session's own turns
+   *  (蒸馏回声): the conversation already carries that knowledge, so a
+   *  pointer is a stale echo at best (2026-09 audit: 3 of 6 useless rounds).
+   *  Provenance rides the observations log (sessionId → distilledInto). */
+  suppressEcho: z.boolean().default(true),
   /** Max topics injected per round (ADR 0006: ≤4). */
   topK: z.number().default(4),
   /** Per-topic digest budget in tokens. */
@@ -61,6 +66,7 @@ export type TopicsConfigValue = {
   repo: string
   autoInject: boolean
   injectDedup: boolean
+  suppressEcho: boolean
   topK: number
   perTopicBudget: number
   totalBudget: number
@@ -86,6 +92,7 @@ export const CONFIG_KEYS = [
   'repo',
   'autoInject',
   'injectDedup',
+  'suppressEcho',
   'topK',
   'perTopicBudget',
   'totalBudget',
@@ -125,6 +132,7 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     }
     case 'autoInject':
     case 'injectDedup':
+    case 'suppressEcho':
     case 'autoObserve':
     case 'distillOnSessionEnd':
     case 'includeSubagents': {

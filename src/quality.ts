@@ -36,6 +36,8 @@ export const SAMPLED_EVERY = 3
 const RING_CHARS = 6000
 /** Candidate band size fed to the rerank. */
 const CANDIDATE_LIMIT = 6
+/** Over-fetch before the exclude filter, so excluded slugs don't thin the band. */
+const CANDIDATE_OVERFETCH = 6
 
 export const QUERY_BUILD_PROMPT = [
   '你是检索查询构建器。输入是最近几轮对话。任务：判断「模型此刻需要什么背景知识」，输出一个用于关键词检索的 query。',
@@ -70,6 +72,14 @@ export type ConsumeResult = { pending: PendingInjection } | { expired: 'ttl' | '
 export interface DispatchInput {
   ring: readonly RingEntry[]
   turnId: number
+  /**
+   * Slugs the session already carries — injected earlier this session or
+   * distilled from its own turns (echo). The candidate band drops them
+   * BEFORE the rerank: a pick the fast-lane dedup would silently swallow at
+   * consumption is a wasted aux call and a dead pending (2026-09 audit: 2 of
+   * the first 3 slow-lane outcomes died exactly this way).
+   */
+  exclude?: ReadonlySet<string>
 }
 
 /** Race `p` against a timeout; `onTimeout` fires so callers can abort upstream work. */
@@ -233,13 +243,16 @@ export class SlowLane {
       // candidates = threshold passers + the near-miss band beneath them.
       const band = searchTopics(query, roster, {
         threshold: this.service.cfg.matchThreshold,
-        topK: CANDIDATE_LIMIT,
+        topK: CANDIDATE_LIMIT + CANDIDATE_OVERFETCH,
         tagBoost: this.service.cfg.tagBoost,
         graphDepth: 0,
         recencyWindowDays: this.service.cfg.recencyWindowDays,
         structuralGate: false,
       })
-      const candidates = [...band.hits, ...band.nearMisses].slice(0, CANDIDATE_LIMIT)
+      const exclude = input.exclude
+      const candidates = [...band.hits, ...band.nearMisses]
+        .filter((c) => !exclude?.has(c.slug))
+        .slice(0, CANDIDATE_LIMIT)
       if (candidates.length === 0) return
       const bySlug = new Map(roster.map((r) => [r.slug, r]))
       const payload = candidates.flatMap((c) => {

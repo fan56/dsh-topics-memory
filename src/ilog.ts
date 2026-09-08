@@ -41,6 +41,8 @@ export interface InjectionRecord {
   dropped?: { slug: string; reason: string }[]
   /** Slugs blocked this round by session-level injection dedup (never assembled). */
   deduped?: string[]
+  /** Slugs blocked this round as 蒸馏回声 (distilled from this session's own turns). */
+  echoed?: string[]
   usedTokens?: number
   // ---- v4 lane field family (§4.3) — absent on pure fast-lane rounds ----
   /** fast = lexical pointers only; slow = async picks only; mixed = both. */
@@ -88,12 +90,14 @@ export function aggregateStats(records: readonly InjectionRecord[]): AggregateSt
       budgetSamples += 1
       budgetSum += r.usedTokens
     }
-    // topTopics feeds 「Top-N 被注入 Topic」— deduped hits were NOT injected,
-    // so they must not inflate the per-slug injection counts. Retrieval-shape
-    // metrics above (hits/rounds, zero-hit rounds) keep counting raw hits.
+    // topTopics feeds 「Top-N 被注入 Topic」— deduped/echoed hits were NOT
+    // injected, so they must not inflate the per-slug injection counts.
+    // Retrieval-shape metrics above (hits/rounds, zero-hit rounds) keep
+    // counting raw hits.
     const deduped = r.deduped === undefined ? undefined : new Set(r.deduped)
+    const echoed = r.echoed === undefined ? undefined : new Set(r.echoed)
     for (const h of r.hits) {
-      if (deduped?.has(h.slug)) continue
+      if (deduped?.has(h.slug) || echoed?.has(h.slug)) continue
       topicCounts.set(h.slug, (topicCounts.get(h.slug) ?? 0) + 1)
     }
     for (const nm of r.nearMisses) {

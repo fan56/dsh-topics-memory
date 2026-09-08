@@ -244,6 +244,7 @@ export function apply(ctx: Context): void {
       if (state === undefined) return
       const cfg = cfgNow()
       const seen = cfg.injectDedup ? injectedBySession.get(sessionId) : undefined
+      const echo = cfg.suppressEcho ? service.echoSlugsSync(sessionId) : undefined
       // Slow-lane consumption point (v4 生命周期表): the pending produced at
       // the previous turn/end rides THIS splice — consumed or expired, the
       // slot is gone either way (消费即清; expiry surfaces in record.why).
@@ -256,7 +257,7 @@ export function apply(ctx: Context): void {
           else slowExpired = consumed.expired
         }
       }
-      const r = service.retrieveSync(query, sessionId, seen === undefined ? undefined : { exclude: seen }, slow, slowExpired)
+      const r = service.retrieveSync(query, sessionId, seen === undefined && echo === undefined ? undefined : { exclude: seen, echo }, slow, slowExpired)
       // Mark only what entered the context this round (hits AND slow picks →
       // dedup filter → assemble → registry mark; budget-dropped slugs stay
       // injectable).
@@ -301,6 +302,18 @@ export function apply(ctx: Context): void {
       slowLane.dispatch(sessionId, {
         ring: observer.recentTurns(sessionId),
         turnId: observer.turnCountOf(sessionId),
+        // The lane must not spend its rerank on slugs this session already
+        // carries (injected earlier / distilled from its own turns) — such a
+        // pick is silently swallowed at consumption and the pending dies.
+        exclude: (() => {
+          const seen = injectedBySession.get(sessionId)
+          const echo = cfgNow().suppressEcho ? service.echoSlugsSync(sessionId) : undefined
+          if (seen === undefined || seen.size === 0) return echo
+          if (echo === undefined || echo.size === 0) return seen
+          const merged = new Set(seen)
+          for (const slug of echo) merged.add(slug)
+          return merged
+        })(),
       })
     } catch {
       // contained — the lane must never break the event handler
@@ -646,6 +659,7 @@ const DEFAULTS: TopicsConfigValue = {
   repo: '',
   autoInject: true,
   injectDedup: true,
+  suppressEcho: true,
   topK: 4,
   perTopicBudget: 300,
   totalBudget: 1500,

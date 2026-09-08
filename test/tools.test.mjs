@@ -167,3 +167,58 @@ test('retrieveSync: same-turn hot path is synchronous and logs fire-and-forget',
   assert.equal(records.filter((r) => r.injected).length, 1)
   assert.equal(records.filter((r) => !r.injected).length, 1)
 })
+
+// ---------------------------------------------------------------------------
+// 2026-09 audit fixes: slug prefix normalization + lossless output shape.
+// The host validates tool output against the declared schema and rejects any
+// object carrying an undefined-valued key as non-lossless JSON
+// (INVALID_TOOL_OUTPUT) — a topic without a description used to make every
+// topic_open of it fail.
+// ---------------------------------------------------------------------------
+
+test('tool topic_open: unwraps a topics:-prefixed slug and logs the clean slug', async (t) => {
+  const { service, cleanup } = tmpService()
+  t.after(cleanup)
+  await service.store.ensure()
+  const [save, open] = buildTopicTools(service)
+  await save.execute({ title: 'dsh-cron 定时插件', conclusion: '定时靠 headless + OS cron。' })
+  // Pointers render as `(topics:<slug>)`; models copy that whole token back.
+  const out = await open.execute({ slug: 'topics:dsh-cron-定时插件' })
+  assert.equal(out.found, true)
+  assert.equal(out.slug, 'dsh-cron-定时插件', 'response carries the clean slug')
+  assert.equal(out.conclusion, '定时靠 headless + OS cron。')
+  // Path and .md suffixes unwrap the same way; the open log records clean.
+  const out2 = await open.execute({ slug: 'topics/dsh-cron-定时插件.md' })
+  assert.equal(out2.found, true)
+  const opens = await service.store.readOpenRecords()
+  assert.deepEqual(opens.map((o) => o.slug), ['dsh-cron-定时插件', 'dsh-cron-定时插件'])
+})
+
+test('tool topic_open: output stays lossless when the topic has no description', async (t) => {
+  const { service, cleanup } = tmpService()
+  t.after(cleanup)
+  await service.store.ensure()
+  const [save, open] = buildTopicTools(service)
+  await save.execute({ title: 'no-desc-topic-AB1', conclusion: '结论自含。' })
+  const out = await open.execute({ slug: 'no-desc-topic-AB1' })
+  assert.equal(out.found, true)
+  assert.equal(!('description' in out), true, 'undefined description is omitted, never present-as-undefined')
+  // The exact check the host's tool-output validator runs.
+  const { isJsonValue } = await import('@deepseek-ai/dsh-util-values')
+  assert.equal(isJsonValue(out), true, 'tool output is lossless JSON (would otherwise be INVALID_TOOL_OUTPUT)')
+})
+
+test('tool topic_history: entries stay lossless (conclusion omitted when absent)', async (t) => {
+  const { service, cleanup } = tmpService()
+  t.after(cleanup)
+  await service.store.ensure()
+  const tools = buildTopicTools(service)
+  const save = tools[0]
+  const history = tools[4]
+  await save.execute({ title: 'hist-topic-CD2', conclusion: '第一版结论。' })
+  await save.execute({ title: 'hist-topic-CD2', slug: 'hist-topic-cd2', conclusion: '第二版结论。' })
+  const out = await history.execute({ slug: 'hist-topic-cd2' })
+  assert.ok(out.entries.length >= 2, 'both revisions listed')
+  const { isJsonValue } = await import('@deepseek-ai/dsh-util-values')
+  assert.equal(isJsonValue(out), true, 'history output is lossless JSON')
+})
