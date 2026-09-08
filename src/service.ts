@@ -443,8 +443,11 @@ export class TopicsService {
     // Pointers render slugs as `(topics:<slug>)` and models copy that whole
     // token back as the argument — unwrap every `topics:`/`topics/` wrap the
     // same way the depends edges do (audit ⑨: the wrapped form read as a
-    // missing topic).
-    const slug = okf.unwrapTopicRef(rawSlug)
+    // missing topic). Then CANONICALIZE with the save path's own slugify:
+    // unwrap alone is case-preserving, and on a case-sensitive filesystem
+    // (Linux bundles) an uppercase-carrying argument would miss the file the
+    // save path wrote under its folded slug (CI-caught, v0.11.0 round 1).
+    const slug = okf.slugify(okf.unwrapTopicRef(rawSlug))
     const doc = slug === '' ? undefined : await this.store.readTopic(slug).catch(() => undefined)
     if (doc === undefined) return { found: false, slug }
     // Awaited (tool path, not hot): a settled write makes the pointer-open

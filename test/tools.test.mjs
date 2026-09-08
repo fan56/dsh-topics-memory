@@ -202,6 +202,7 @@ test('tool topic_open: output stays lossless when the topic has no description',
   await save.execute({ title: 'no-desc-topic-AB1', conclusion: '结论自含。' })
   const out = await open.execute({ slug: 'no-desc-topic-AB1' })
   assert.equal(out.found, true)
+  assert.equal(out.slug, 'no-desc-topic-ab1', 'case-folded to the canonical slug (the save path wrote it folded; case-sensitive bundles miss otherwise)')
   assert.equal(!('description' in out), true, 'undefined description is omitted, never present-as-undefined')
   // The exact check the host's tool-output validator runs.
   const { isJsonValue } = await import('@deepseek-ai/dsh-util-values')
