@@ -93,7 +93,14 @@ export class Sync {
       await this.store.setConflicts(outcome.conflicted)
     }
     this.lastError = outcome.output.slice(-500)
-    return { ok: false, conflicted: conflictedSlugs, message: `rebase 冲突：${conflictedSlugs.join('、') || '未知路径'}（已标记降权，待手工解决）` }
+    // A rebase can fail without producing conflicted paths (identity missing,
+    // fetch failure, corrupt state) — surface the git output tail instead of
+    // the misleading 「未知路径」 so a headless failure is diagnosable.
+    if (conflictedSlugs.length === 0) {
+      const tail = outcome.output.trim().split('\n').slice(-3).join('；').slice(-200)
+      return { ok: false, conflicted: [], message: `rebase 失败（无冲突文件）：${tail !== '' ? tail : 'git 无输出'}` }
+    }
+    return { ok: false, conflicted: conflictedSlugs, message: `rebase 冲突：${conflictedSlugs.join('、')}（已标记降权，待手工解决）` }
   }
 
   /** Called after every write-through commit — schedules the debounced push. */

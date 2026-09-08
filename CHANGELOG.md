@@ -8,6 +8,7 @@
 - **启动补推**：`sync.pull()` 在 rebase 成功后检查 `unpushedCount`，>0 即补推——上一次退出推迟的 push 在这里落到远端；失败只记 `lastError`，由后续 debounced flush 或下次启动重试。
 - **启动补蒸馏（boot-replay）**：session-start 的 pull 链完成后检查未消化 observations，非空则请求一次蒸馏（`distiller.request` 新增 `boot-replay` 触发原因，含与 observer 回调同构的 trigger-time llm capture）；空池零开销，不健康的模型路由落 distill-state 失败记录。
 - 导出常量更名 `EXIT_DISTILL_TIMEOUT_MS` → `EXIT_COMMIT_TIMEOUT_MS`（90_000 → 10_000）。
+- **pullRebase 挂上兜底 git 身份**（补全 addAndCommit 已有的既定设计）：rebase 重放本地 commit 需要 committer 身份，无全局 git 配置的环境（CI、新机器）此前会在每次 pull 时失败且冲突列表为空；同时 `sync.pull` 失败信息在无冲突文件时携带 git 输出尾部（原「未知路径」不可诊断）。
 - 测试 251 → 254：退出 disposer 不等蒸馏（<慢模型时延即返回）、boot-replay 正（遗留被消化）/反（无积压不发请求）两例、pull 补推（本地领先 + 远端前进 → rebase 后一次推平）；harness 修正为驱动全部 session/event handler（apply 注册两个，此前只驱动第一个）。
 - 关联：`docs/design/2026-09-06-sync-robustness-unrelated-history-and-meta.md`（同步健壮性提案）与本次改动正交——该提案管「同步的正确性」（无关历史防御、meta 移出 git），本次管「同步的时机」；退出不再 pull 还顺带减少了 P1 所述静默 abort 死循环的触发点。
 

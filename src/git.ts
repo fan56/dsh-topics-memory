@@ -152,10 +152,13 @@ export interface PullOutcome {
  * `pull --rebase` with conflict containment: on conflict we abort the rebase
  * (ADR 0003 — no automatic smart merging) and report the conflicted paths so
  * the caller can mark those topics. Remote and branch are explicit — the
- * bundle never depends on upstream tracking config.
+ * bundle never depends on upstream tracking config. IDENTITY rides along:
+ * a rebase REPLAYS local commits, which requires a committer identity, and
+ * a fresh machine (CI, new host) may have none — without this the pull
+ * fails with an empty conflicted list on every session start.
  */
 export async function pullRebase(cwd: string, token?: string, remote = 'origin', branch = 'main'): Promise<PullOutcome> {
-  const r = await runGit(['pull', '--rebase', '--autostash', remote, branch], { cwd, token, mayFail: true, timeoutMs: 60_000 }).catch((e) => {
+  const r = await runGit([...IDENTITY, 'pull', '--rebase', '--autostash', remote, branch], { cwd, token, mayFail: true, timeoutMs: 60_000 }).catch((e) => {
     return { code: -1, stdout: '', stderr: String(e instanceof Error ? e.message : e) } satisfies GitResult
   })
   if (r.code === 0) return { ok: true, conflicted: [], output: r.stdout + r.stderr }
