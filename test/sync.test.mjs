@@ -7,6 +7,7 @@ import { execFileSync } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { BundleStore } from '../lib/store.js'
 import { Sync } from '../lib/sync.js'
+import { unpushedCount } from '../lib/git.js'
 
 function tmp() {
   const dir = mkdtempSync(join(tmpdir(), 'topics-sync-'))
@@ -120,6 +121,43 @@ test('sync: conflicting edit marks conflicted topics on pull', async () => {
     }
   } finally {
     work.cleanup()
+    rmSync(bare, { recursive: true, force: true })
+  }
+})
+
+test('sync: pull replays the push deferred by a local-only exit', async () => {
+  const work = tmp()
+  const bare = mkdtempSync(join(tmpdir(), 'topics-bare-'))
+  const other = mkdtempSync(join(tmpdir(), 'topics-other-'))
+  try {
+    const store = new BundleStore(work.dir)
+    await seed(store)
+    execFileSync('git', ['init', '--bare', '-b', 'main', join(bare, 'origin.git')], { stdio: 'pipe' })
+    const sync = new Sync(store, () => ({ repo: 'o/n', pushDebounceSeconds: 3600 }), async () => undefined, (repo) => join(bare, 'origin.git'))
+    // Land a base so the bare remote has main, then simulate the local-only
+    // exit: one further commit that never leaves the machine.
+    assert.equal((await sync.flush()).ok, true)
+    await store.saveTopic(
+      { slug: 'gamma', doc: { fm: { type: 'Topic', title: 'G', tags: [], depends: [], open_questions: [], impact: [], status: 'draft', generated: { by: 't', at: '2026-08-31T00:00:00Z' } }, body: 'g\n' } },
+      { message: 'gamma' },
+    )
+    assert.equal(await unpushedCount(work.dir), 1, 'the exit backlog sits unpushed')
+    // A second machine advances the remote past the base.
+    execFileSync('git', ['clone', join(bare, 'origin.git'), other], { stdio: 'pipe' })
+    writeFileSync(join(other, 'topics/beta.md'), '---\ntype: Topic\ntitle: B\n---\n', 'utf8')
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'add', '.'], { cwd: other, stdio: 'pipe' })
+    execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-m', 'beta'], { cwd: other, stdio: 'pipe' })
+    execFileSync('git', ['push'], { cwd: other, stdio: 'pipe' })
+    // The boot pull rebases onto beta AND replays the deferred push.
+    const pull = await sync.pull()
+    assert.equal(pull.ok, true, pull.message)
+    const head = execFileSync('git', ['rev-parse', 'origin/main'], { cwd: work.dir, encoding: 'utf8' }).trim()
+    const local = execFileSync('git', ['rev-parse', 'main'], { cwd: work.dir, encoding: 'utf8' }).trim()
+    assert.equal(head, local, 'the deferred push landed during pull')
+    assert.match(await readFile(join(work.dir, 'topics/beta.md'), 'utf8'), /title: B/)
+  } finally {
+    work.cleanup()
+    rmSync(other, { recursive: true, force: true })
     rmSync(bare, { recursive: true, force: true })
   }
 })

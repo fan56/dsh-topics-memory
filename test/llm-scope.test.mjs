@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { apply, settleBounded, EXIT_DISTILL_TIMEOUT_MS } from '../lib/index.js'
+import { apply, settleBounded, EXIT_COMMIT_TIMEOUT_MS } from '../lib/index.js'
 import { BundleStore } from '../lib/store.js'
 
 /** rm that tolerates an in-flight fire-and-forget write racing the cleanup. */
@@ -80,7 +80,11 @@ function bootPlugin(overrides = {}) {
   }
   apply(ctx)
   const onEvent = handlers[0]
-  const dispatch = (sessionId, type, data) => onEvent.call(undefined, { id: sessionId }, { type, data })
+  // apply() registers TWO session/event handlers (injection dispatch + sync
+  // lifecycle) — real hosts invoke every handler, so must the harness.
+  const dispatch = (sessionId, type, data) => {
+    for (const handler of handlers) handler.call(undefined, { id: sessionId }, { type, data })
+  }
   // Real teardown events carry payloads; the agent payload still owns its ctx
   // (scope unwind follows), which is exactly the capture the final distill uses.
   const dispose = (sessionId, type) => {
@@ -194,7 +198,7 @@ test('settleBounded: resolves as soon as the run settles; rejections are swallow
   await settleBounded(new Promise((r) => setTimeout(r, 30)), 60_000)
   assert.ok(Date.now() - start < 1000, 'a healthy run is awaited, not the cap')
   await settleBounded(Promise.reject(new Error('boom')), 60_000)
-  assert.equal(EXIT_DISTILL_TIMEOUT_MS, 90_000, 'the documented exit cap')
+  assert.equal(EXIT_COMMIT_TIMEOUT_MS, 10_000, 'the local-only exit commit cap')
 })
 
 test('settleBounded: caps a hanging run so exit never wedges', async () => {
@@ -214,20 +218,18 @@ test('settleBounded: caps a hanging run so exit never wedges', async () => {
   }
 })
 
-test('lifecycle: the effect disposer awaits the exit distill before resolving', async () => {
+test('lifecycle: the disposer commits locally and never waits for the exit distill', async () => {
   const h = bootPlugin({ ...CFG })
-  // Keep-alive: the 90s exit cap inside the disposer is unref'd (see the
-  // settleBounded test above); hold the loop open so the cap can fire in a
-  // harness whose otherwise-idle loop would exit before it.
-  const keepAlive = setInterval(() => {}, 50)
   try {
     const store = new BundleStore(h.root)
     await store.ensure()
     const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '观察一' })
     const llm = liveLlm(opFor('Exit Distill Topic', o1.id))
+    let streamCalls = 0
     const baseStream = llm.stream
     llm.stream = async function* (...args) {
-      await new Promise((r) => setTimeout(r, 150)) // a realistic slow model call
+      streamCalls += 1
+      await new Promise((r) => setTimeout(r, 150)) // a slow model call the exit must NOT wait for
       yield* baseStream(...args)
     }
     // The exit path triggers under the fake 'dispose' session id — its agent
@@ -239,12 +241,12 @@ test('lifecycle: the effect disposer awaits the exit distill before resolving', 
     const start = Date.now()
     await disposer()
     const elapsed = Date.now() - start
-    assert.ok(elapsed >= 140, `the disposer waited for the distill (elapsed=${elapsed}ms)`)
-    assert.ok(elapsed < 30_000, 'and it did not wedge on the cap')
-    assert.equal((await store.readDistillState())?.ok, true, 'the exit distill landed before dispose resolved')
-    assert.equal((await store.undistilledObservations()).length, 0)
+    // The trigger fired (a run was requested — it may or may not have STARTED
+    // streaming inside the race window) but the disposer resolved on the local
+    // meta commit, not on the model call. The observations stay durable in the
+    // meta sidecars either way, so the skipped run replays on the next boot.
+    assert.ok(elapsed < 140, `the disposer resolved without the distill (elapsed=${elapsed}ms)`)
   } finally {
-    clearInterval(keepAlive)
     h.cleanup()
   }
 })
@@ -306,6 +308,44 @@ test('lifecycle: the exit dispose trigger is skipped while a session-end run is 
     assert.equal(await store.readTopic('end-run-topic') !== undefined, true, 'its topic landed')
   } finally {
     clearInterval(keepAlive)
+    h.cleanup()
+  }
+})
+
+test('lifecycle: a fresh session replays undistilled observations left by a skipped exit', async () => {
+  const h = bootPlugin({ ...CFG })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // Backlog simulating the previous session's local-only exit: the
+    // observation is durable on disk but no run ever consumed it.
+    const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
+    const llm = liveLlm(opFor('Boot Replay Topic', o1.id))
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm } })
+    // session-start: sync.pull is a no-op in local-only CFG, then the replay
+    // check finds the backlog and requests one distill.
+    h.dispatch('s1', 'agent/session-start', undefined)
+    await waitFor(async () => (await store.readDistillState())?.ok === true, 'the boot-replay distill landed')
+    assert.equal((await store.undistilledObservations()).length, 0, 'the backlog was consumed')
+    assert.notEqual(await store.readTopic('boot-replay-topic'), undefined, 'its topic landed')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('lifecycle: a fresh session with no backlog requests no replay distill', async () => {
+  const h = bootPlugin({ ...CFG })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // No backlog: the replay check must find an empty pool and stay idle —
+    // a healthy boot must not spend a model call per session start.
+    assert.equal((await store.undistilledObservations()).length, 0)
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Nope', 'x')) } })
+    h.dispatch('s1', 'agent/session-start', undefined)
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal((await store.readDistillState()) ?? undefined, undefined, 'no distill run was requested')
+  } finally {
     h.cleanup()
   }
 })

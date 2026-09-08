@@ -39,13 +39,13 @@ import { isDelegated } from './delegation.ts'
 export const name = 'dsh-topics-memory'
 
 /**
- * Bounded wait for the process-exit distill. Session teardown is the last
- * distill trigger, but the disposer used to fire it fire-and-forget — process
- * exit always won the race and the run died unwritten. The disposer now waits
- * for the run, capped so a pathological (hanging) model call can never wedge
- * the host's exit.
+ * Bounded wait for the process-exit meta commit. The exit path is
+ * local-only: no pull/push, no model call — the deferred push rides the
+ * next boot's pull and the skipped exit distill is replayed there. The
+ * window only bounds the local `git commit` against a pathological stall
+ * (a wedged index.lock, a hung filesystem), which should never fire.
  */
-export const EXIT_DISTILL_TIMEOUT_MS = 90_000
+export const EXIT_COMMIT_TIMEOUT_MS = 10_000
 
 /**
  * Resolve when `p` settles (rejection swallowed) or after `ms`, whichever
@@ -368,10 +368,10 @@ export function apply(ctx: Context): void {
   const slowLane = new SlowLane(service, caller, releaseSessionLlm)
 
   // ---- Observer (M2) ----
-  // The process-exit disposer awaits this run (bounded): the callback below
-  // records it synchronously when the fake 'dispose' session's end trigger
-  // fires, so the disposer can wait for the last distill to land.
-  let exitDistill: Promise<DistillResult> | undefined
+  // Trigger runs are fire-and-forget everywhere now — including the exit
+  // one. Observations are write-through on disk, so a run the process exits
+  // under is never lost work: its input is still undistilled and the next
+  // boot's replay distills it.
   const observer = new Observer(service, (sessionId, reason) => {
     // Trigger-time capture: the agent is still registered here, so its scoped
     // ctx can hand over the llm instance whose adapters are live.
@@ -387,7 +387,6 @@ export function apply(ctx: Context): void {
     // and its own settle hook does the release.
     const run = distiller.request(sessionId, reason)
     if (run !== undefined) {
-      if (sessionId === 'dispose') exitDistill = run
       void run.finally(() => releaseSessionLlm(sessionId)).catch(() => undefined)
     }
   })
@@ -508,13 +507,37 @@ export function apply(ctx: Context): void {
     }) as never)
   }
 
-  // ---- Sync lifecycle: pull on session start, flush on dispose ----
+  // ---- Sync lifecycle: pull on session start, local commit on dispose ----
   ctx.on('session/event' as never, ((session: { id: unknown }, event: SessionEvent) => {
     if (event.type === 'agent/session-start') {
       void sync
         .pull()
         .catch(() => undefined)
         .finally(() => store.ensure().catch(() => undefined))
+        .then(() => {
+          // Boot replay: the observations JSONL is the durable distill queue.
+          // Whatever the previous exit skipped (local-only exit since the
+          // no-network exit commit) or a killed run left unmarked is still
+          // undistilled here. Empty pool and no-model are cheap no-ops inside
+          // the distiller; the per-session dedup guards double runs.
+          void store
+            .undistilledObservations(1)
+            .then((pending) => {
+              if (pending.length === 0) return
+              // Same trigger-time capture the observer callback does: the
+              // replay run's caller resolves candidates lazily and a fresh
+              // session has no prior capture to lean on.
+              try {
+                captureFromAgent(agents()?.get(session.id) as unknown)
+              } catch {
+                // contained — the run below fails with the readable
+                // no-adapter detail instead
+              }
+              const run = distiller.request(String(session.id), 'boot-replay')
+              if (run !== undefined) void run.catch(() => undefined)
+            })
+            .catch(() => undefined)
+        })
     }
   }) as never)
 
@@ -522,27 +545,24 @@ export function apply(ctx: Context): void {
     () => {
       void store.ensure().catch(() => undefined)
       // Async disposer: cordis awaits it during unload (Disposable may be
-      // async), so the exit distill gets its bounded window before the
-      // process goes away instead of always losing the exit race.
+      // async). The exit path is local-only — one git commit of the meta
+      // sidecars (observations / injection log / distill state), no pull, no
+      // push, no model call. The deferred push rides the next boot's pull
+      // (sync.pull replays it) and the skipped exit distill is replayed
+      // there too; both only ever needed the on-disk state, which the commit
+      // below makes durable before the process goes away.
       return () => {
         // A real session's session-end run (agent/disposed trigger, moments
         // earlier) may still be in flight — and the fake-'dispose' run would
         // feed the SAME global pool head to the model a second time (double
         // evaluation, double GC attempts). Skip the exit trigger while any
-        // run is pending; the bounded wait below then simply has nothing
-        // extra to await.
+        // run is pending; its capture is already write-through on disk.
         if (!distiller.hasAnyPending()) {
           observer.onSessionEvent('dispose', 'agent/disposed', undefined)
         }
         sync.dispose()
-        // The exit flush (final meta commit + ledger flush) rides the SAME
-        // bounded window as the exit distill — fire-and-forget here loses the
-        // exit race that window was built to win.
-        const exitFlush = sync.commitMeta().then(() => sync.flush()).catch(() => undefined)
-        return settleBounded(
-          exitDistill === undefined ? exitFlush : Promise.allSettled([exitDistill, exitFlush]),
-          EXIT_DISTILL_TIMEOUT_MS,
-        )
+        const exitFlush = sync.commitMeta().catch(() => undefined)
+        return settleBounded(exitFlush, EXIT_COMMIT_TIMEOUT_MS)
       }
     },
     'topics: lifecycle',

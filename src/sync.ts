@@ -51,7 +51,12 @@ export class Sync {
     return this.cfg().repo !== ''
   }
 
-  /** Session start (or `/topics sync pull`): rebase onto remote, mark conflicts. */
+  /**
+   * Session start (or `/topics sync pull`): rebase onto remote, mark
+   * conflicts, then replay any push the previous session's local-only exit
+   * deferred. The replay is best-effort — a failure just marks lastError and
+   * the debounced flush (or the next boot's pull) retries.
+   */
   async pull(): Promise<{ ok: boolean; conflicted: string[]; message: string }> {
     if (!this.active) return { ok: true, conflicted: [], message: 'local-only 模式，无同步' }
     const token = await this.safeToken()
@@ -66,6 +71,21 @@ export class Sync {
       // A successful rebase clears previous conflict marks.
       const prior = await this.store.getConflicts()
       if (prior.size > 0) await this.store.setConflicts([])
+      // Deferred-push replay: the previous exit committed locally only, so a
+      // successful rebase here is the moment the backlog lands on the remote.
+      try {
+        if ((await gitmod.unpushedCount(this.store.root)) > 0) {
+          const pushed = await gitmod.push(this.store.root, token)
+          if (pushed.ok) {
+            this.lastPushAt = new Date().toISOString()
+            this.lastError = ''
+          } else {
+            this.lastError = pushed.output.slice(-500)
+          }
+        }
+      } catch {
+        // pull must stay best-effort for the session-start caller
+      }
       return { ok: true, conflicted: [], message: '已与远端同步' }
     }
     const conflictedSlugs = outcome.conflicted.map((p) => p.replace(/^topics\//, '').replace(/\.md$/, ''))

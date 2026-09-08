@@ -161,8 +161,10 @@ export class Distiller {
    * caller can hook post-run cleanup — the per-session llm capture in
    * index.ts must live exactly as long as a run that may read it. `manual`
    * is the /topics distill trigger: same lane, same in-flight guard.
+   * `boot-replay` is the session-start backlog drain: a previous exit's
+   * skipped (or killed-mid-run) distill replays here.
    */
-  request(sessionId: string, reason: 'every-n' | 'session-end' | 'manual'): Promise<DistillResult> | undefined {
+  request(sessionId: string, reason: 'every-n' | 'session-end' | 'manual' | 'boot-replay'): Promise<DistillResult> | undefined {
     if (!this.configured) return undefined
     if (this.inFlight.has(sessionId)) return undefined
     const run = this.run(sessionId).finally(() => this.inFlight.delete(sessionId))

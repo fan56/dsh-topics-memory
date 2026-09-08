@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.10.0 (2026-09-08)
+
+退出/启动同步时机改造——消除宿主进出时最长可达数十秒的网络等待（实测本机 git 双程 8s + 退出蒸馏共享 90s 有界窗口）：
+
+- **退出路径本地化**：插件卸载的 disposer 不再执行 `flush()`（pull --rebase + push 全是网络），也不再有退出蒸馏的有界等待；只做一步**本地 meta commit**（observations / injections / distill-state 落盘），窗口从 `EXIT_DISTILL_TIMEOUT_MS = 90s` 收窄为 `EXIT_COMMIT_TIMEOUT_MS = 10s`（只防病理性 git 卡死，正常毫秒级）。被跳过的退出蒸馏改为 fire-and-forget——observations 本就是 write-through 落盘，跑不完也不丢活。
+- **启动补推**：`sync.pull()` 在 rebase 成功后检查 `unpushedCount`，>0 即补推——上一次退出推迟的 push 在这里落到远端；失败只记 `lastError`，由后续 debounced flush 或下次启动重试。
+- **启动补蒸馏（boot-replay）**：session-start 的 pull 链完成后检查未消化 observations，非空则请求一次蒸馏（`distiller.request` 新增 `boot-replay` 触发原因，含与 observer 回调同构的 trigger-time llm capture）；空池零开销，不健康的模型路由落 distill-state 失败记录。
+- 导出常量更名 `EXIT_DISTILL_TIMEOUT_MS` → `EXIT_COMMIT_TIMEOUT_MS`（90_000 → 10_000）。
+- 测试 251 → 254：退出 disposer 不等蒸馏（<慢模型时延即返回）、boot-replay 正（遗留被消化）/反（无积压不发请求）两例、pull 补推（本地领先 + 远端前进 → rebase 后一次推平）；harness 修正为驱动全部 session/event handler（apply 注册两个，此前只驱动第一个）。
+- 关联：`docs/design/2026-09-06-sync-robustness-unrelated-history-and-meta.md`（同步健壮性提案）与本次改动正交——该提案管「同步的正确性」（无关历史防御、meta 移出 git），本次管「同步的时机」；退出不再 pull 还顺带减少了 P1 所述静默 abort 死循环的触发点。
+
+## 0.9.0 (2026-09-06)
+
+- depends 双重包裹修复四件套：OKF `unwrapTopicRef` 容错解包（`topics/foo.md` / `[[foo]]` / 包裹一层的引用统一归一）、写路径归一化（`saveTopic`/distill create 落盘前剥包裹）、启动修复（`BundleStore.repairDepends` 扫描存量坏档并回填备份）、冲突标记过滤（`store.setConflicts` 只收 `topics/*.md`，git abort 抓到的 meta 路径不再入 `/topics status`）。
+- 检索注入的代码段剥离：inject/digest 渲染不再携带结论正文里的 fenced code block（压预算）。
+- 同步健壮性设计提案入库（`docs/design/2026-09-06-sync-robustness-unrelated-history-and-meta.md`，待拍板）。
+- 测试 240 → 251。
+
 ## 0.8.1 (2026-09-05)
 
 - 退出 flush 纳入有界窗口：卸载时的最终 meta 提交 + 账本 flush 此前是 fire-and-forget，会输给它本要赢的退出竞态；现在与退出蒸馏共享同一个 `settleBounded` 窗口。
