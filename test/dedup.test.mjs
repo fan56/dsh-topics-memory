@@ -75,6 +75,11 @@ function bootPlugin(overrides = {}) {
     },
     inject: (_deps, cb) => cb({ effect: () => () => {} }),
     effect: () => () => {},
+    skills: {
+      registerProvider() {
+        return () => {}
+      },
+    },
   }
   apply(ctx)
   const onEvent = handlers[0]

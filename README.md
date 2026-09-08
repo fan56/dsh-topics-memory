@@ -103,15 +103,18 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `repo` | empty (local-only) | GitHub sync repo `owner/name`; suggested `dsh-topics-data`; empty = back to local-only |
 | `autoInject` | `true` | Per-turn injection master switch |
 | `injectDedup` | `true` | Session-level injection dedup: topics already injected in this session are not re-injected (registry cleared at session end; budget-dropped topics stay injectable; deduped topK slots are NOT backfilled) — ADR 0012 |
+| `suppressEcho` | `true` | Distill-echo suppression: topics distilled from the CURRENT session's own turns are not injected back into it (provenance rides the observations log `sessionId → distilledInto`) |
 | `topK` | `4` | Max topics injected per turn |
 | `perTopicBudget` | `300` | Per-topic digest token budget |
 | `totalBudget` | `1500` | Total injection budget per turn |
 | `matchThreshold` | `0.3` | Hit threshold; tune from `/topics stats` near-miss evidence |
-| `tagBoost` | `0.15` | Additive boost per tag hit |
+| `tagBoost` | `0.15` | Additive boost per tag hit (total cap across hits equals this value) |
+| `injectMode` | `pointer` | Injection shape: pointer (light pointers, ≤80 tok each, `topic_open` pulls the full text; total budget capped at 600) / digest (full digest rendering, per-topic 300 / total 1500) |
+| `qualityLane` | `sampled` | Slow quality lane: `off` / `sampled` (1/3 of turns) / `always`; produced at `turn/end`, consumed by the next injection (consume-once), never for subagent sessions |
 | `graphDepth` | `2` | `depends` graph walk depth (0 disables) |
 | `recencyWindowDays` | `7` | Recency bonus window (+0.2) |
 | `autoObserve` | `true` | Capture atomic observations every turn |
-| `includeSubagents` | `true` | Whether injection and observation also engage subagent sessions (ADR 0011); `off` skips them entirely |
+| `includeSubagents` | `false` | Whether injection and observation also engage subagent sessions (ADR 0011; off by default since 0.7.0); `off` skips them entirely |
 | `observationMaxChars` | `2000` | Per-side per-turn observation truncation |
 | `distillProvider` / `distillModel` | empty (distill off) | Distill lane model route; both must be set to enable. With a UI, `/topics set distill-provider` / `distill-model` without a value opens a picker panel (provider list → that provider's model catalog); a mixed `provider model` / `provider/model` value for `distill-model` splits into both keys |
 | `distillEveryTurns` | `5` | Distill every N turns of a long session |
@@ -132,7 +135,7 @@ This project's shape is directly inspired and supported by:
 
 ## Known boundaries
 
-- **Subagents engage memory by default — one switch to opt out**: by default (`include-subagents` on), injection and observation apply to subagent sessions too. `/topics set include-subagents off` skips delegated sessions entirely — no injection, no observation, no distill triggers; the topic tools stay on the global layer, so an explicit `topic_save` from a child still lands. Out-of-process subagents (claude-code/codex providers) never load this plugin anyway.
+- **Subagents are out of memory by default — one switch to opt in**: by default (`include-subagents` off since 0.7.0) delegated sessions are skipped entirely — no injection, no observation, no distill triggers; `/topics set include-subagents on` applies injection and observation to them too. The topic tools stay on the global layer, so an explicit `topic_save` from a child still lands. Out-of-process subagents (claude-code/codex providers) never load this plugin anyway.
 - **Exit is local-only (0.10.0)**: the plugin's disposer makes one local git commit of the meta sidecars (observations / injections / distill state) and never waits on the network — no pull, no push, no model call, so host exit no longer pays a git round-trip or a bounded distill wait (the old 90s cap is gone; only a 10s guard against a pathological git stall remains). The exit distill trigger is fired fire-and-forget and is skipped entirely while a session-end run is still in flight (the same pool head would otherwise be fed to the model twice). Nothing is lost by skipping: observations are write-through on disk, the deferred push is replayed by the next boot's pull, and the skipped distill is replayed there too (boot-replay). `meta/distill-state.json` records each lane's outcome, checkable via `/topics status`.
 - **Observation GC (three strikes)**: an observation the model actually evaluated (parseable answer, however useless) but no op consumed accrues one failed attempt; the third failed attempt physically deletes it — explicitly authorized cleanup of raw data the lane demonstrably cannot process. Runs that never evaluated the batch never count: infrastructure failures (network errors, unconfigured distill route → readable `no-model` short-circuit) and unparseable output (`invalid-output`) are exempt, and a batch still mid-shrink on output-limit retries is only counted once a verdict is reached (success, floor stop, stall, or an explicit skip). Deletions are committed immediately (data destruction stays git-traceable); pure attempt counters follow the usual flush cadence.
 - **Config read timing**: `/topics set` and `settings.yaml` edits take effect most reliably from the next session start.

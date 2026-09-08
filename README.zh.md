@@ -103,15 +103,18 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `repo` | 空（local-only） | GitHub 同步仓 `owner/name`；建议 `dsh-topics-data`；置空回 local-only |
 | `autoInject` | `true` | 每轮注入总开关 |
 | `injectDedup` | `true` | 会话级注入去重：本会话已实际注入过的 Topic 不重注（会话结束清空注册表；被预算丢弃的仍可注入；被去重占用的 topK 名额不回填）——见 ADR 0012 |
+| `suppressEcho` | `true` | 蒸馏回声抑制：本会话蒸馏出的 Topic 不回注同会话（provenance 记入 observations 日志的 `sessionId → distilledInto`） |
 | `topK` | `4` | 每轮最多注入的 Topic 数 |
 | `perTopicBudget` | `300` | 单 Topic 摘要 token 预算 |
 | `totalBudget` | `1500` | 每轮注入总预算 |
 | `matchThreshold` | `0.3` | 命中阈值；按 `/topics stats` 的 near-miss 证据调 |
-| `tagBoost` | `0.15` | tag 命中加成 |
+| `tagBoost` | `0.15` | tag 命中加成（多次命中的总上限也为此值） |
+| `injectMode` | `pointer` | 注入形态：pointer（轻指针，单条 ≤80 tok，`topic_open` 拉全文；总预算上界锁 600）／digest（完整摘要渲染，per-topic 300 / 总 1500） |
+| `qualityLane` | `sampled` | 慢道质量 lane：`off`／`sampled`（1/3 轮触发）／`always`；`turn/end` 产出、下一轮注入消费（消费即清），子代理会话写死不跑 |
 | `graphDepth` | `2` | `depends` 图双向游走深度（0 关闭） |
 | `recencyWindowDays` | `7` | 近因加分窗口（+0.2） |
 | `autoObserve` | `true` | 每轮自动抓原子观察 |
-| `includeSubagents` | `true` | 注入与观察是否作用于子代理会话（ADR 0011）；`off` = 子代理整体跳过 |
+| `includeSubagents` | `false` | 注入与观察是否作用于子代理会话（ADR 0011；0.7.0 起默认 off）；`off` = 子代理整体跳过 |
 | `observationMaxChars` | `2000` | 每侧每轮观察截断长度 |
 | `distillProvider` / `distillModel` | 空（蒸馏关闭） | 蒸馏 lane 模型路由，两者都设置才启用。有 UI 时 `/topics set distill-provider` / `distill-model` 不带值会弹选择面板（provider 列表 → 该 provider 的模型目录）；带值时 `distill-model` 支持 `provider model` 或 `provider/model` 混写自动拆成两个键 |
 | `distillEveryTurns` | `5` | 长 session 每 N 轮触发一次蒸馏 |
@@ -132,7 +135,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 
 ## 已知边界
 
-- **子代理默认参与记忆，可整体关掉**：默认（`include-subagents` 开）注入与观察同样作用于子代理会话。`/topics set include-subagents off` 后，delegation depth > 0 的子代理会话被整体跳过——不注入、不观察、不触发蒸馏；topic 工具始终在全局层（子代理显式 `topic_save` 不受开关影响）。跨进程子代理（claude-code/codex 等 provider）本就不加载本插件。
+- **子代理默认不参与记忆，可整体打开**：默认（`include-subagents` off，0.7.0 起）delegation depth > 0 的子代理会话被整体跳过——不注入、不观察、不触发蒸馏；`/topics set include-subagents on` 后注入与观察同样作用于子代理会话。topic 工具始终在全局层（子代理显式 `topic_save` 不受开关影响）。跨进程子代理（claude-code/codex 等 provider）本就不加载本插件。
 - **退出路径本地化（0.10.0）**：插件 disposer 只做一步本地 git commit（meta 侧车文件：observations / injections / distill state），不再等待任何网络——没有 pull、没有 push、没有模型调用，宿主退出不再支付 git 双程与有界蒸馏等待（旧的 90s 上限移除，仅保留 10s 兜底以防病理性 git 卡死）。退出蒸馏触发改为 fire-and-forget；已有 session-end run 在跑时整体跳过（否则同一全局队头批次会被双份喂给模型）。跳过不丢活：observations 本就 write-through 落盘，推迟的 push 由下次启动的 pull 补推，被跳过的蒸馏同样由下次启动回放（boot-replay）。`meta/distill-state.json` 记录每次 lane 的结局，`/topics status` 可查。
 - **观察 GC（三振删除）**：被模型实际评估（返回了可解析应答，无论内容有无价值）却未被任何 op 消费的观察记一次 failed attempt，连续 3 次即物理删除（用户已明确授权删除 lane 确实无法处理的原始观察）。模型从未评估过的批次永不计数：基础设施失败（网络错误、蒸馏路由未配置 → 可读 `no-model` 短路）与输出不可解析（`invalid-output`）豁免；输出上限减半重试中的批次只有到达裁决（成功 / 触底 / stalled / 明确跳过）才计一次。删除立即 commit（数据销毁 git 可追溯），纯计数沿用 flush 节奏。
 - **配置读取时机**：`/topics set` 与 settings.yaml 修改在下次会话启动后生效最稳。

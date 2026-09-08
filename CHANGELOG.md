@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.13.0 (2026-09-08)
+
+随包发布「使用与配置指南」skill（dsh 插件生态统一改造，对齐 dsh-vault / dsh-llm-proxy 同款机制）：
+
+- **内置 skill `dsh-topics-memory`**：`skills/dsh-topics-memory/SKILL.md` 经 `ctx.skills.registerProvider` 随包发布（`inject` 顶层加 `skills` seam），内容为中文使用与配置指南——`topics:` 段全部 23 个键、/topics 命令族速查、`ask_user_question` 首次配置向导（存储模式 / 蒸馏模型路由 / 注入档位 / 自动观察）、pointer/digest 注入形态与排障。模型可按触发词（topics、记忆、蒸馏、llmwiki 等）自动路由读取，用户也能显式唤起。
+- **防漂移测试**：`test/skill.test.mjs` 断言 provider 注册形态、frontmatter `description` 与代码内硬编码 `SKILL_DESCRIPTION` 逐字一致（≤500 字符路由预算）、`stripFrontmatter` 的容错语义——指南文案与包内文件不再可能各自漂移。
+- **打包与依赖**：`files` 加 `skills`（skill 正文随 npm 包分发）；新增 optional peer `@deepseek-ai/dsh-skill`（`>=0.1.2-rc.1`，devDeps 同步钉版）；现有测试的 mock ctx 补 `skills.registerProvider`。
+- **README 修正（en/zh 配置表）**：补齐缺失的 `suppressEcho` / `injectMode` / `qualityLane` 三键；`includeSubagents` 默认值 `true` → `false`（代码自 0.7.0 起即为 false，文档漏改），「已知边界」的同款错误表述一并改正。
 ## 0.12.0 (2026-09-08)
 
 统计/状态类命令输出全面 markdown 表格化（TUI 对含 GFM 分隔行的命令输出自动切 Markdown 渲染，`/topics list` 的表格已在 0.11.0 验证渲染效果）：

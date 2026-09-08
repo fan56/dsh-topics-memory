@@ -145,6 +145,11 @@ test('settings-migration: apply() carries legacy values into the new namespace',
       on: () => undefined,
       inject: (_deps, cb) => cb({ effect: () => () => {} }),
       effect: () => () => {},
+      skills: {
+        registerProvider() {
+          return () => {}
+        },
+      },
     })
     // The apply path fire-and-forgets the write; poll for it to settle.
     for (let i = 0; i < 100 && doc.topics === undefined; i += 1) {

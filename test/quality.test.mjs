@@ -387,6 +387,11 @@ test('wiring: turn/end produces a pending, the next spliced consumes it', async 
     },
     inject: (_deps, cb) => cb({ effect: () => () => {} }),
     effect: () => () => {},
+    skills: {
+      registerProvider() {
+        return () => {}
+      },
+    },
   }
   apply(ctx)
   const onEvent = handlers[0]
@@ -460,6 +465,11 @@ test('wiring: autoInject off → the slow lane never produces (no unconsumable s
     },
     inject: (_deps, cb) => cb({ effect: () => () => {} }),
     effect: () => () => {},
+    skills: {
+      registerProvider() {
+        return () => {}
+      },
+    },
   }
   apply(ctx)
   const onEvent = handlers[0]

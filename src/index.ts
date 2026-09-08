@@ -12,10 +12,25 @@
  *    digest for this turn
  *  - model tools: topic_save / topic_search / topic_observe / topic_history
  *  - `/topics` command via the shared dsh-commands registry (optional peer)
+ *  - bundled usage/config skill served through ctx.skills.registerProvider
  *  - observer (M2): turn capture + distill triggers over session events
  *  - sync (ADR 0003): pull on session start, debounced write-through push
  */
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
 import type { Context } from '@deepseek-ai/cordis'
+// Types only (erased at emit). The runtime import is deliberately avoided:
+// the registry-published dsh-skill lib imports host-closure siblings
+// (@deepseek-ai/dsh-scope, dsh-llm — peers of it, but absent from a plugin
+// repo's own dependency graph), which dies under pnpm's isolated layout.
+// The host injects the real service at runtime; these types only shape the
+// provider object this plugin hands it.
+import type { SkillCandidate, SkillDefinition, SkillProvider } from '@deepseek-ai/dsh-skill'
+
+/** Mirrors dsh-skill's bundled-skill rank (a non-load-bearing ordering hint;
+ *  the constant is hardcoded there too). Local copy — see the type-import
+ *  note above for why dsh-skill is not loaded at runtime here. */
+const BUNDLED_SKILL_RANK = 600
 // Type-only side-effect import: loads dsh-settings' `declare module
 // '@deepseek-ai/cordis'` augmentation, which is what puts `ctx.settings` on
 // the Context type. There is no runtime import — the host provides the
@@ -66,8 +81,9 @@ export function settleBounded(p: Promise<unknown> | undefined, ms: number): Prom
   return Promise.race([settled, cap]).finally(() => clearTimeout(timer))
 }
 
-/** Services consumed at apply time; llm joins via guarded ctx.inject. */
-export const inject = ['systemPrompt', 'tools', 'settings', 'agents', 'llm']
+/** Services consumed at apply time; llm joins via guarded ctx.inject, and the
+ *  skills registry serves the bundled usage/config guide. */
+export const inject = ['systemPrompt', 'tools', 'settings', 'agents', 'llm', 'skills']
 
 // dsh-settings 0.1.2-alpha.3 removed the runtime settingsNamespace() helper:
 // register() now brand-checks the namespace at the type level
@@ -160,7 +176,83 @@ export function migrateLegacySettings(settings: SettingsNsLike, warn?: (message:
   }
 }
 
+// --- Bundled skill -----------------------------------------------------------
+
+/** Provider name under `ctx.skills`; doubles as the skill name. */
+const SKILL_PROVIDER_NAME = 'dsh-topics-memory'
+
+/** Packaged skill body; `../skills/` resolves to the package root from both lib/ and src/. */
+const SKILL_BODY_URL = new URL('../skills/dsh-topics-memory/SKILL.md', import.meta.url)
+
+/** Resource base served with the skill so its relative links resolve. */
+const SKILL_RESOURCE_BASE = {
+  kind: 'directory',
+  path: fileURLToPath(new URL('../skills/dsh-topics-memory/', import.meta.url)),
+} as const
+
+const SKILL_INVOCATION = { modelInvocable: true, userInvocable: true } as const
+
+/** Routing description; must stay identical to the SKILL.md frontmatter (asserted in tests). */
+const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/观察/图游走等）、/topics 命令族（onboard/status/distill/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、autoInject、记忆库、llmwiki、include-subagents。'
+
+const SKILL_CANDIDATE: SkillCandidate = {
+  name: SKILL_PROVIDER_NAME,
+  description: SKILL_DESCRIPTION,
+  invocation: SKILL_INVOCATION,
+  provider: SKILL_PROVIDER_NAME,
+  source: 'bundled',
+  resourceBase: SKILL_RESOURCE_BASE,
+  rank: BUNDLED_SKILL_RANK,
+  locator: SKILL_BODY_URL,
+}
+
+const skillProvider: SkillProvider = {
+  name: SKILL_PROVIDER_NAME,
+  list: () => Promise.resolve([SKILL_CANDIDATE]),
+  async get(_candidate): Promise<SkillDefinition> {
+    return {
+      name: SKILL_CANDIDATE.name,
+      description: SKILL_CANDIDATE.description,
+      invocation: SKILL_CANDIDATE.invocation,
+      provider: SKILL_CANDIDATE.provider,
+      source: SKILL_CANDIDATE.source,
+      resourceBase: SKILL_RESOURCE_BASE,
+      content: stripFrontmatter(await readFile(SKILL_BODY_URL, 'utf8')),
+    }
+  },
+}
+
+/**
+ * Strip a leading YAML frontmatter block (`---` / body / `---`) from a skill
+ * markdown file. `SkillDefinition.content` must be the instruction body after
+ * metadata removal — the same shape the filesystem provider serves — so the
+ * bundled SKILL.md, which keeps its frontmatter for the GitHub/manual install
+ * paths, has the block removed when served through {@link skillProvider.get}.
+ * Tolerant by design: input that does not open with a `---` line, or whose
+ * frontmatter block is never closed, is returned unchanged. Mirrors the
+ * delimiter semantics of the upstream skill-filesystem provider.
+ */
+export function stripFrontmatter(raw: string): string {
+  const firstLineEnd = raw.indexOf('\n')
+  if (firstLineEnd < 0 || raw.slice(0, firstLineEnd).replace(/\r$/, '') !== '---') return raw
+  let lineStart = firstLineEnd + 1
+  while (lineStart <= raw.length) {
+    const nextNewline = raw.indexOf('\n', lineStart)
+    const lineEnd = nextNewline < 0 ? raw.length : nextNewline
+    if (raw.slice(lineStart, lineEnd).replace(/\r$/, '') === '---') {
+      return raw.slice(nextNewline < 0 ? raw.length : nextNewline + 1).trim()
+    }
+    if (nextNewline < 0) return raw
+    lineStart = nextNewline + 1
+  }
+  return raw
+}
+
 export function apply(ctx: Context): void {
+  // `inject = ['skills']` guarantees the service exists on every real host;
+  // register unconditionally so a missing service fails loud instead of
+  // silently dropping the bundled skill.
+  ctx.skills.registerProvider(() => skillProvider)
   // dsh-settings is part of every real host closure but is a runtime-optional
   // peer so bare test harnesses can still load this module.
   const settingsNs = (ctx as unknown as { settings?: { register(n: unknown, s: unknown): { get(): unknown } } }).settings
