@@ -232,11 +232,23 @@ export function tuningHint(stats: ReturnType<typeof aggregateStats>, threshold: 
 async function renderList(service: TopicsService): Promise<string> {
   const metas = await service.store.listTopics()
   if (metas.length === 0) return 'Bundle 里还没有 Topic —— 在会话里让我记点什么，或 /topics set 配置好蒸馏。'
-  const lines = [`共 ${metas.length} 个 Topic：`]
-  for (const m of metas.sort((a, b) => a.slug.localeCompare(b.slug))) {
-    lines.push(`  ${m.slug}  [${m.status}] ${m.title}${m.tags.length > 0 ? `  #${m.tags.join(' #')}` : ''}`)
+  metas.sort((a, b) => a.slug.localeCompare(b.slug))
+  const lines = [
+    `共 ${metas.length} 个 Topic：`,
+    '',
+    '| Slug | 标题 | 状态 | 标签 | 更新 |',
+    '| --- | --- | --- | --- | --- |',
+  ]
+  for (const m of metas) {
+    const tags = m.tags.length > 0 ? m.tags.map((t) => `#${cell(t)}`).join(' ') : '—'
+    lines.push(`| \`${cell(m.slug)}\` | ${cell(m.title)} | ${m.status} | ${tags} | ${cell(m.generatedAt.slice(0, 10))} |`)
   }
   return lines.join('\n')
+}
+
+/** One markdown table cell: pipes escaped, whitespace flattened. */
+function cell(text: string): string {
+  return text.replace(/\|/g, '\\|').replace(/\s*\n\s*/g, ' ')
 }
 
 async function renderShow(service: TopicsService, slug: string | undefined): Promise<CommandResult> {

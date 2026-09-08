@@ -120,6 +120,32 @@ test('command: stats empty vs populated + list + show', async () => {
   }
 })
 
+test('command: list renders a markdown table (sort, tags, escaping)', async () => {
+  const { service, mutate, cleanup } = makeService()
+  try {
+    await service.store.ensure()
+    await service.saveTopic({ title: 'bravo | beta', conclusion: 'B', tags: ['X', 'y'] })
+    await service.saveTopic({ title: 'alpha topic', conclusion: 'A' })
+    const cmd = buildTopicsCommand(service, mutate)
+    const r = await cmd.handler(inv('list'))
+    assert.equal(r.kind, 'success')
+    assert.match(r.text, /共 2 个 Topic/)
+    assert.match(r.text, /\| Slug \| 标题 \| 状态 \| 标签 \| 更新 \|/)
+    assert.match(r.text, /\| --- \| --- \| --- \| --- \| --- \|/)
+    const rows = r.text.split('\n').filter((l) => l.startsWith('| `'))
+    assert.equal(rows.length, 2)
+    // Exact rows: slug sort order, pipes in title escaped, tags lowercased,
+    // date-only stamp. (Regex literals would need every `|` escaped — exact
+    // strings pin the rendering harder.)
+    const dateOf = (slug) => service.store.listTopics().then((ms) => ms.find((m) => m.slug === slug).generatedAt.slice(0, 10))
+    assert.equal(rows[0], `| \`alpha-topic\` | alpha topic | draft | — | ${await dateOf('alpha-topic')} |`)
+    assert.equal(rows[1], `| \`bravo-beta\` | bravo \\| beta | draft | #x #y | ${await dateOf('bravo-beta')} |`)
+    assert.doesNotMatch(r.text, /T\d{2}:/)
+  } finally {
+    cleanup()
+  }
+})
+
 test('command: history works on git-backed bundle', async () => {
   const { service, mutate, cleanup } = makeService()
   try {
