@@ -8,6 +8,7 @@
 - **本地聚类定向投喂**：title/tags 词面 Jaccard（拉丁词 + 中文 2-gram）≥ 0.3 才成候选簇（union-find 连通分量，簇封顶 6 条），模型只看「长得像」的簇——单 run 最多 8 次模型调用，按相似度峰值降序处理，剩余簇留待下个周期。实测本机 136 条语料恰好聚出 5 簇，全部为真重复对。
 - **四类动作、越权即弃**：merge（结论并集合并，survivor 存活、被并入条目标 deprecated 并在结论顶部留指向 survivor 的指针行）、promote（draft → stable）、deprecate（status 标记，不删正文）、refresh（仅 title/description/tags/triggers 元数据；**禁止改结论**——重写结论是 merge 的专属路径）。禁止 create；slug 必须逐字来自 bundle，自合并/幽灵 slug/缺结论/越权 refresh 一律丢弃计数，单 run 最多应用 12 个 op。
 - **`/topics consolidate` 手动命令**：无视 cadence 立即跑，逐动作输出理由；全部变更走正常 saveTopic 路径逐条 git commit——`/topics history <slug>` 可追溯，`git revert` 即回滚。`/topics status` 新增「整理」行（节拍 + 最近整理结果）。
+- **deprecated TTL 清扫（新配置 `deprecated-ttl-days`，默认 `15`，`0` 关闭）**：deprecated 条目超过 N 天在会话启动时自动删除——纯本地规则、不依赖模型路由（蒸馏未配置也照常清扫）。时间基准是 `generated.at`（deprecated 条目落定后无人再动，该戳即"进入废弃的时刻"）；每条删除独立 git commit（消息含废弃日期），远端历史永久可找回；时间戳不可解析的条目跳过不猜。删除发生时打宿主日志列明清单。
 - **修 retired 条目仍参与注入（整理语义的硬依赖）**：`roster()` / `rosterSync()` 现在排除 deprecated——此前 deprecated 只是统计口径，命中、排序、注入、depends 图游走照旧，合并退场的旧条目会继续和 survivor 抢注入预算。
 - 测试 267 → 282：分簇（重复聚簇/单例丢弃/封顶 6）、cadence 门（off/首跑/未到期/到期）、merge/promote/deprecate/refresh 落盘与指针行、6 类无效 op 丢弃、失败不推进时间戳、单飞去重、roster 排除 deprecated，另有一条真实备份语料（136 条，本地副本、零网络）断言一字不差重复对必落同簇。
 

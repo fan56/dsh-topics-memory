@@ -17,6 +17,7 @@ import {
   mkdir,
   appendFile,
   access,
+  rm,
 } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { constants as FsConstants } from 'node:fs'
@@ -344,8 +345,25 @@ export class BundleStore {
     })
   }
 
-  private async regenerateIndex(): Promise<void> {
-    const metas = await this.listTopics()
+  /**
+   * Remove a topic file and regenerate the index — one commit, so the rm is
+   * as traceable and revertible as every other bundle write. Callers own the
+   * policy (TTL housekeeping, future manual ops); the store only supplies the
+   * safe write path. Returns false when the slug doesn't exist (idempotent).
+   */
+  async deleteTopic(slug: string, message: string): Promise<boolean> {
+    return this.enqueue(async () => {
+      const clean = okf.slugify(slug)
+      const file = this.topicPath(clean)
+      if (!(await existsSync(file))) return false
+      await rm(file)
+      await this.regenerateIndex()
+      await this.commit([`topics/${clean}.md`, 'index.md'], message)
+      return true
+    })
+  }
+
+  private async regenerateIndex(): Promise<void> {    const metas = await this.listTopics()
     const entries: okf.IndexEntry[] = metas.map((m) => ({
       slug: m.slug,
       title: m.title,

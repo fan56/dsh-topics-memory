@@ -207,6 +207,47 @@ export function clusterTopics(
   return clusters
 }
 
+// --- Deprecated-TTL housekeeping (local rule, no model) ----------------------
+
+/**
+ * Drop `deprecated` topics older than `ttlDays` — pure housekeeping, never
+ * touches the model. `generated.at` is the right clock: every save restamps
+ * it and nothing ever touches a deprecated entry afterwards, so it IS the
+ * "became deprecated at" timestamp. Deletion rides the normal store path
+ * (one commit per drop, index regenerated), so the history stays recoverable
+ * on the remote; an unparsable stamp is skipped, not guessed. Returns the
+ * dropped slugs. `ttlDays <= 0` disables the sweep.
+ */
+export async function dropExpiredDeprecated(
+  service: TopicsService,
+  ttlDays: number,
+  now = Date.now(),
+): Promise<string[]> {
+  if (!Number.isFinite(ttlDays) || ttlDays <= 0) return []
+  const metas = await service.store.listTopics()
+  const cutoff = now - ttlDays * 86_400_000
+  const dropped: string[] = []
+  for (const m of metas) {
+    if (m.status !== 'deprecated') continue
+    const at = Date.parse(m.generatedAt)
+    if (!Number.isFinite(at) || at > cutoff) continue
+    try {
+      const removed = await service.store.deleteTopic(
+        m.slug,
+        `topics(topic): drop deprecated ${m.slug} (TTL ${ttlDays}d, deprecated ${new Date(at).toISOString().slice(0, 10)})`,
+      )
+      if (removed) dropped.push(m.slug)
+    } catch {
+      // one unreadable entry never stops the sweep
+    }
+  }
+  if (dropped.length > 0) {
+    service.invalidate()
+    void service.sync?.schedulePush()
+  }
+  return dropped
+}
+
 // --- The lane ----------------------------------------------------------------
 
 interface ClusterOutcome {

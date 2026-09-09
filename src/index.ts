@@ -45,7 +45,7 @@ import { buildTopicTools } from './tools.ts'
 import { buildTopicsCommand } from './commands.ts'
 import { Observer, textOf, type UserMessageLike } from './observer.ts'
 import { Distiller, defaultModelCaller, type DistillResult, type LlmCandidateShape } from './distill.ts'
-import { Consolidator, type ConsolidateResult } from './consolidate.ts'
+import { Consolidator, dropExpiredDeprecated, type ConsolidateResult } from './consolidate.ts'
 import { SlowLane } from './quality.ts'
 import type { SlowDelivery } from './service.ts'
 import { CONFIG_KEYS, TopicsConfig, type TopicsConfigValue } from './config.ts'
@@ -194,7 +194,7 @@ const SKILL_RESOURCE_BASE = {
 const SKILL_INVOCATION = { modelInvocable: true, userInvocable: true } as const
 
 /** Routing description; must stay identical to the SKILL.md frontmatter (asserted in tests). */
-const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、autoInject、记忆库、llmwiki、include-subagents。'
+const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、autoInject、记忆库、llmwiki、include-subagents。'
 
 const SKILL_CANDIDATE: SkillCandidate = {
   name: SKILL_PROVIDER_NAME,
@@ -666,6 +666,19 @@ export function apply(ctx: Context): void {
               }
             })
             .catch(() => undefined)
+          // Deprecated-TTL sweep — pure local rule, no model, runs even when
+          // the distill route is unconfigured. Drops are logged: deletion is
+          // the one housekeeping action the user should always see happened.
+          const ttl = cfgNow().deprecatedTtlDays
+          if (ttl > 0) {
+            void dropExpiredDeprecated(service, ttl)
+              .then((dropped) => {
+                if (dropped.length > 0) {
+                  warn(`dsh-topics-memory：按 ${ttl} 天 TTL 删除了 ${dropped.length} 条 deprecated topic（${dropped.map((s) => `topics/${s}`).join('、')}）；git 历史可找回`)
+                }
+              })
+              .catch(() => undefined)
+          }
         })
     }
   }) as never)
@@ -809,5 +822,6 @@ const DEFAULTS: TopicsConfigValue = {
   distillBatchSize: 40,
   distillMaxModelCalls: 8,
   consolidateCadence: 'daily',
+  deprecatedTtlDays: 15,
   pushDebounceSeconds: 45,
 }

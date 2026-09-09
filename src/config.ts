@@ -63,6 +63,10 @@ export const TopicsConfig = z.object({
    *  settled drafts, deprecate superseded, refresh metadata). Reuses the
    *  distill model route; off disables the lane entirely. */
   consolidateCadence: z.string().default('daily'),
+  /** Deprecated topics older than this many days are dropped at session start
+   *  (local TTL sweep, no model; each drop is its own git commit, so history
+   *  stays recoverable on the remote). 0 disables the sweep. */
+  deprecatedTtlDays: z.number().default(15),
   /** Debounced push delay in GitHub mode. */
   pushDebounceSeconds: z.number().default(45),
 })
@@ -91,6 +95,7 @@ export type TopicsConfigValue = {
   distillBatchSize: number
   distillMaxModelCalls: number
   consolidateCadence: string
+  deprecatedTtlDays: number
   pushDebounceSeconds: number
 }
 
@@ -118,6 +123,7 @@ export const CONFIG_KEYS = [
   'distillBatchSize',
   'distillMaxModelCalls',
   'consolidateCadence',
+  'deprecatedTtlDays',
   'pushDebounceSeconds',
 ] as const
 
@@ -156,6 +162,7 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'distillEveryTurns':
     case 'distillBatchSize':
     case 'distillMaxModelCalls':
+    case 'deprecatedTtlDays':
     case 'pushDebounceSeconds': {
       const n = Number(raw)
       if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) return { error: `${key} 需要非负整数` }

@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import { mkdtempSync, rmSync } from 'node:fs'
-import { readFile, readdir } from 'node:fs/promises'
+import { readFile, readdir, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BundleStore } from '../lib/store.js'
@@ -10,6 +10,7 @@ import {
   Consolidator,
   CONSOLIDATE_SYSTEM_PROMPT,
   clusterTopics,
+  dropExpiredDeprecated,
   topicTokens,
 } from '../lib/consolidate.js'
 import * as okf from '../lib/okf.js'
@@ -342,6 +343,46 @@ test('consolidator: merge union tags on survivor', async () => {
     assert.equal(r.ok, true)
     const survivor = await h.store.readTopic(SLUGS['部署链路甲 cicd'])
     assert.deepEqual([...survivor.fm.tags].sort(), ['cicd', 'deploy'])
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('deprecated-TTL sweep: drops only expired deprecated; 0 disables; idempotent', async () => {
+  const h = make()
+  try {
+    await h.store.ensure()
+    const SLUGS = await seed(h, [
+      { title: '过期废弃条目 keyspace 洪泛', tags: ['redis'] },
+      { title: '新鲜废弃条目 keyspace 洪泛', tags: ['redis'] },
+      { title: '活着的老条目 keyspace 洪泛', tags: ['redis'] },
+    ])
+    // Rewrite frontmatter in place: generated.at is the became-deprecated clock.
+    const age = async (slug, days, status) => {
+      const file = join(h.store.topicsDir(), `${slug}.md`)
+      const doc = okf.parseTopicDoc(await readFile(file, 'utf8'))
+      doc.fm.status = status
+      doc.fm.generated = { by: doc.fm.generated.by, at: new Date(Date.now() - days * DAY_MS).toISOString() }
+      await writeFile(file, okf.serializeTopicDoc(doc))
+    }
+    await age(SLUGS['过期废弃条目 keyspace 洪泛'], 20, 'deprecated')
+    await age(SLUGS['新鲜废弃条目 keyspace 洪泛'], 5, 'deprecated')
+    await age(SLUGS['活着的老条目 keyspace 洪泛'], 20, 'draft')
+    h.service.invalidate()
+
+    const dropped = await dropExpiredDeprecated(h.service, 15)
+    assert.deepEqual(dropped, [SLUGS['过期废弃条目 keyspace 洪泛']])
+    assert.equal(await h.store.exists(SLUGS['过期废弃条目 keyspace 洪泛']), false)
+    assert.ok(await h.store.exists(SLUGS['新鲜废弃条目 keyspace 洪泛']), 'fresh deprecated survives')
+    assert.ok(await h.store.exists(SLUGS['活着的老条目 keyspace 洪泛']), 'old non-deprecated survives')
+    // Roster excludes deprecated by design — only the old draft remains.
+    const roster = await h.service.roster()
+    assert.deepEqual(roster.map((r) => r.slug), [SLUGS['活着的老条目 keyspace 洪泛']])
+    // 0 disables the sweep; re-running is a no-op.
+    assert.deepEqual(await dropExpiredDeprecated(h.service, 0), [])
+    assert.deepEqual(await dropExpiredDeprecated(h.service, 15), [])
+    // The drop landed as a git commit (bundle history stays the safety net).
+    assert.equal(h.store.hasGit ? await h.store.hasGit() : false, true)
   } finally {
     h.cleanup()
   }
