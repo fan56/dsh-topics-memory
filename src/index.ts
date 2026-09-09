@@ -650,12 +650,22 @@ export function apply(ctx: Context): void {
           // Consolidation cadence check — after the pull (freshest pool),
           // fully fire-and-forget: cadence/single-flight gates live inside
           // maybeRun, and a no-model boot just skips (no stamp advanced).
+          // Failures are NOT silent at the host log: the 2026-09-09 real-host
+          // test showed a dead distill route would otherwise hide here with
+          // zero observable trace (the state file only advances on success).
           try {
             captureFromAgent(agents()?.get(session.id) as unknown)
           } catch {
             // contained — the run below fails with a readable no-model detail
           }
-          void consolidator.maybeRun({ sessionId: String(session.id) }).catch(() => undefined)
+          void consolidator
+            .maybeRun({ sessionId: String(session.id) })
+            .then((r) => {
+              if (r !== undefined && !r.ok && r.reason !== 'no-clusters') {
+                warn(`dsh-topics-memory 整理 lane 未执行：${r.reason ?? 'unknown'}${r.detail !== undefined ? `（${r.detail}）` : ''}`)
+              }
+            })
+            .catch(() => undefined)
         })
     }
   }) as never)
