@@ -1,5 +1,5 @@
 ---
-name: dsh-topics-memory
+name: dsh-topics-memory-config
 description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/观察/图游走等）、/topics 命令族（onboard/status/distill/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、autoInject、记忆库、llmwiki、include-subagents。"
 ---
 

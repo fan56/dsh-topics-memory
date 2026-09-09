@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.13.1 (2026-09-09)
+
+内置 skill 改名：`dsh-topics-memory` → `dsh-topics-memory-config`（生态统一 `-config` 后缀）。skill 为进程内注册、包外零落盘，升级即自动迁移——更新包并重启 dsh 后新名生效，无手工清理项。
+
 ## 0.13.0 (2026-09-08)
 
 随包发布「使用与配置指南」skill（dsh 插件生态统一改造，对齐 dsh-vault / dsh-llm-proxy 同款机制）：
