@@ -99,6 +99,11 @@ export class TopicsService {
       }
       if (entry === undefined) continue
       const doc = entry.doc
+      // Deprecated topics are retired knowledge (consolidation merges and
+      // manual deprecations) — they must not rank, inject, or feed the
+      // depends-graph walk, or a merged-away entry would keep competing
+      // with its survivor for the injection budget.
+      if (doc.fm.status === 'deprecated') continue
       out.push({
         slug: entry.slug,
         title: doc.fm.title,
@@ -515,6 +520,8 @@ export class TopicsService {
       }
       if (entry === undefined) continue
       const doc = entry.doc
+      // Same retirement rule as roster(): deprecated knowledge never injects.
+      if (doc.fm.status === 'deprecated') continue
       out.push({
         slug: entry.slug,
         title: doc.fm.title,

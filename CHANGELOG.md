@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.14.0 (2026-09-09)
+
+整理 lane（consolidation）——「记忆是编辑出来的不是攒出来的」的后半句落地：蒸馏把观察沉淀成 topic，整理让 LLM 园丁定期修剪已落库的 topic 池本身（2026-09-09 语料审计：136 条中存在一字不差的重复对、同主题碎片化 3~5 条、50 条 draft 无人晋升）：
+
+- **新配置 `consolidate-cadence`（默认 `daily`，取值 off | daily | 3d | 7d）**：会话启动时检查上次整理时间（`meta/consolidate-state.json`），到期即在后台自动跑——不阻塞启动、全局单飞。复用蒸馏模型路由（`distill-provider` / `distill-model`，不新增路由配置），未配蒸馏模型则整条 lane 闲置。模型调用失败不推进时间戳，下次启动自动重试；模型完成评估（含「无需整理」）才记节拍。
+- **本地聚类定向投喂**：title/tags 词面 Jaccard（拉丁词 + 中文 2-gram）≥ 0.3 才成候选簇（union-find 连通分量，簇封顶 6 条），模型只看「长得像」的簇——单 run 最多 8 次模型调用，按相似度峰值降序处理，剩余簇留待下个周期。实测本机 136 条语料恰好聚出 5 簇，全部为真重复对。
+- **四类动作、越权即弃**：merge（结论并集合并，survivor 存活、被并入条目标 deprecated 并在结论顶部留指向 survivor 的指针行）、promote（draft → stable）、deprecate（status 标记，不删正文）、refresh（仅 title/description/tags/triggers 元数据；**禁止改结论**——重写结论是 merge 的专属路径）。禁止 create；slug 必须逐字来自 bundle，自合并/幽灵 slug/缺结论/越权 refresh 一律丢弃计数，单 run 最多应用 12 个 op。
+- **`/topics consolidate` 手动命令**：无视 cadence 立即跑，逐动作输出理由；全部变更走正常 saveTopic 路径逐条 git commit——`/topics history <slug>` 可追溯，`git revert` 即回滚。`/topics status` 新增「整理」行（节拍 + 最近整理结果）。
+- **修 retired 条目仍参与注入（整理语义的硬依赖）**：`roster()` / `rosterSync()` 现在排除 deprecated——此前 deprecated 只是统计口径，命中、排序、注入、depends 图游走照旧，合并退场的旧条目会继续和 survivor 抢注入预算。
+- 测试 267 → 282：分簇（重复聚簇/单例丢弃/封顶 6）、cadence 门（off/首跑/未到期/到期）、merge/promote/deprecate/refresh 落盘与指针行、6 类无效 op 丢弃、失败不推进时间戳、单飞去重、roster 排除 deprecated，另有一条真实备份语料（136 条，本地副本、零网络）断言一字不差重复对必落同簇。
+
 ## 0.13.1 (2026-09-09)
 
 内置 skill 改名：`dsh-topics-memory` → `dsh-topics-memory-config`（生态统一 `-config` 后缀）。skill 为进程内注册、包外零落盘，升级即自动迁移——更新包并重启 dsh 后新名生效，无手工清理项。

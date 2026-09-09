@@ -161,6 +161,24 @@ export class BundleStore {
     }
   }
 
+  private consolidateStatePath(): string {
+    return join(this.metaDir(), 'consolidate-state.json')
+  }
+
+  /** Last consolidation-lane run outcome (cadence stamp + /topics status). */
+  async writeConsolidateState(state: unknown): Promise<void> {
+    await mkdir(this.metaDir(), { recursive: true })
+    await atomicWrite(this.consolidateStatePath(), `${JSON.stringify(state, null, 2)}\n`)
+  }
+
+  async readConsolidateState(): Promise<Record<string, unknown> | undefined> {
+    try {
+      return JSON.parse(await readFile(this.consolidateStatePath(), 'utf8')) as Record<string, unknown>
+    } catch {
+      return undefined
+    }
+  }
+
   /** Create the directory skeleton, git repo, initial index, and repair
    * wrapped depends entries left by older save paths (idempotent). */
   async ensure(): Promise<void> {

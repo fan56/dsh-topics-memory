@@ -52,6 +52,7 @@ https://github.com/user-attachments/assets/6e9b346d-2ec9-4148-ae62-7087797d3188
 | `/topics onboard` | 交互式配置向导：唤起 dsh 原生 ask-user 面板逐项问答（模式 / 仓库 / 蒸馏 / 注入档位 / 自动观察），末步确认才写入；无 ask-user UI 的环境自动退化为逐条输入 |
 | `/topics status` | bundle 健康：topic 数、观察积压、冲突、最近蒸馏结果、同步状态 |
 | `/topics distill` | 手动触发一次蒸馏 run（复用现有 lane 与 in-flight 守卫；输出摘要与 distill-state 字段一一对应） |
+| `/topics consolidate` | 手动触发一次整理 run：LLM 园丁合并重复/晋升 stable/废弃过时/刷新元数据，逐条 git commit 可回滚 |
 | `/topics stats` | 注入统计：hit rate、top-N、near-miss 分布与调参建议 |
 | `/topics list` / `show` / `history` | 浏览 Topic、反向引用与变更史 |
 | `/topics graph` | 生成关系图网页（力导向、可拖拽缩放、悬停看结论）并自动在浏览器打开 |
@@ -121,6 +122,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `distillOnSessionEnd` | `true` | session 结束时蒸馏一次 |
 | `distillBatchSize` | `40` | 每次蒸馏模型调用携带的观察条数。遇输出上限（`max-tokens`）失败自动减半重试（下限 5），失败批次不再活锁积压；缩小状态跨 run 保持，直到插件重载或配置变更。注意：`/topics set distillBatchSize` 重设为同值不触发复位，需设为不同值或重载插件 |
 | `distillMaxModelCalls` | `8` | 单次蒸馏 run 的模型调用预算，含 ops 未回显有效 `observed_ids` 时的纠错重试（至多一次，预算放不下即零消费停机）。预算耗尽即停，已成功的批次照常 markDistilled（部分前进优于零前进），distill state 记 `partial: …` |
+| `consolidateCadence` | `daily` | 整理 lane 节拍：`daily`/`3d`/`7d`/`off`。会话启动时检查上次整理时间（`meta/consolidate-state.json`），到期即在后台自动跑 LLM 园丁（复用蒸馏模型路由）：本地词面聚类只送「长得像」的候选簇，四类动作 merge/promote/deprecate/refresh，越权 op 一律丢弃；模型调用失败不推进节拍，下次启动重试 |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
 
 ## Acknowledgements

@@ -58,6 +58,11 @@ export const TopicsConfig = z.object({
    *  Default 8: with the batch loop, one run then drains ~30-40 observations
    *  instead of ~10, which is what makes a real backlog actually shrink. */
   distillMaxModelCalls: z.number().default(8),
+  /** Consolidation lane (整理) cadence: how often a session start may run the
+   *  LLM gardener over the EXISTING pool (merge near-duplicates, promote
+   *  settled drafts, deprecate superseded, refresh metadata). Reuses the
+   *  distill model route; off disables the lane entirely. */
+  consolidateCadence: z.string().default('daily'),
   /** Debounced push delay in GitHub mode. */
   pushDebounceSeconds: z.number().default(45),
 })
@@ -85,6 +90,7 @@ export type TopicsConfigValue = {
   distillModel: string
   distillBatchSize: number
   distillMaxModelCalls: number
+  consolidateCadence: string
   pushDebounceSeconds: number
 }
 
@@ -111,6 +117,7 @@ export const CONFIG_KEYS = [
   'distillModel',
   'distillBatchSize',
   'distillMaxModelCalls',
+  'consolidateCadence',
   'pushDebounceSeconds',
 ] as const
 
@@ -157,6 +164,10 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'injectMode': {
       if (raw === 'pointer' || raw === 'digest') return raw
       return { error: 'inject-mode 取值 pointer|digest' }
+    }
+    case 'consolidateCadence': {
+      if (raw === 'off' || raw === 'daily' || raw === '3d' || raw === '7d') return raw
+      return { error: 'consolidate-cadence 取值 off|daily|3d|7d' }
     }
     case 'qualityLane': {
       if (raw === 'off' || raw === 'sampled' || raw === 'always') return raw

@@ -1,6 +1,6 @@
 ---
 name: dsh-topics-memory-config
-description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/观察/图游走等）、/topics 命令族（onboard/status/distill/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、autoInject、记忆库、llmwiki、include-subagents。"
+description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、autoInject、记忆库、llmwiki、include-subagents。"
 ---
 
 # dsh-topics-memory 使用指南（工作记忆 / 蒸馏 / 注入）
@@ -36,6 +36,7 @@ description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指
 | `distillProvider` / `distillModel` | 空（蒸馏关闭） | 蒸馏模型路由，两者都非空才启用 |
 | `distillBatchSize` | `40` | 每次蒸馏模型调用携带的观察条数（输出上限失败自动减半，下限 5） |
 | `distillMaxModelCalls` | `8` | 单次蒸馏 run 的模型调用预算（预算耗尽即停，已成功批次保留标记） |
+| `consolidateCadence` | `daily` | 整理 lane 节拍：daily／3d／7d／off。会话启动时检查上次整理时间，到期即在后台跑 LLM 园丁（复用蒸馏模型路由）：合并重复、晋升 stable、废弃过时、刷新元数据；off 关闭 |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
 
 - 全部键都可用 `/topics set <键> <值>` 运行时写回同段（即时校验：boolean 用 on|off、
@@ -67,6 +68,7 @@ GitHub 模式凭据走 `$GITHUB_TOKEN` 或已登录的 gh CLI（`gh auth status`
 | `/topics onboard` | 交互式配置向导（ask-user 面板，末步确认才写入） |
 | `/topics status` | bundle 健康：topic 数、观察积压、冲突、最近蒸馏、同步状态 |
 | `/topics distill` | 手动触发一次蒸馏 run（复用现有 lane 与 in-flight 守卫） |
+| `/topics consolidate` | 手动触发一次整理 run：LLM 园丁合并重复/晋升/废弃/刷新元数据，逐条 git commit 可回滚 |
 | `/topics stats` | 注入统计：hit rate、Top-N、near-miss 分布与调参建议 |
 | `/topics list` | 表格列出全部 Topic（带序号、最新优先、100 条封顶） |
 | `/topics show <slug>` | Topic 全文阅读页 + 反向引用（谁引用了我、怎么引用） |
@@ -83,9 +85,14 @@ GitHub 模式凭据走 `$GITHUB_TOKEN` 或已登录的 gh CLI（`gh auth status`
 2. **蒸馏没跑**：distill-provider 与 distill-model 必须**同时非空**（缺一即闲置）；长会话看
    distill-every-turns 节拍、会话结束看 distill-on-session-end；`/topics distill` 手动触发
    会给可读原因（no-model / in-flight / no-observations）。
-3. **GitHub 同步**：repo 须形如 owner/name；推送有 push-debounce-seconds 去抖；退出只做
+3. **整理 lane**：`consolidate-cadence`（daily/3d/7d，默认 daily，off 关闭）到期后在会话启动
+   时后台跑，复用蒸馏模型路由（未配蒸馏模型则闲置）；本地词面聚类只把「长得像」的 topic
+   送模型，四类动作（merge/promote/deprecate/refresh）都逐条 git commit，`/topics consolidate`
+   手动立即跑，`/topics status` 看最近整理，不满意 `git revert` 即回滚。被合并条目标
+   deprecated 且不再参与注入。
+4. **GitHub 同步**：repo 须形如 owner/name；推送有 push-debounce-seconds 去抖；退出只做
    本地 commit 不等网络，推迟的 push 由下次启动 pull 后补推；rebase 冲突的 topic 降权标记，
    `/topics status` 可查。
-4. **旧版 llmwiki 段自动迁移**：0.5.x 的 `llmwiki:` 设置段与 `~/.dsh/llmwiki` 数据目录在
+5. **旧版 llmwiki 段自动迁移**：0.5.x 的 `llmwiki:` 设置段与 `~/.dsh/llmwiki` 数据目录在
    首次启动时自动迁移到 `topics` / `~/.dsh/topics`，无需手工；旧插件还在运行时会警告跳过
    （防双载脑裂），先从 profile 移除旧包。

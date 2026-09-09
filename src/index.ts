@@ -45,6 +45,7 @@ import { buildTopicTools } from './tools.ts'
 import { buildTopicsCommand } from './commands.ts'
 import { Observer, textOf, type UserMessageLike } from './observer.ts'
 import { Distiller, defaultModelCaller, type DistillResult, type LlmCandidateShape } from './distill.ts'
+import { Consolidator, type ConsolidateResult } from './consolidate.ts'
 import { SlowLane } from './quality.ts'
 import type { SlowDelivery } from './service.ts'
 import { CONFIG_KEYS, TopicsConfig, type TopicsConfigValue } from './config.ts'
@@ -193,7 +194,7 @@ const SKILL_RESOURCE_BASE = {
 const SKILL_INVOCATION = { modelInvocable: true, userInvocable: true } as const
 
 /** Routing description; must stay identical to the SKILL.md frontmatter (asserted in tests). */
-const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/观察/图游走等）、/topics 命令族（onboard/status/distill/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、autoInject、记忆库、llmwiki、include-subagents。'
+const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、autoInject、记忆库、llmwiki、include-subagents。'
 
 const SKILL_CANDIDATE: SkillCandidate = {
   name: SKILL_PROVIDER_NAME,
@@ -471,6 +472,10 @@ export function apply(ctx: Context): void {
   // The settle hook re-runs the release check because a disposal that landed
   // mid-pipeline deferred to THIS pipeline and never fires again.
   const slowLane = new SlowLane(service, caller, releaseSessionLlm)
+  // Consolidation lane (整理): same caller/route as distill, global single
+  // flight inside. Reads the pool and merges/promotes/deprecates/refreshes;
+  // cadence-gated at session start, manual via /topics consolidate.
+  const consolidator = new Consolidator(service, caller)
 
   // ---- Observer (M2) ----
   // Trigger runs are fire-and-forget everywhere now — including the exit
@@ -642,6 +647,15 @@ export function apply(ctx: Context): void {
               if (run !== undefined) void run.catch(() => undefined)
             })
             .catch(() => undefined)
+          // Consolidation cadence check — after the pull (freshest pool),
+          // fully fire-and-forget: cadence/single-flight gates live inside
+          // maybeRun, and a no-model boot just skips (no stamp advanced).
+          try {
+            captureFromAgent(agents()?.get(session.id) as unknown)
+          } catch {
+            // contained — the run below fails with a readable no-model detail
+          }
+          void consolidator.maybeRun({ sessionId: String(session.id) }).catch(() => undefined)
         })
     }
   }) as never)
@@ -742,7 +756,21 @@ export function apply(ctx: Context): void {
       }
       return run.finally(() => releaseSessionLlm(sessionId))
     }
-    cmdCtx.effect(() => commands.register(buildTopicsCommand(service, mutate as never, resolveAsk, resolveLlm, manualDistill)), 'topics: /topics')
+    // Manual /topics consolidate trigger: same lane as the cadence path, same
+    // trigger-time llm capture and in-flight guard (the command runs inside a
+    // live session, so its agent's scoped instance is the freshest adapter
+    // holder). Unlike the cadence path there is no releaseSessionLlm hook —
+    // the consolidator holds no per-session capture of its own.
+    const manualConsolidate = async (invocation: unknown): Promise<ConsolidateResult> => {
+      try {
+        captureFromAgent((invocation as { agent?: unknown }).agent)
+      } catch {
+        // contained — the candidate chain still walks whatever was captured
+      }
+      const sessionId = String((invocation as { agent?: { id?: unknown } }).agent?.id ?? 'manual')
+      return consolidator.run(sessionId)
+    }
+    cmdCtx.effect(() => commands.register(buildTopicsCommand(service, mutate as never, resolveAsk, resolveLlm, manualDistill, manualConsolidate)), 'topics: /topics')
   })
 }
 
@@ -770,5 +798,6 @@ const DEFAULTS: TopicsConfigValue = {
   distillModel: '',
   distillBatchSize: 40,
   distillMaxModelCalls: 8,
+  consolidateCadence: 'daily',
   pushDebounceSeconds: 45,
 }

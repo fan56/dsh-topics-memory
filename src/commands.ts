@@ -12,6 +12,7 @@ import { join } from 'node:path'
 import { spawn } from 'node:child_process'
 import type { TopicsService } from './service.ts'
 import type { DistillResult } from './distill.ts'
+import type { ConsolidateResult } from './consolidate.ts'
 import { serializeTopicDoc, slugify, firstParagraph } from './okf.ts'
 import { buildGraph, renderGraphHtml } from './viz.ts'
 import { CONFIG_KEYS, displayKey, type ConfigKey, type TopicsConfigValue, parseConfigValue } from './config.ts'
@@ -37,11 +38,19 @@ import {
  */
 export type ManualDistill = (invocation: CommandInvocation) => Promise<DistillResult>
 
+/**
+ * Manual `/topics consolidate` trigger, wired by the host (index.ts owns the
+ * lane instance). Bypasses the cadence gate; the lane's own in-flight guard
+ * still applies.
+ */
+export type ManualConsolidate = (invocation: CommandInvocation) => Promise<ConsolidateResult>
+
 export const HELP = [
   'dsh-topics-memory — OKF topic 记忆（本地 bundle，git 可追溯，可选 GitHub 同步）',
   '  /topics onboard             交互式配置向导（ask-user 面板逐项问答；无 UI 环境逐条输入）',
   '  /topics status              bundle 健康：topic 数、观察积压、冲突、同步状态',
   '  /topics distill             手动触发一次蒸馏（观察池 → Topic，输出 marked/created/updated/gc 摘要）',
+  '  /topics consolidate         手动触发一次整理（合并重复/晋升 stable/废弃过时/刷新元数据，无视 cadence 立即跑）',
   '  /topics stats               注入统计：hit rate、top-N、near-miss 分布与调参建议',
   '  /topics list                列出全部 Topic',
   '  /topics show <slug>         查看一个 Topic 全文（含反向引用）',
@@ -55,17 +64,17 @@ export const HELP = [
   '凭据：$GITHUB_TOKEN 或已登录的 gh CLI；登录不在本插件职责内。',
 ].join('\n')
 
-export function buildTopicsCommand(service: TopicsService, mutate: MutateFn, resolveAsk: AskServiceResolver = () => undefined, resolveLlm: LlmDirectoryResolver = () => [], distillNow?: ManualDistill): CommandDefinition {
+export function buildTopicsCommand(service: TopicsService, mutate: MutateFn, resolveAsk: AskServiceResolver = () => undefined, resolveLlm: LlmDirectoryResolver = () => [], distillNow?: ManualDistill, consolidateNow?: ManualConsolidate): CommandDefinition {
   const onboard = createOnboardHandler(service, mutate, undefined, resolveAsk, resolveLlm)
   return {
     name: 'topics',
-    description: 'OKF topic 记忆：onboard | distill | status | stats | list | show | history | graph | sync | config | set',
-    input: { hint: '[onboard | distill | status | stats | list | show <slug> | history <slug> | graph | sync [pull|push] | config | set <key> <value>]' },
-    handler: (invocation) => handle(invocation, service, mutate, onboard, resolveAsk, resolveLlm, distillNow),
+    description: 'OKF topic 记忆：onboard | distill | consolidate | status | stats | list | show | history | graph | sync | config | set',
+    input: { hint: '[onboard | distill | consolidate | status | stats | list | show <slug> | history <slug> | graph | sync [pull|push] | config | set <key> <value>]' },
+    handler: (invocation) => handle(invocation, service, mutate, onboard, resolveAsk, resolveLlm, distillNow, consolidateNow),
   }
 }
 
-async function handle(invocation: CommandInvocation, service: TopicsService, mutate: MutateFn, onboard: (args: string[], invocation: CommandInvocation) => Promise<CommandResult>, resolveAsk: AskServiceResolver, resolveLlm: LlmDirectoryResolver, distillNow?: ManualDistill): Promise<CommandResult> {
+async function handle(invocation: CommandInvocation, service: TopicsService, mutate: MutateFn, onboard: (args: string[], invocation: CommandInvocation) => Promise<CommandResult>, resolveAsk: AskServiceResolver, resolveLlm: LlmDirectoryResolver, distillNow?: ManualDistill, consolidateNow?: ManualConsolidate): Promise<CommandResult> {
   const raw = invocation.rawInput.trim()
   const [action = '', ...rest] = raw.split(/\s+/)
   try {
@@ -78,6 +87,8 @@ async function handle(invocation: CommandInvocation, service: TopicsService, mut
         return ok(await renderStatus(service))
       case 'distill':
         return await doDistill(service, invocation, distillNow)
+      case 'consolidate':
+        return await doConsolidate(service, invocation, consolidateNow)
       case 'stats':
         return ok(await renderStats(service))
       case 'list':
@@ -125,6 +136,7 @@ async function renderStatus(service: TopicsService): Promise<string> {
     ['注入去重', cfg.injectDedup ? '开（同会话已注入的 Topic 不重注）' : '关'],
     ['慢道', cfg.qualityLane === 'off' ? '关' : cfg.qualityLane === 'always' ? `每轮（${cfg.distillProvider}/${cfg.distillModel}）` : `采样 1/3（${cfg.distillProvider}/${cfg.distillModel}）`],
     ['蒸馏', cfg.distillProvider !== '' && cfg.distillModel !== '' ? `${cfg.distillProvider}/${cfg.distillModel}，每 ${cfg.distillEveryTurns} 轮` : '未配置模型（/topics set distill-provider / distill-model）'],
+    ['整理', cadenceLabel(cfg.consolidateCadence) + (cfg.consolidateCadence === 'off' ? '' : `（复用蒸馏模型，/topics consolidate 立即跑）`)],
   ]
   // Last lane outcome (distill-state summary) — what "checkable via
   // /topics status" promises; absent until the first run of this bundle.
@@ -136,6 +148,20 @@ async function renderStatus(service: TopicsService): Promise<string> {
         : `失败（${String(lastRun.reason ?? 'unknown')}）`
     const gc = typeof lastRun.gcDropped === 'number' && lastRun.gcDropped > 0 ? `，GC 回收 ${lastRun.gcDropped}` : ''
     rows.push(['最近蒸馏', `${outcome}${gc} @ ${cell(String(lastRun.at ?? '').slice(0, 19).replace('T', ' '))}`])
+  }
+  const lastConsolidate = await service.store.readConsolidateState()
+  if (lastConsolidate !== undefined) {
+    const count = (v: unknown): number => (Array.isArray(v) ? v.length : 0)
+    const counts = [
+      `合并 ${count(lastConsolidate.merged)}`,
+      `晋升 ${count(lastConsolidate.promoted)}`,
+      `废弃 ${count(lastConsolidate.deprecated)}`,
+      `刷新 ${count(lastConsolidate.refreshed)}`,
+    ].join('/')
+    rows.push([
+      '最近整理',
+      `${counts} @ ${cell(String(lastConsolidate.at ?? '').slice(0, 19).replace('T', ' '))}${lastConsolidate.ok === false && lastConsolidate.detail ? `（${String(lastConsolidate.detail).slice(0, 80)}）` : ''}`,
+    ])
   }
   if (service.sync !== undefined) {
     rows.push(['上次推送', cell(String(service.sync.lastPushAt ?? '从未'))])
@@ -156,6 +182,59 @@ async function renderStatus(service: TopicsService): Promise<string> {
  * summary mirrors the distill state fields (ok / marked / created / updated /
  * gc dropped / reason) so what the user sees is what the state file records.
  */
+/** Human-readable cadence for status/consolidate output. */
+function cadenceLabel(value: string): string {
+  switch (value) {
+    case 'daily':
+      return '每天'
+    case '3d':
+      return '每 3 天'
+    case '7d':
+      return '每 7 天'
+    default:
+      return '关'
+  }
+}
+
+/**
+ * `/topics consolidate` — one manual run of the consolidation lane (LLM
+ * gardener over the existing pool). Bypasses the cadence gate; the lane's
+ * own in-flight guard dedups a concurrent automatic run. Output mirrors the
+ * lane's actions with per-op reasons so the user can eyeball (and git-revert)
+ * what the model decided.
+ */
+async function doConsolidate(service: TopicsService, invocation: CommandInvocation, consolidateNow: ManualConsolidate | undefined): Promise<CommandResult> {
+  if (consolidateNow === undefined) return fail('整理 lane 未接线（宿主未提供手动整理触发器）')
+  const cfg = service.cfg
+  if (cfg.distillProvider === '' || cfg.distillModel === '') {
+    return fail('整理复用蒸馏模型路由：请先 /topics set distill-provider 与 distill-model。')
+  }
+  const result = await consolidateNow(invocation)
+  if (!result.ok) {
+    const reasonNote =
+      result.reason === 'no-clusters'
+        ? '没有找到可能相近的 topic 候选簇（词面上没有疑似重复/相关对）'
+        : result.reason === 'no-model'
+          ? '蒸馏模型未配置（/topics set distill-provider / distill-model）'
+          : result.reason === 'in-flight'
+            ? '已有整理在跑，稍后再试'
+            : (result.reason ?? 'unknown')
+    return fail(`整理未执行：${reasonNote}${result.detail !== undefined ? `\n   ${result.detail}` : ''}`)
+  }
+  const lines: string[] = []
+  const actions = result.actions ?? []
+  const KIND_LABEL: Record<string, string> = { merge: '合并', promote: '晋升', deprecate: '废弃', refresh: '刷新' }
+  for (const a of actions) {
+    if (a.kind === 'merge' && a.merged !== undefined) {
+      lines.push(`- 合并 ${a.merged.map((m) => cell(m)).join('、')} → ${cell(a.slug)}${a.reason !== undefined ? `：${a.reason}` : ''}`)
+    } else {
+      lines.push(`- ${KIND_LABEL[a.kind] ?? a.kind} ${cell(a.slug)}${a.reason !== undefined ? `：${a.reason}` : ''}`)
+    }
+  }
+  const header = `✅ 整理完成：合并 ${result.merged.length} 组；晋升 ${result.promoted.length}；废弃 ${result.deprecated.length}；刷新 ${result.refreshed.length}${result.droppedOps ? `（丢弃 ${result.droppedOps} 个无效 op）` : ''}${result.detail !== undefined ? `\n   ${result.detail}` : ''}`
+  return ok(lines.length === 0 ? header : `${header}\n${lines.join('\n')}\n全部变更已逐条 git commit，可 /topics history <slug> 追溯、git revert 回滚。`)
+}
+
 async function doDistill(service: TopicsService, invocation: CommandInvocation, distillNow: ManualDistill | undefined): Promise<CommandResult> {
   if (distillNow === undefined) return fail('蒸馏 lane 未接线（宿主未提供手动蒸馏触发器）')
   const pending = await service.store.undistilledObservations(1)

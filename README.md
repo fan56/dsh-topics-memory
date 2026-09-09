@@ -58,6 +58,7 @@ This plugin is not trying to be the model's notebook. It is trying to be the mod
 | `/topics onboard` | Interactive setup wizard on dsh-native ask-user panels (mode / repo / distill model / injection tier / auto-observe); typed fallback where no ask-user UI exists |
 | `/topics status` | Bundle health: topic count, observation backlog, conflicts, last distill outcome, sync status |
 | `/topics distill` | Manually trigger one distill run over the current observation pool (same lane, same in-flight guard; summary mirrors the distill-state fields) |
+| `/topics consolidate` | Manually trigger one consolidation run: the LLM gardener merges duplicates, promotes settled drafts, deprecates superseded entries, refreshes metadata — every change is its own git commit, revert to roll back |
 | `/topics stats` | Injection stats: hit rate, top-N, near-miss distribution, tuning advice |
 | `/topics list` / `show` / `history` | Browse topics, backlinks, and change history |
 | `/topics graph` | Generate a relationship-graph web page (force-directed, draggable/zoomable, hover for conclusions) and open it in the browser |
@@ -121,6 +122,7 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `distillOnSessionEnd` | `true` | Distill once when a session ends |
 | `distillBatchSize` | `40` | Observations per distill model call. On an output-limit (`max-tokens`) failure the batch halves automatically (floor 5) and retries — a failing batch can no longer livelock the backlog; the shrink persists until reload or a config change. Note: `/topics set distillBatchSize` back to the same value does not reset the shrink — set a different value or reload the plugin |
 | `distillMaxModelCalls` | `8` | Max model calls per distill run, including the one corrective retry for ops echoing no valid `observed_ids` (the run stalls when the budget can't fit it). Batches already distilled keep their marks when the budget stops the run (partial progress), recorded as `partial: …` in the distill state |
+| `consolidateCadence` | `daily` | Consolidation-lane cadence: `daily`/`3d`/`7d`/`off`. At session start the plugin checks the last consolidation time (`meta/consolidate-state.json`) and, when due, runs the LLM gardener in the background (reusing the distill model route): local lexical clustering only feeds near-look-alike candidate clusters; four op kinds merge/promote/deprecate/refresh, out-of-scope ops are dropped; a failed call never advances the stamp, so the next start retries |
 | `pushDebounceSeconds` | `45` | GitHub-mode debounced push interval |
 
 ## Acknowledgements
