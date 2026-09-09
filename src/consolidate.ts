@@ -95,6 +95,7 @@ export const CONSOLIDATE_SYSTEM_PROMPT = [
   '- merge 只用于结论重复或高度重叠的条目：conclusion 必须是合并后的完整结论（自含、不依赖原文也能读懂），取双方有效信息的并集，不丢关键事实；survivor 选信息更全或更新的那条。',
   '- refresh 禁止改结论——它只能修 title/description/tags/triggers；想改结论就用 merge 或不要动。',
   '- slug 必须从输入里逐字复制，禁止改写、缩写或编造；survivor 不得出现在它自己的 merged 里。',
+  '- payload 里的 injections30d/opens30d 是该 topic 近 30 天被注入命中的次数与被点开的次数：0 表示近期从未被检索命中，可作为 deprecate 或 refresh（修命名/标签）的支持证据；但不要仅凭零使用就 deprecate——新条目和小众但关键的条目也会零命中。',
   '- 拿不准就不动：宁可输出 {"ops":[]}。禁止 create 新 topic，禁止输出这四类之外的 op。',
   '- 全部用中文写内容；tags 全小写。',
 ].join('\n')
@@ -434,6 +435,7 @@ export class Consolidator {
   /** Read the active pool and cluster it lexically. */
   private async buildClusters(): Promise<TopicCluster[]> {
     const metas = await this.service.store.listTopics()
+    const usage = this.service.usageSignalsSync()
     const entries: ClusterEntry[] = []
     for (const m of metas) {
       if (m.status === 'deprecated') continue
@@ -457,13 +459,29 @@ export class Consolidator {
   private async runCluster(sessionId: string | undefined, cluster: TopicCluster): Promise<ClusterOutcome> {
     const caller = this.caller
     if (caller === undefined) return { ops: [], fatal: 'model-error', detail: 'consolidate caller unavailable' }
-    const payload = cluster.entries.map((e) => ({
-      slug: e.slug,
-      title: e.title,
-      status: e.status,
-      tags: e.tags,
-      conclusion: e.conclusion,
-    }))
+    const usage = this.service.usageSignalsSync()
+    // The aggregate map only keys slugs WITH signals — but "0 hits in 30d" is
+    // exactly the gardening evidence the guardrail sentence talks about. When
+    // the logs are non-empty, absence from the map IS a measured zero; when
+    // they're empty (fresh bundle) the fields stay absent rather than lying.
+    const usageKnown = usage.size > 0
+    const usageOf = (slug: string): { injections30d: number; opens30d: number } | undefined => {
+      if (!usageKnown) return undefined
+      const u = usage.get(slug)
+      return { injections30d: u?.hits ?? 0, opens30d: u?.opens ?? 0 }
+    }
+    const payload = cluster.entries.map((e) => {
+      const base: Record<string, unknown> = {
+        slug: e.slug,
+        title: e.title,
+        status: e.status,
+        tags: e.tags,
+        conclusion: e.conclusion,
+      }
+      const u = usageOf(e.slug)
+      if (u !== undefined) Object.assign(base, u)
+      return base
+    })
     const user = [
       `候选簇（${payload.length} 条可能相近的 topic）：`,
       JSON.stringify(payload),

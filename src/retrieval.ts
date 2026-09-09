@@ -40,7 +40,20 @@ export interface RetrievalConfig {
    * self-cross. Off for the explicit topic_search tool (the model asked).
    */
   structuralGate: boolean
+  /**
+   * UsageBoost (ADR 0015): behavioral bonus for topics used within the
+   * rolling window. Gate-scoped but double-locked — capped below the
+   * threshold and never granted to a zero-lexical candidate; the structural
+   * gate still requires lexical evidence. 0 = off.
+   */
+  usageBoost: number
+  /** Usage signals per slug (hits/opens in the window); absent map = no boost. */
+  usage?: ReadonlyMap<string, { hits: number; opens: number }>
 }
+
+/** Hard cap for the usage bonus — below threshold 0.3 so usage can never
+ *  carry a candidate across the gate on its own (ADR 0015). */
+export const USAGE_BOOST_CAP = 0.2
 
 export const DEFAULT_RETRIEVAL: RetrievalConfig = {
   threshold: 0.3,
@@ -49,6 +62,7 @@ export const DEFAULT_RETRIEVAL: RetrievalConfig = {
   graphDepth: 2,
   recencyWindowDays: 7,
   structuralGate: true,
+  usageBoost: 0.15,
 }
 
 /** Trigger hits outrank every other lexical field (pi-llm-wiki: highest weight). */
@@ -115,7 +129,8 @@ export interface ScoredTopic {
   strong: boolean
   /** Distinct query terms found in description ∪ conclusion — pass condition B is ≥2. */
   bodyHits: number
-  /** Score with the recency tiebreaker removed — the only score the gate looks at. */
+  /** Score with the recency tiebreaker removed — the score the numeric gate
+   *  looks at (lexical + tags + usageBoost; recency excluded, ADR 0015). */
   gateScore: number
 }
 
@@ -178,6 +193,18 @@ export function scoreTopic(
     const boost = Math.min(cfg.tagBoost * tagHits, cfg.tagBoost)
     score += boost
     reasons.push(`tag-boost:+${boost.toFixed(2)}`)
+  }
+  // UsageBoost (ADR 0015) — gate-scoped behavioral bonus, unlike recency it
+  // IS part of gateScore. Double-locked: capped below the threshold, and a
+  // zero-lexical candidate (score === 0 here) never qualifies. Presence of a
+  // signal is the trigger, not its magnitude — votes never scale the bonus.
+  if (cfg.usageBoost > 0 && score > 0 && cfg.usage !== undefined) {
+    const u = cfg.usage.get(topic.slug)
+    if (u !== undefined && (u.hits > 0 || u.opens > 0)) {
+      const boost = Math.min(cfg.usageBoost, USAGE_BOOST_CAP)
+      score += boost
+      reasons.push(`usage:+${boost.toFixed(2)}`)
+    }
   }
   // Recency is a RANKING tiebreaker only (v4): it pads `score` but is kept
   // out of `gateScore`, so it can never carry a candidate across the numeric

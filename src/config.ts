@@ -67,6 +67,11 @@ export const TopicsConfig = z.object({
    *  (local TTL sweep, no model; each drop is its own git commit, so history
    *  stays recoverable on the remote). 0 disables the sweep. */
   deprecatedTtlDays: z.number().default(15),
+  /** UsageBoost (ADR 0015): behavioral bonus for topics injected/opened in
+   *  the last 30 days, folded into the gate score — capped at 0.2 and never
+   *  granted to zero-lexical candidates; the structural gate still applies.
+   *  0 = off. */
+  usageBoost: z.number().default(0.15),
   /** Debounced push delay in GitHub mode. */
   pushDebounceSeconds: z.number().default(45),
 })
@@ -96,6 +101,7 @@ export type TopicsConfigValue = {
   distillMaxModelCalls: number
   consolidateCadence: string
   deprecatedTtlDays: number
+  usageBoost: number
   pushDebounceSeconds: number
 }
 
@@ -124,6 +130,7 @@ export const CONFIG_KEYS = [
   'distillMaxModelCalls',
   'consolidateCadence',
   'deprecatedTtlDays',
+  'usageBoost',
   'pushDebounceSeconds',
 ] as const
 
@@ -181,7 +188,8 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
       return { error: 'quality-lane 取值 off|sampled|always' }
     }
     case 'matchThreshold':
-    case 'tagBoost': {
+    case 'tagBoost':
+    case 'usageBoost': {
       const n = Number(raw)
       if (!Number.isFinite(n) || n < 0) return { error: `${key} 需要非负数` }
       return n

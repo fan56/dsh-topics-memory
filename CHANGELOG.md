@@ -9,6 +9,7 @@
 - **四类动作、越权即弃**：merge（结论并集合并，survivor 存活、被并入条目标 deprecated 并在结论顶部留指向 survivor 的指针行）、promote（draft → stable）、deprecate（status 标记，不删正文）、refresh（仅 title/description/tags/triggers 元数据；**禁止改结论**——重写结论是 merge 的专属路径）。禁止 create；slug 必须逐字来自 bundle，自合并/幽灵 slug/缺结论/越权 refresh 一律丢弃计数，单 run 最多应用 12 个 op。
 - **`/topics consolidate` 手动命令**：无视 cadence 立即跑，逐动作输出理由；全部变更走正常 saveTopic 路径逐条 git commit——`/topics history <slug>` 可追溯，`git revert` 即回滚。`/topics status` 新增「整理」行（节拍 + 最近整理结果）。
 - **deprecated TTL 清扫（新配置 `deprecated-ttl-days`，默认 `15`，`0` 关闭）**：deprecated 条目超过 N 天在会话启动时自动删除——纯本地规则、不依赖模型路由（蒸馏未配置也照常清扫）。时间基准是 `generated.at`（deprecated 条目落定后无人再动，该戳即"进入废弃的时刻"）；每条删除独立 git commit（消息含废弃日期），远端历史永久可找回；时间戳不可解析的条目跳过不猜。删除发生时打宿主日志列明清单。
+- **使用信号回路（ADR 0015，新配置 `usage-boost`，默认 `0.15`，`0` 关闭）**：ilog 里免费积累的行为数据首次反馈回检索——近 30 天被注入命中（1 票）/`topic_open` 点开（3 票）的 Topic 检索加分，计入门槛数字分但三重约束：帽 0.2（低于 0.3 阈值，使用永远不足以单独抬条目过门）、词面分为 0 不加（零相关不靠资历入选）、结构门不豁免（ADR 0014 不变式）。命中条目的 reasons 带 `usage:+n` 回放证据；聚合结果 mtime 缓存，冷启动零影响。动机：命名漂移的常用条目（弱词面、常年 gate 之下）终于能被使用史捞起来。同源统计（`injections30d`/`opens30d`）进整理 lane 簇 payload，prompt 加零使用护栏句——「冷门」是 deprecate/refresh 的支持证据而非充分条件。
 - **修 retired 条目仍参与注入（整理语义的硬依赖）**：`roster()` / `rosterSync()` 现在排除 deprecated——此前 deprecated 只是统计口径，命中、排序、注入、depends 图游走照旧，合并退场的旧条目会继续和 survivor 抢注入预算。
 - 测试 267 → 282：分簇（重复聚簇/单例丢弃/封顶 6）、cadence 门（off/首跑/未到期/到期）、merge/promote/deprecate/refresh 落盘与指针行、6 类无效 op 丢弃、失败不推进时间戳、单飞去重、roster 排除 deprecated，另有一条真实备份语料（136 条，本地副本、零网络）断言一字不差重复对必落同簇。
 

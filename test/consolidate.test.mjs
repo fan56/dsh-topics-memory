@@ -102,9 +102,40 @@ test('cadenceDays mapping', () => {
   assert.equal(Consolidator.cadenceDays('weekly'), undefined)
 })
 
-test('system prompt forbids create and refresh-conclusion rewrites', () => {
+test('system prompt forbids create and refresh-conclusion rewrites, guards zero-usage', () => {
   assert.match(CONSOLIDATE_SYSTEM_PROMPT, /禁止 create/)
   assert.match(CONSOLIDATE_SYSTEM_PROMPT, /refresh 禁止改结论/)
+  assert.match(CONSOLIDATE_SYSTEM_PROMPT, /injections30d/)
+  assert.match(CONSOLIDATE_SYSTEM_PROMPT, /不要仅凭零使用就 deprecate/)
+})
+
+test('consolidator: cluster payload carries usage counts (0 when logs non-empty, absent when empty)', async () => {
+  let captured
+  const h = make(undefined, async (req) => {
+    captured = req.user
+    return JSON.stringify({ ops: [] })
+  })
+  try {
+    await h.store.ensure()
+    await seed(h, [
+      { title: '相近主题甲 keyspace 洪泛', tags: ['redis'] },
+      { title: '相近主题甲 keyspace 洪泛评估', tags: ['redis'] },
+    ])
+    // Empty IL → usage unknown → fields absent.
+    await h.consolidator.run()
+    assert.ok(!captured.includes('injections30d'), 'empty IL: fields absent, not lying zeros')
+    // Non-empty IL → measured zeros surface for the guardrail.
+    await h.store.appendInjectionRecord({
+      at: new Date().toISOString(), injected: true, queryTokenCount: 2, rosterSize: 2,
+      hits: [{ slug: 'x', score: 1, reasons: [], viaGraph: false }],
+    })
+    h.service.invalidate()
+    await h.consolidator.run()
+    assert.match(captured, /"injections30d":0/)
+    assert.match(captured, /"opens30d":0/)
+  } finally {
+    h.cleanup()
+  }
 })
 
 test('consolidator: no caller wired → no-model', async () => {

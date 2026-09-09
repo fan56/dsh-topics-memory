@@ -138,3 +138,56 @@ export function querySample(query: string): string {
   const words = query.replace(/\s+/g, ' ').trim()
   return words.length <= 40 ? words : `${words.slice(0, 40)}…`
 }
+
+/** Rolling usage-signal window (ADR 0015) — days of Injection/Open history. */
+export const USAGE_WINDOW_DAYS = 30
+
+export interface UsageSignal {
+  hits: number
+  opens: number
+}
+
+/**
+ * Usage signals per slug over a rolling window (ADR 0015): an injection hit
+ * (truly assembled, not deduped/echoed/dropped) counts 1, a topic_open counts
+ * 3 — the model chose to read the full text, the strongest "this helped"
+ * evidence available. Downstream, only PRESENCE matters (the boost is a
+ * fixed capped bonus, never linear in votes); the counts exist for the
+ * consolidation payload, where "0 vs many" is the gardening evidence.
+ */
+export function aggregateUsage(
+  injections: readonly InjectionRecord[],
+  opens: readonly { slug: string; at: string }[],
+  windowDays: number,
+  now: number,
+): Map<string, UsageSignal> {
+  const cutoff = now - windowDays * 86_400_000
+  const out = new Map<string, UsageSignal>()
+  const bump = (slug: string, kind: keyof UsageSignal): void => {
+    if (slug === '') return
+    const entry = out.get(slug) ?? { hits: 0, opens: 0 }
+    entry[kind] += 1
+    out.set(slug, entry)
+  }
+  for (const record of injections) {
+    const at = Date.parse(record.at)
+    if (!Number.isFinite(at) || at < cutoff) continue
+    if (record.injected !== true) continue
+    const excluded = new Set<string>([
+      ...(record.deduped ?? []),
+      ...(record.echoed ?? []),
+      ...(record.dropped ?? []).map((d) => d.slug),
+    ])
+    for (const hit of record.hits) {
+      if (excluded.has(hit.slug)) continue
+      bump(hit.slug, 'hits')
+    }
+    for (const slow of record.slow ?? []) bump(slow.slug, 'hits')
+  }
+  for (const open of opens) {
+    const at = Date.parse(open.at)
+    if (!Number.isFinite(at) || at < cutoff) continue
+    bump(open.slug, 'opens')
+  }
+  return out
+}

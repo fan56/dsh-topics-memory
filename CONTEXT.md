@@ -79,3 +79,11 @@ _Avoid_: context injection、inject
 **Injection Log**：
 每轮检索的决策记录：命中 Topic、得分、命中原因、注入与否（含 near-miss）、预算占用；是调参与 stats 聚合的依据。
 _Avoid_: usage log、telemetry
+
+**Open**：
+模型跟随注入指针、用 `topic_open` 工具读取 Topic 全文的动作。Open 是比命中更强的使用信号——命中只说明「被检索选中」，Open 说明「模型认为值得细读」。
+_Avoid_: view、read、click
+
+**UsageBoost**：
+近 30 天使用信号（Injection 命中与 Open 按票权折算）对检索得分的加成项，让「实际帮到过对话」的 Topic 更容易被再次选中；它受结构门与上限约束，永不救起零词面相关的条目。
+_Avoid_: quality score、popularity、评分

@@ -1,6 +1,6 @@
 ---
 name: dsh-topics-memory-config
-description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、autoInject、记忆库、llmwiki、include-subagents。"
+description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、usageBoost、使用加成、autoInject、记忆库、llmwiki、include-subagents。"
 ---
 
 # dsh-topics-memory 使用指南（工作记忆 / 蒸馏 / 注入）
@@ -38,6 +38,7 @@ description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指
 | `distillMaxModelCalls` | `8` | 单次蒸馏 run 的模型调用预算（预算耗尽即停，已成功批次保留标记） |
 | `consolidateCadence` | `daily` | 整理 lane 节拍：daily／3d／7d／off。会话启动时检查上次整理时间，到期即在后台跑 LLM 园丁（复用蒸馏模型路由）：合并重复、晋升 stable、废弃过时、刷新元数据；off 关闭 |
 | `deprecatedTtlDays` | `15` | deprecated 条目超过 N 天在会话启动时自动删除（本地规则不依赖模型，逐条 git commit 可回溯找回）；0 关闭清扫 |
+| `usageBoost` | `0.15` | 使用加成（ADR 0015）：近 30 天被注入命中/点开过的 Topic 检索加分（计入门槛分，帽 0.2，零词面相关不加，结构门不豁免）；`0` 关闭 |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
 
 - 全部键都可用 `/topics set <键> <值>` 运行时写回同段（即时校验：boolean 用 on|off、

@@ -193,3 +193,51 @@ test('gate v0: graph expansion stays exempt from the structural gate', () => {
   const out = searchTopics('图种子', [seed, neighbor], cfg)
   assert.ok(out.hits.some((h) => h.slug === 'neighbor' && h.viaGraph), 'graph neighbor still injects')
 })
+
+// ---- UsageBoost (ADR 0015) ----
+
+test('usageBoost: rescues a weak-lexical used topic across the gate, with evidence', () => {
+  // 8 query tokens; the topic's body hits exactly 2 → gateScore 0.2, under gate.
+  const query = '蒸馏 适配器 超时 回滚 折叠 语义 回放 命名'
+  const roster = [
+    { slug: 'renamed-legacy', title: 'codebase-memory 接入方案', tags: [], depends: [], generatedAt: '2026-09-01T00:00:00Z', conclusion: '适配器 超时', status: 'stable' },
+    { slug: 'shiny-new', title: '完全无关的另一件事', tags: [], depends: [], generatedAt: '2026-09-08T00:00:00Z', conclusion: '别的东西', status: 'draft' },
+  ]
+  const cfg = { usageBoost: 0.15, structuralGate: true }
+  const without = searchTopics(query, roster, cfg)
+  assert.ok(!without.hits.some((h) => h.slug === 'renamed-legacy'), 'no usage → gateScore 0.2 stays below 0.3')
+
+  const withUsage = searchTopics(query, roster, {
+    ...cfg,
+    usage: new Map([['renamed-legacy', { hits: 9, opens: 2 }]]),
+  })
+  const hit = withUsage.hits.find((h) => h.slug === 'renamed-legacy')
+  assert.ok(hit, 'usage rescues the weak-lexical used topic across the gate (0.2 + 0.15 = 0.35)')
+  assert.ok(hit.reasons.some((r) => r.startsWith('usage:')))
+  // gateScore (the numeric-gate score) carries the boost; bodyHits>=2 passes the structural gate.
+  assert.ok(hit.gateScore > 0.3 && hit.gateScore < 0.42, `gateScore just past the gate, got ${hit.gateScore}`)
+})
+
+test('usageBoost: capped at 0.2, zero-lexical never boosted, 0 disables', () => {
+  const query = '蒸馏 适配器 超时 回滚 折叠 语义 回放 命名'
+  const roster = [
+    { slug: 'weak', title: 'codebase-memory 接入方案', tags: [], depends: [], generatedAt: '2026-09-01T00:00:00Z', conclusion: '适配器 超时', status: 'draft' },
+    { slug: 'no-lexical', title: '风马牛不相及', tags: [], depends: [], generatedAt: '2026-09-01T00:00:00Z', conclusion: '别的领域', status: 'draft' },
+  ]
+  const hugeUsage = new Map([
+    ['weak', { hits: 999, opens: 999 }],
+    ['no-lexical', { hits: 999, opens: 999 }],
+  ])
+  // Config 0.5 → effective 0.2 cap: gateScore 0.2 + 0.2 = 0.4, never 0.7.
+  const boosted = searchTopics(query, roster, { usageBoost: 0.5, structuralGate: true, usage: hugeUsage })
+  const weak = boosted.hits.find((h) => h.slug === 'weak')
+  assert.ok(weak, 'weak lexical + capped usage crosses the gate')
+  assert.ok(weak.gateScore < 0.5, `cap holds: gateScore ${weak.gateScore} (uncapped would be ~0.77)`)
+  // Zero-lexical candidate: score===0 → boost never granted, never in hits.
+  const none = searchTopics(query, roster, { usageBoost: 0.5, structuralGate: false, usage: hugeUsage })
+  assert.ok(!none.hits.some((h) => h.slug === 'no-lexical'), 'zero-lexical never rides usage into hits')
+  // usageBoost: 0 → identical hit set to a run with no usage map at all.
+  const off = searchTopics(query, roster, { usageBoost: 0, structuralGate: true, usage: hugeUsage })
+  const base = searchTopics(query, roster, { usageBoost: 0.15, structuralGate: true })
+  assert.deepEqual(off.hits.map((h) => h.slug), base.hits.map((h) => h.slug))
+})

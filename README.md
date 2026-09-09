@@ -124,6 +124,7 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `distillMaxModelCalls` | `8` | Max model calls per distill run, including the one corrective retry for ops echoing no valid `observed_ids` (the run stalls when the budget can't fit it). Batches already distilled keep their marks when the budget stops the run (partial progress), recorded as `partial: …` in the distill state |
 | `consolidateCadence` | `daily` | Consolidation-lane cadence: `daily`/`3d`/`7d`/`off`. At session start the plugin checks the last consolidation time (`meta/consolidate-state.json`) and, when due, runs the LLM gardener in the background (reusing the distill model route): local lexical clustering only feeds near-look-alike candidate clusters; four op kinds merge/promote/deprecate/refresh, out-of-scope ops are dropped; a failed call never advances the stamp, so the next start retries |
 | `deprecatedTtlDays` | `15` | Deprecated topics older than N days are dropped at session start (local rule, no model; each drop is its own git commit — history stays recoverable); `0` disables the sweep |
+| `usageBoost` | `0.15` | Usage boost (ADR 0015): topics injected/opened in the last 30 days score higher at retrieval (gate-scoped, capped at 0.2, never granted to zero-lexical candidates, structural gate not waived); `0` disables |
 | `pushDebounceSeconds` | `45` | GitHub-mode debounced push interval |
 
 ## Acknowledgements

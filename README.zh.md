@@ -124,6 +124,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `distillMaxModelCalls` | `8` | 单次蒸馏 run 的模型调用预算，含 ops 未回显有效 `observed_ids` 时的纠错重试（至多一次，预算放不下即零消费停机）。预算耗尽即停，已成功的批次照常 markDistilled（部分前进优于零前进），distill state 记 `partial: …` |
 | `consolidateCadence` | `daily` | 整理 lane 节拍：`daily`/`3d`/`7d`/`off`。会话启动时检查上次整理时间（`meta/consolidate-state.json`），到期即在后台自动跑 LLM 园丁（复用蒸馏模型路由）：本地词面聚类只送「长得像」的候选簇，四类动作 merge/promote/deprecate/refresh，越权 op 一律丢弃；模型调用失败不推进节拍，下次启动重试 |
 | `deprecatedTtlDays` | `15` | deprecated 条目超过 N 天在会话启动时自动删除（本地规则不依赖模型，逐条 git commit 可回溯找回）；`0` 关闭清扫 |
+| `usageBoost` | `0.15` | 使用加成（ADR 0015）：近 30 天被注入命中/点开过的 Topic 检索加分（计入门槛分、帽 0.2、零词面相关不加、结构门不豁免）；`0` 关闭 |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
 
 ## Acknowledgements

@@ -14,7 +14,7 @@ import { searchTopics, scoreTopic, passesGate, tokenize, type RetrievableTopic, 
 import { assembleInjection, assemblePointer, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type SlowPointerInput } from './digest.ts'
 import type { BundleStore, Observation, SaveResult } from './store.ts'
 import type { TopicsConfigValue } from './config.ts'
-import { aggregateStats, querySample, type AggregateStats, type InjectionRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem } from './ilog.ts'
+import { aggregateStats, querySample, aggregateUsage, USAGE_WINDOW_DAYS, type AggregateStats, type InjectionRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type UsageSignal } from './ilog.ts'
 import { fileHistory, fileAtRev } from './git.ts'
 import type { Sync } from './sync.ts'
 
@@ -50,6 +50,13 @@ export class TopicsService {
   private cache = new Map<string, CacheEntry>()
   /** mtime-keyed parse of the observations log, grouped by session. */
   private echoCache: { mtimeMs: number; size: number; bySession: Map<string, Set<string>> } | undefined
+  private usageCache: {
+    injMs: number
+    injSize: number
+    opensMs: number
+    opensSize: number
+    signals: Map<string, UsageSignal>
+  } | undefined
   readonly store: BundleStore
   private readonly getConfig: () => TopicsConfigValue
   readonly sync?: Sync
@@ -124,6 +131,7 @@ export class TopicsService {
   invalidate(): void {
     this.cache.clear()
     this.echoCache = undefined
+    this.usageCache = undefined
   }
 
   /**
@@ -175,6 +183,68 @@ export class TopicsService {
   }
 
   /**
+   * Usage signals (ADR 0015): mtime-cached aggregate over the injection log
+   * and the opens log, rolling USAGE_WINDOW_DAYS. Synchronous like
+   * echoSlugsSync — the retrieval hot path is sync — and cheap when warm:
+   * a fresh cache costs two stat() calls. Unreadable logs fail open to an
+   * empty map (no boost), never an error.
+   */
+  usageSignalsSync(): Map<string, UsageSignal> {
+    const injFile = join(this.store.metaDir(), 'injections.jsonl')
+    const opensFile = join(this.store.metaDir(), 'opens.jsonl')
+    const statOf = (file: string): { mtimeMs: number; size: number } => {
+      try {
+        const st = statSync(file)
+        return { mtimeMs: st.mtimeMs, size: st.size }
+      } catch {
+        return { mtimeMs: 0, size: 0 }
+      }
+    }
+    const injSt = statOf(injFile)
+    const opensSt = statOf(opensFile)
+    const cached = this.usageCache
+    if (
+      cached !== undefined &&
+      cached.injMs === injSt.mtimeMs &&
+      cached.injSize === injSt.size &&
+      cached.opensMs === opensSt.mtimeMs &&
+      cached.opensSize === opensSt.size
+    ) {
+      return cached.signals
+    }
+    const parseLines = <T>(file: string): T[] => {
+      const out: T[] = []
+      try {
+        for (const line of readFileSync(file, 'utf8').split('\n')) {
+          if (line.trim() === '') continue
+          try {
+            out.push(JSON.parse(line) as T)
+          } catch {
+            continue // torn tail line
+          }
+        }
+      } catch {
+        // unreadable log: contribute nothing
+      }
+      return out
+    }
+    const signals = aggregateUsage(
+      parseLines(injFile),
+      parseLines(opensFile),
+      USAGE_WINDOW_DAYS,
+      Date.now(),
+    )
+    this.usageCache = {
+      injMs: injSt.mtimeMs,
+      injSize: injSt.size,
+      opensMs: opensSt.mtimeMs,
+      opensSize: opensSt.size,
+      signals,
+    }
+    return signals
+  }
+
+  /**
    * Full retrieval round: search → assemble → log (ADR 0006/0007). The
    * injection record is written even for zero-hit rounds — the hit-rate
    * denominator must count every round (near-miss evidence).
@@ -197,6 +267,8 @@ export class TopicsService {
       graphDepth: cfg.graphDepth,
       recencyWindowDays: cfg.recencyWindowDays,
       conflicts,
+      usageBoost: cfg.usageBoost,
+      usage: this.usageSignalsSync(),
     })
     const bySlug = new Map(roster.map((r) => [r.slug, r]))
     const entries: DigestInput[] = []
@@ -294,6 +366,8 @@ export class TopicsService {
       graphDepth: cfg.graphDepth,
       recencyWindowDays: cfg.recencyWindowDays,
       conflicts,
+      usageBoost: cfg.usageBoost,
+      usage: this.usageSignalsSync(),
     })
     const exclude = dedup?.exclude
     const echo = dedup?.echo
@@ -351,6 +425,8 @@ export class TopicsService {
           recencyWindowDays: cfg.recencyWindowDays,
           conflicts,
           structuralGate: true,
+          usageBoost: cfg.usageBoost,
+          usage: this.usageSignalsSync(),
         })
         shadow.push({
           slug: item.slug,
@@ -628,6 +704,8 @@ export class TopicsService {
       // structural gate must not hide results.
       structuralGate: false,
       conflicts: await this.store.getConflicts(),
+      usageBoost: cfg.usageBoost,
+      usage: this.usageSignalsSync(),
     })
   }
 
