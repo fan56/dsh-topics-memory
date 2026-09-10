@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Changed
+- dsh closure moved to 0.1.5-rc.1（dev pins、locks）。
+- 观察器改为从 `assistant/message` 结算事件读取助手文本——firehose 上已无流式 `assistant/chunk` 事件；失败的尝试（`assistant/attempt`）有意跳过：那些文本从未抵达用户。
+
 ## 0.14.0 (2026-09-09)
 
 整理 lane（consolidation）——「记忆是编辑出来的不是攒出来的」的后半句落地：蒸馏把观察沉淀成 topic，整理让 LLM 园丁定期修剪已落库的 topic 池本身（2026-09-09 语料审计：136 条中存在一字不差的重复对、同主题碎片化 3~5 条、50 条 draft 无人晋升）：

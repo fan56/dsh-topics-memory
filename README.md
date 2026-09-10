@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 A dsh plugin: maintains "working topic memory" as an [OKF (Open Knowledge Format v0.2)](https://github.com/GoogleCloudPlatform/open-knowledge-format) knowledge bundle, persisted in a local git repository (optionally synced to a private GitHub repo), with conclusions traceable through git history, sessions automatically observed and distilled into knowledge, and relevant topics injected to the model before every turn.
 
-> **Requires dsh >= 0.1.2-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
+> **Requires dsh >= 0.1.5-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
 
 ## Demo
 
