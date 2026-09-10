@@ -39,14 +39,16 @@ function make() {
 
 const userMsg = (text) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
 const pluginMsg = (text) => ({ source: { kind: 'plugin' }, content: [{ type: 'text', text }] })
+// dsh 0.1.5-rc.1: streaming chunks are gone — the assistant side arrives as
+// `assistant/message` settlements carrying the committed message.
+const assistantMsg = (text) => ({ role: 'assistant', content: [{ type: 'text', text }] })
 
 test('observer: captures user+assistant text per turn as auto observation', async () => {
   const h = make()
   try {
     await h.store.ensure()
     h.observer.onSessionEvent('s1', 'user/message', userMsg('怎么配置 dsh cron？'))
-    h.observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '用 OS cron，' } })
-    h.observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '窗口一年。' } })
+    h.observer.onSessionEvent('s1', 'assistant/message', assistantMsg('用 OS cron，窗口一年。'))
     h.observer.onSessionEvent('s1', 'turn/end', {})
     await new Promise((r) => setTimeout(r, 30))
     const obs = await h.store.allObservations()
@@ -89,7 +91,7 @@ test('observer: image blocks in user messages are skipped, text alongside still 
         { type: 'text', text: '评估迁移风险' },
       ],
     })
-    h.observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '迁移风险可控。' } })
+    h.observer.onSessionEvent('s1', 'assistant/message', assistantMsg('迁移风险可控。'))
     h.observer.onSessionEvent('s1', 'turn/end', {})
     await new Promise((r) => setTimeout(r, 30))
     const obs = await h.store.allObservations()
@@ -156,7 +158,7 @@ test('observer: autoObserve off stops capture but cadence still runs', async () 
     await h.store.ensure()
     h.setCfg({ autoObserve: false })
     h.observer.onSessionEvent('s1', 'user/message', userMsg('问题'))
-    h.observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '答案' } })
+    h.observer.onSessionEvent('s1', 'assistant/message', assistantMsg('答案'))
     h.observer.onSessionEvent('s1', 'turn/end', {})
     await new Promise((r) => setTimeout(r, 30))
     assert.equal((await h.store.allObservations()).length, 0)
@@ -172,7 +174,7 @@ test('observer: truncation bounds long turns', async () => {
     await h.store.ensure()
     h.setCfg({ observationMaxChars: 50 })
     h.observer.onSessionEvent('s1', 'user/message', userMsg('长'.repeat(500)))
-    h.observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '答'.repeat(500) } })
+    h.observer.onSessionEvent('s1', 'assistant/message', assistantMsg('答'.repeat(500)))
     h.observer.onSessionEvent('s1', 'turn/end', {})
     await new Promise((r) => setTimeout(r, 30))
     const obs = (await h.store.allObservations())[0]
@@ -195,7 +197,7 @@ test('observer: throwing service never propagates into the session loop', async 
     }))
     const observer = new Observer(service, () => {})
     observer.onSessionEvent('s1', 'user/message', userMsg('问题'))
-    observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '答案' } })
+    observer.onSessionEvent('s1', 'assistant/message', assistantMsg('答案'))
     // Must not throw synchronously or reject.
     await new Promise((r) => setTimeout(r, 30))
   } finally {
@@ -215,7 +217,7 @@ test('observer: ring keeps the last 3 completed turns and copies out', async (t)
   const userMsg = (text) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
   for (let i = 1; i <= 5; i += 1) {
     observer.onSessionEvent('s1', 'user/message', userMsg(`u${i}`))
-    observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: `a${i}` } })
+    observer.onSessionEvent('s1', 'assistant/message', assistantMsg(`a${i}`))
     observer.onSessionEvent('s1', 'turn/end', {})
   }
   const ring = observer.recentTurns('s1')
@@ -236,7 +238,7 @@ test('observer: empty turns do not occupy ring slots; teardown drops the ring', 
   observer.onSessionEvent('s1', 'turn/end', {})
   assert.equal(observer.recentTurns('s1').length, 0, 'a turn with no text leaves no ring entry')
   observer.onSessionEvent('s1', 'user/message', { source: { kind: 'user' }, content: [{ type: 'text', text: 'u1' }] })
-  observer.onSessionEvent('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: 'a1' } })
+  observer.onSessionEvent('s1', 'assistant/message', assistantMsg('a1'))
   observer.onSessionEvent('s1', 'turn/end', {})
   assert.equal(observer.recentTurns('s1').length, 1)
   observer.onSessionEvent('s1', 'agent/disposed', undefined)

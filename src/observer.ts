@@ -111,9 +111,12 @@ export class Observer {
         state.assistantText = ''
         return
       }
-      case 'assistant/chunk': {
-        const chunk = (data as { chunk?: { type?: string; text?: string } }).chunk
-        if (chunk?.type === 'text-delta' && typeof chunk.text === 'string') state.assistantText += chunk.text
+      case 'assistant/message': {
+        // dsh 0.1.5-rc.1: streaming `assistant/chunk` events are gone — the
+        // settlement carries the committed message. Accumulate each round's
+        // text; turn/end reads the whole turn's transcript. Failed attempts
+        // (`assistant/attempt`) never reached the user, so they are skipped.
+        state.assistantText += textOf(data as UserMessageLike)
         return
       }
       case 'turn/end': {

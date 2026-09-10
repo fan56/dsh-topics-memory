@@ -402,7 +402,7 @@ test('wiring: turn/end produces a pending, the next spliced consumes it', async 
     agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm } })
     // A complete turn gives the ring buffer material; turn/end fires the lane.
     dispatch('s1', 'user/message', userMsg('echo marker qx7qz 还没处理完吗'))
-    dispatch('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '在看。' } })
+    dispatch('s1', 'assistant/message', { role: 'assistant', content: [{ type: 'text', text: '在看。' }] })
     dispatch('s1', 'turn/end', {})
     // Poll the fake llm's lane-call counter: both aux calls done → pending set.
     for (let i = 0; i < 150 && llm.laneCalls < 2; i += 1) await waitMs(20)
@@ -479,7 +479,7 @@ test('wiring: autoInject off → the slow lane never produces (no unconsumable s
     const llm = roleLlm()
     agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm } })
     dispatch('s1', 'user/message', userMsg('echo marker qx7qz 还没处理完吗'))
-    dispatch('s1', 'assistant/chunk', { chunk: { type: 'text-delta', text: '在看。' } })
+    dispatch('s1', 'assistant/message', { role: 'assistant', content: [{ type: 'text', text: '在看。' }] })
     dispatch('s1', 'turn/end', {})
     await waitMs(300)
     assert.equal(llm.laneCalls, 0, 'no aux LLM spend when injection is off')
