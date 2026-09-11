@@ -1,9 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.15.0 (2026-09-11)
 
 ### Changed
-- dsh closure moved to 0.1.5-rc.2（dev pins、locks）。
+- dsh 支持下限抬到 `>= 0.1.5-rc.2`（peer floors：`dsh-tools` / `dsh-llm` / `dsh-settings` / `dsh-skill` 等；README 同步），closure 随 0.1.5-rc.2 线（dev pins、locks；0.1.5 是 rc.1 的纯版本重钉、代码零差异）。
 - 观察器改为从 `assistant/message` 结算事件读取助手文本——firehose 上已无流式 `assistant/chunk` 事件；失败的尝试（`assistant/attempt`）有意跳过：那些文本从未抵达用户。
 
 ## 0.14.0 (2026-09-09)
