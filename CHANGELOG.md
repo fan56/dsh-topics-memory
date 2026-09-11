@@ -3,7 +3,7 @@
 ## Unreleased
 
 ### Changed
-- dsh closure moved to 0.1.5-rc.1（dev pins、locks）。
+- dsh closure moved to 0.1.5-rc.2（dev pins、locks）。
 - 观察器改为从 `assistant/message` 结算事件读取助手文本——firehose 上已无流式 `assistant/chunk` 事件；失败的尝试（`assistant/attempt`）有意跳过：那些文本从未抵达用户。
 
 ## 0.14.0 (2026-09-09)
