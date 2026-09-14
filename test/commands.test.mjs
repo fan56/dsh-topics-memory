@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BundleStore } from '../lib/store.js'
 import { TopicsService } from '../lib/service.js'
-import { buildTopicsCommand, tuningHint, HELP } from '../lib/commands.js'
+import { buildTopicsCommand, tuningHint, renderNearMissSparkline, HELP } from '../lib/commands.js'
 
 function makeService(cfgOverrides = {}) {
   const root = mkdtempSync(join(tmpdir(), 'topics-cmd-'))
@@ -581,6 +581,56 @@ test('tuningHint: dense near-miss band just below threshold suggests lowering', 
   // Healthy hit rate → no hint.
   const healthy = { ...stats, hitRate: 0.8, injectedRounds: 32 }
   assert.equal(tuningHint(healthy, 0.3), undefined)
+})
+
+test('renderNearMissSparkline: log-scaled strip with ticks, gaps as dots', () => {
+  const buckets = [
+    { bucket: '0.40–0.45', count: 178 },
+    { bucket: '0.45–0.50', count: 226 },
+    { bucket: '1.35–1.40', count: 1 },
+  ]
+  const [ticks, strip] = renderNearMissSparkline(buckets)
+  assert.equal(strip.length, 40) // 0.40–1.40 = 20 buckets × 2 cols
+  assert.ok(strip.startsWith('████'))
+  assert.ok(strip.endsWith('▂▂'))
+  assert.ok(strip.includes('·')) // empty buckets stay visible on the axis
+  assert.ok(ticks.startsWith('0.40'))
+  assert.ok(ticks.includes('1.40'))
+})
+
+test('renderNearMissSparkline: realistic session keeps the 0.05 axis continuous', () => {
+  const buckets = [
+    ['0.15–0.20', 2], ['0.20–0.25', 2], ['0.25–0.30', 4], ['0.30–0.35', 5],
+    ['0.35–0.40', 83], ['0.40–0.45', 178], ['0.45–0.50', 226], ['0.50–0.55', 7],
+    ['0.55–0.60', 7], ['0.60–0.65', 8], ['0.65–0.70', 4], ['0.70–0.75', 2],
+    ['0.75–0.80', 5], ['0.80–0.85', 3], ['0.85–0.90', 3], ['0.90–0.95', 4],
+    ['0.95–1.00', 1], ['1.00–1.05', 18], ['1.05–1.10', 1], ['1.15–1.20', 9],
+    ['1.35–1.40', 1],
+  ].map(([bucket, count]) => ({ bucket, count }))
+  const [ticks, strip] = renderNearMissSparkline(buckets)
+  assert.equal(strip.length, 50)
+  assert.ok(strip.includes('····')) // the 1.20–1.35 gap stays on the axis
+  assert.ok(strip.includes('████'))
+  assert.ok(ticks.includes('0.75'))
+})
+
+test('renderNearMissSparkline: unsorted input merges onto one axis', () => {
+  const [, strip] = renderNearMissSparkline([
+    { bucket: '0.45–0.50', count: 226 },
+    { bucket: '0.40–0.45', count: 178 },
+  ])
+  assert.equal(strip.length, 4)
+  assert.equal(strip, '████')
+})
+
+test('renderNearMissSparkline: single bucket renders, labels drop out when too narrow', () => {
+  const [ticks, strip] = renderNearMissSparkline([{ bucket: '0.30–0.35', count: 4 }])
+  assert.equal(strip, '██')
+  assert.equal(ticks, '')
+})
+
+test('renderNearMissSparkline: empty input renders nothing', () => {
+  assert.deepEqual(renderNearMissSparkline([]), [])
 })
 
 test('command: /topics distill — unwired, empty pool, success summary, failure reason', async () => {

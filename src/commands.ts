@@ -306,8 +306,14 @@ async function renderStats(service: TopicsService): Promise<string> {
     for (const t of stats.topTopics.slice(0, 5)) lines.push(`| \`${cell(t.slug)}\` | ${t.count} |`)
   }
   if (stats.nearMissHistogram.length > 0) {
-    lines.push('', 'Near-miss 分布（低于阈值或被结构门挡下）：', '', '| 分数段 | 次数 |', '| --- | --- |')
-    for (const b of stats.nearMissHistogram) lines.push(`| ${cell(b.bucket)} | ${b.count} |`)
+    lines.push(
+      '',
+      `Near-miss 分布（低于阈值 ${service.cfg.matchThreshold.toFixed(2)} 或被结构门挡下，对数刻度）：`,
+      '',
+      '```',
+      ...renderNearMissSparkline(stats.nearMissHistogram),
+      '```',
+    )
     const hint = tuningHint(stats, service.cfg.matchThreshold)
     if (hint !== undefined) lines.push('', `💡 ${hint}`)
   }
@@ -323,6 +329,57 @@ export function tuningHint(stats: ReturnType<typeof aggregateStats>, threshold: 
     return `near-miss 集中在阈值 ${threshold} 下方（${justBelowCount} 次），可尝试 /topics set match-threshold ${(Math.max(0.05, threshold - 0.1)).toFixed(2)}`
   }
   return undefined
+}
+
+const SPARK_LEVELS = '▁▂▃▄▅▆▇█'
+const SPARK_EMPTY = '·'
+/** Columns per histogram bucket; 2 keeps a 25-bucket range at 50 cols so the
+ *  TUI renders both lines without wrapping. */
+const SPARK_COLS_PER_BUCKET = 2
+/** Axis tick every 0.30 score units. */
+const SPARK_TICK_STEP = 0.3
+/** Bucket width of the histogram built by nmBucket() in ilog.ts. */
+const SPARK_BUCKET_WIDTH = 0.05
+
+/**
+ * Render the near-miss histogram as a two-line horizontal sparkline: tick
+ * labels over a log-scaled (count+1) strip, so a live session's 200:1 count
+ * range stays legible. Zero-count buckets inside the observed range draw as
+ * '·' to keep the score axis honest. Returns [] for empty or unparsable input.
+ */
+export function renderNearMissSparkline(buckets: { bucket: string; count: number }[]): string[] {
+  const starts = buckets.map((b) => Number(b.bucket.split('–')[0]))
+  if (buckets.length === 0 || starts.some((s) => Number.isNaN(s))) return []
+  const first = Math.min(...starts)
+  const last = Math.max(...starts)
+  const n = Math.round((last - first) / SPARK_BUCKET_WIDTH) + 1
+  const counts = new Array<number>(n).fill(0)
+  for (let i = 0; i < buckets.length; i++) {
+    counts[Math.round((starts[i] - first) / SPARK_BUCKET_WIDTH)] += buckets[i].count
+  }
+  const max = Math.max(...counts)
+  const denom = Math.log10(max + 1)
+  const strip = counts
+    .map((c) => (c === 0 || denom === 0 ? SPARK_EMPTY : SPARK_LEVELS[Math.round((Math.log10(c + 1) / denom) * (SPARK_LEVELS.length - 1))]))
+    .map((ch) => ch.repeat(SPARK_COLS_PER_BUCKET))
+    .join('')
+  const width = n * SPARK_COLS_PER_BUCKET
+  const line = new Array<string>(width).fill(' ')
+  const used = new Array<boolean>(width).fill(false)
+  const put = (at: number, label: string) => {
+    if (at < 0 || at + label.length > width) return
+    if (used.slice(at, at + label.length).some(Boolean)) return
+    for (let k = 0; k < label.length; k++) {
+      line[at + k] = label[k]
+      used[at + k] = true
+    }
+  }
+  for (let i = 0; ; i += Math.round(SPARK_TICK_STEP / SPARK_BUCKET_WIDTH)) {
+    if (i > 0 && i >= n - 2) break
+    put(i * SPARK_COLS_PER_BUCKET, (first + i * SPARK_BUCKET_WIDTH).toFixed(2))
+  }
+  put(width - 4, (first + n * SPARK_BUCKET_WIDTH).toFixed(2))
+  return [line.join('').replace(/ +$/, ''), strip]
 }
 
 /** /topics list caps the table at this many newest topics. */
