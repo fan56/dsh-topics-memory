@@ -4,6 +4,7 @@
 
 ### Changed
 - `/topics stats` 的 near-miss 分布由逐桶 markdown 表格（常见会话 20+ 行）改为横向 sparkline：刻度行 + 条带行共两行（≤50 列，TUI 不折行），对数刻度（log₁₀(count+1)）保住 200:1 的计数动态范围，区间内的零计数桶画 `·` 保持分数轴连续；阈值数值移入节标题。调参建议（`tuningHint`）仍读原始 histogram，逻辑不变。
+- **测试**：新增脱敏 fake 会话回放夹具（`test/fixtures/nearmiss-fake-session.json`，形状取自真实会话、计数扰动、slug 全部虚构），经 `appendInjectionRecord` → `aggregateStats` → `/topics stats` 全链路回放并钉死两行渲染输出；`sync` 用例的 debounce 竞态（全量跑红/单跑绿）由定长 sleep 改为最多 10s 轮询。测试 287 → 293。
 
 ## 0.15.0 (2026-09-11)
 

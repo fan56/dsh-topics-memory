@@ -1,11 +1,17 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BundleStore } from '../lib/store.js'
 import { TopicsService } from '../lib/service.js'
 import { buildTopicsCommand, tuningHint, renderNearMissSparkline, HELP } from '../lib/commands.js'
+
+/** Desensitized replay of a real session's near-miss distribution (see the
+ *  fixture's note field) — drives the stats end-to-end test below. */
+const NEARMISS_FIXTURE = JSON.parse(
+  readFileSync(new URL('./fixtures/nearmiss-fake-session.json', import.meta.url), 'utf8'),
+)
 
 function makeService(cfgOverrides = {}) {
   const root = mkdtempSync(join(tmpdir(), 'topics-cmd-'))
@@ -631,6 +637,50 @@ test('renderNearMissSparkline: single bucket renders, labels drop out when too n
 
 test('renderNearMissSparkline: empty input renders nothing', () => {
   assert.deepEqual(renderNearMissSparkline([]), [])
+})
+
+test('stats: near-miss sparkline replayed from the fake session fixture', async () => {
+  const { service, mutate, store, cleanup } = makeService({ matchThreshold: NEARMISS_FIXTURE.matchThreshold })
+  try {
+    await store.ensure()
+    // Expand the bucket-count table into per-round near-miss entries; scores
+    // spread inside each bucket floor back to the same label via nmBucket().
+    const entries = []
+    for (const [bucket, count] of NEARMISS_FIXTURE.buckets) {
+      const start = Number(bucket.split('–')[0])
+      for (let i = 0; i < count; i++) {
+        entries.push({
+          slug: NEARMISS_FIXTURE.slugs[(i + entries.length) % NEARMISS_FIXTURE.slugs.length],
+          score: start + ((i % 9) + 1) * 0.005,
+          ...(start >= 1 ? { reasons: ['gate-blocked'] } : {}),
+        })
+      }
+    }
+    const perRound = Math.ceil(entries.length / NEARMISS_FIXTURE.rounds)
+    for (let r = 0; r * perRound < entries.length; r++) {
+      await store.appendInjectionRecord({
+        at: new Date(Date.UTC(2026, 8, 14, 0, r)).toISOString(),
+        queryTokenCount: 12 + (r % 7),
+        rosterSize: 8,
+        hits: r % 3 === 0 ? [{ slug: 'anchor-topic', score: 0.9, reasons: ['lexical'], viaGraph: false }] : [],
+        nearMisses: entries.slice(r * perRound, (r + 1) * perRound),
+        injected: r % 2 === 0,
+        usedTokens: 100 + r,
+      })
+    }
+    const cmd = buildTopicsCommand(service, mutate)
+    const res = await cmd.handler(inv('stats'))
+    assert.equal(res.kind, 'success')
+    const lines = res.text.split('\n')
+    const title = lines.findIndex((l) => l.startsWith('Near-miss 分布（低于阈值 0.50'))
+    assert.ok(title >= 0, 'section title carries the configured threshold')
+    assert.equal(lines[title + 2], '```')
+    assert.equal(lines[title + 3], NEARMISS_FIXTURE.goldenTicks)
+    assert.equal(lines[title + 4], NEARMISS_FIXTURE.goldenStrip)
+    assert.equal(lines[title + 5], '```')
+  } finally {
+    cleanup()
+  }
 })
 
 test('command: /topics distill — unwired, empty pool, success summary, failure reason', async () => {
