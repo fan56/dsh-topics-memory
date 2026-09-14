@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.16.0 (2026-09-14)
 
 ### Changed
 - `/topics stats` 的 near-miss 分布由逐桶 markdown 表格（常见会话 20+ 行）改为横向 sparkline：刻度行 + 条带行共两行（≤50 列，TUI 不折行），对数刻度（log₁₀(count+1)）保住 200:1 的计数动态范围，区间内的零计数桶画 `·` 保持分数轴连续；阈值数值移入节标题。调参建议（`tuningHint`）仍读原始 histogram，逻辑不变。
