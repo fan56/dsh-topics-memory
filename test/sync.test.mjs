@@ -73,10 +73,15 @@ test('sync: pull + debounced push against a bare remote', async () => {
       { message: 'gamma' },
     )
     sync.schedulePush()
-    await new Promise((resolve) => setTimeout(resolve, 1800))
-    const head = execFileSync('git', ['rev-parse', 'origin/main'], { cwd: work.dir, encoding: 'utf8' }).trim()
-    const local = execFileSync('git', ['rev-parse', 'main'], { cwd: work.dir, encoding: 'utf8' }).trim()
-    assert.equal(head, local, 'debounced push landed')
+    // Poll up to 10s for the debounced push to land — a fixed sleep races
+    // under full-suite load, where the debounce plus git push can outlive it.
+    const rev = (ref) => execFileSync('git', ['rev-parse', ref], { cwd: work.dir, encoding: 'utf8' }).trim()
+    let landed = false
+    for (let i = 0; i < 50 && !landed; i++) {
+      await new Promise((resolve) => setTimeout(resolve, 200))
+      landed = rev('origin/main') === rev('main')
+    }
+    assert.equal(rev('origin/main'), rev('main'), 'debounced push landed')
     sync.dispose()
   } finally {
     work.cleanup()
