@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.16.1-next.1 (unreleased)
+## 0.16.1-next.1 (2026-09-20)
 
 启动链监听面从 `session/event` firehose 迁到 agent bus——会话启动事件只走 agent bus、从不出现在 firehose 上（firehose 只携带 Session.append 类型，此前短暂落地的 firehose 双匹配在真实宿主上永不命中），`sync.pull → store.ensure → boot-replay 蒸馏 → consolidation cadence → deprecated-TTL 清扫`整条启动链由此在 0.1.5 / 0.1.6 宿主上都真实触发，无需抬 dsh 支持下限：
 
