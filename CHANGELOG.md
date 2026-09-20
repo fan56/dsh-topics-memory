@@ -2,10 +2,12 @@
 
 ## 0.16.1-next.1 (unreleased)
 
-Forward-compat dual-match for the dsh 0.1.6 session-start rename — keeps the sync.pull → boot-replay → consolidation cadence → deprecated-TTL chain alive across host versions without a floor bump:
+启动链监听面从 `session/event` firehose 迁到 agent bus——会话启动事件只走 agent bus、从不出现在 firehose 上（firehose 只携带 Session.append 类型，此前短暂落地的 firehose 双匹配在真实宿主上永不命中），`sync.pull → store.ensure → boot-replay 蒸馏 → consolidation cadence → deprecated-TTL 清扫`整条启动链由此在 0.1.5 / 0.1.6 宿主上都真实触发，无需抬 dsh 支持下限：
 
-- **`ctx.on('session/event')` 同步生命周期 handler（src/index.ts:629）双匹配** `agent/session-start` 与 `agent/created`：dsh 0.1.6 起（B-11）启动事件从 `agent/session-start` 改为异步串行 `agent/created`，匹配两者让 0.1.5 与 0.1.6 主机上同一条 pull → boot-replay 链路都触发；当前安装的 0.1.5-rc.2 主机不发射 `agent/created`，第二个分支短路即零行为变化；0.1.6 落地后自动接管。`agent/created` 的 payload 形态尚未实机确认（本插件只依赖触发时机与监听器首参 session id），到达 0.1.6 后再按实情收紧。
-- 测试 293 → 296：dual-match 行为合同三例——`agent/created` 命中触发 boot-replay（与 `agent/session-start` 同链路）、`agent/created` 命中但空积压零请求、其他 session/event 类型（`turn/start`）不触发链路（existing 数据/夹具不变）。
+- **agent bus 双监听 + per-session 去重**：为 `agent/session-start`（同步事件，payload `{ agent, source }`，dsh-agent-loop ≤0.1.5 发射）与 `agent/created`（0.1.6-alpha.1 起 B-11 把启动通知并入异步串行 announcement，payload `{ agent, source, signal? }`，弃用旧名）各注册一个监听器。0.1.5-rc.2 的 creation transaction 两个名字都发射，per-session Set 把一对事件折叠为一次启动链；永不发射某个名字的宿主上对应监听器只是从不被调用，零成本。
+- **teardown 重新武装**：session teardown 的 cordis 事件（`agent/disposed` / `session/disposed`）清除该 session 的去重条目，resume 场景再次启动时链路重新可触发。
+- **防御面**：只有 `{ agent }` 是结构依赖，payload 缺 agent id（畸形）静默 no-op，其余字段防御性处理；对当前 0.1.5-rc.2 主机零行为变化——双发射去重后链路照常只触发一次。
+- 测试 293 → 298（全绿；1 skip 为既有的本地语料跳过，与本次无关）。合同测试四例：`agent/created` announce 形态 `{ agent }` 触发 boot-replay、双发射去重只跑一次链 + teardown 重新武装、畸形 payload 静默 no-op、firehose 事件（`turn/start`）不触发链路。
 
 ## 0.16.0 (2026-09-14)
 
