@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.1-next.1 (unreleased)
+
+Forward-compat dual-match for the dsh 0.1.6 session-start rename — keeps the sync.pull → boot-replay → consolidation cadence → deprecated-TTL chain alive across host versions without a floor bump:
+
+- **`ctx.on('session/event')` 同步生命周期 handler（src/index.ts:629）双匹配** `agent/session-start` 与 `agent/created`：dsh 0.1.6 起（B-11）启动事件从 `agent/session-start` 改为异步串行 `agent/created`，匹配两者让 0.1.5 与 0.1.6 主机上同一条 pull → boot-replay 链路都触发；当前安装的 0.1.5-rc.2 主机不发射 `agent/created`，第二个分支短路即零行为变化；0.1.6 落地后自动接管。`agent/created` 的 payload 形态尚未实机确认（本插件只依赖触发时机与监听器首参 session id），到达 0.1.6 后再按实情收紧。
+- 测试 293 → 296：dual-match 行为合同三例——`agent/created` 命中触发 boot-replay（与 `agent/session-start` 同链路）、`agent/created` 命中但空积压零请求、其他 session/event 类型（`turn/start`）不触发链路（existing 数据/夹具不变）。
+
 ## 0.16.0 (2026-09-14)
 
 ### Changed

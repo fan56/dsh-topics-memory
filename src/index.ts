@@ -618,8 +618,15 @@ export function apply(ctx: Context): void {
   }
 
   // ---- Sync lifecycle: pull on session start, local commit on dispose ----
+  // dsh 0.1.6 B-11 renamed the session-start event to async-serial `agent/created`;
+  // matching both keeps the sync.pull → boot-replay → consolidation cadence →
+  // deprecated-TTL chain alive across 0.1.5 (agent/session-start) and 0.1.6
+  // (agent/created) without a host-floor bump. No-op on hosts that never emit
+  // agent/created: the second comparison short-circuits. Payload shape of
+  // agent/created to be confirmed on real 0.1.6 — only trigger timing and the
+  // first-arg session id are relied upon here.
   ctx.on('session/event' as never, ((session: { id: unknown }, event: SessionEvent) => {
-    if (event.type === 'agent/session-start') {
+    if (event.type === 'agent/session-start' || event.type === ('agent/created' as never)) {
       void sync
         .pull()
         .catch(() => undefined)

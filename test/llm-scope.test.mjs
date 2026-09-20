@@ -354,3 +354,64 @@ test('lifecycle: a fresh session with no backlog requests no replay distill', as
     h.cleanup()
   }
 })
+
+// dsh 0.1.6 B-11 renamed the session-start event to async-serial
+// `agent/created`. The sync lifecycle handler dual-matches so the pull →
+// boot-replay → consolidation cadence → deprecated-TTL chain stays alive on
+// both 0.1.5 and 0.1.6 hosts; on 0.1.5 (no `agent/created` emission) the
+// second comparison is a no-op. These tests pin that contract.
+
+test('lifecycle: agent/created replays undistilled observations like agent/session-start', async () => {
+  const h = bootPlugin({ ...CFG })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // Backlog simulating the previous session's local-only exit: the
+    // observation is durable on disk but no run ever consumed it.
+    const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
+    const llm = liveLlm(opFor('Created Replay Topic', o1.id))
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm } })
+    // agent/created: the dual-match must trigger the same pull → boot-replay
+    // chain that agent/session-start triggers on 0.1.5 hosts.
+    h.dispatch('s1', 'agent/created', undefined)
+    await waitFor(async () => (await store.readDistillState())?.ok === true, 'the boot-replay distill landed')
+    assert.equal((await store.undistilledObservations()).length, 0, 'the backlog was consumed')
+    assert.notEqual(await store.readTopic('created-replay-topic'), undefined, 'its topic landed')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('lifecycle: agent/created with no backlog requests no replay distill', async () => {
+  const h = bootPlugin({ ...CFG })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // Empty pool: the replay check must stay idle even on the 0.1.6 event.
+    assert.equal((await store.undistilledObservations()).length, 0)
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Nope', 'x')) } })
+    h.dispatch('s1', 'agent/created', undefined)
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal((await store.readDistillState()) ?? undefined, undefined, 'no distill run was requested')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('lifecycle: unrelated session/event types do not trigger the boot-replay chain', async () => {
+  const h = bootPlugin({ ...CFG })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // Backlog present but the trigger event is turn/start: the sync lifecycle
+    // handler must not run pull / boot-replay for arbitrary session events.
+    const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Should Not Run', o1.id)) } })
+    h.dispatch('s1', 'turn/start', { turn: 1 })
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal((await store.readDistillState()) ?? undefined, undefined, 'no distill run was requested')
+    assert.equal((await store.undistilledObservations()).length, 1, 'the backlog is intact')
+  } finally {
+    h.cleanup()
+  }
+})
