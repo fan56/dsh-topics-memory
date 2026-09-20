@@ -60,6 +60,7 @@ function bootPlugin(overrides = {}) {
   process.env.DSH_TOPICS_HOME = root
   const handlers = []
   const disposedHandlers = {}
+  const busHandlers = {}
   const contexts = []
   const effects = []
   const agentsMap = new Map()
@@ -71,6 +72,7 @@ function bootPlugin(overrides = {}) {
     on: (type, handler) => {
       if (type === 'session/event') handlers.push(handler)
       else if (type === 'agent/disposed' || type === 'session/disposed') disposedHandlers[type] = handler
+      else if (type === 'agent/session-start' || type === 'agent/created') busHandlers[type] = handler
     },
     inject: (_deps, cb) => cb({ effect: () => () => {} }),
     effect: (setup, name) => {
@@ -85,10 +87,17 @@ function bootPlugin(overrides = {}) {
   }
   apply(ctx)
   const onEvent = handlers[0]
-  // apply() registers TWO session/event handlers (injection dispatch + sync
-  // lifecycle) — real hosts invoke every handler, so must the harness.
+  // apply() registers one session/event handler (injection dispatch) — the
+  // boot chain now listens on the agent bus, not the firehose.
   const dispatch = (sessionId, type, data) => {
     for (const handler of handlers) handler.call(undefined, { id: sessionId }, { type, data })
+  }
+  // Agent-bus events (session start under either host event name): real hosts
+  // emit one payload per event, so must the harness.
+  const emit = (name, payload) => {
+    const handler = busHandlers[name]
+    if (handler === undefined) throw new Error(`no recorded handler for ${name}`)
+    handler(payload)
   }
   // Real teardown events carry payloads; the agent payload still owns its ctx
   // (scope unwind follows), which is exactly the capture the final distill uses.
@@ -103,7 +112,7 @@ function bootPlugin(overrides = {}) {
     else process.env.DSH_TOPICS_HOME = prevHome
     await rmRetry(root)
   }
-  return { root, agentsMap, dispatch, dispose, effects, cleanup }
+  return { root, agentsMap, dispatch, emit, dispose, effects, cleanup }
 }
 
 async function waitFor(cond, what, timeoutMs = 4000) {
@@ -327,9 +336,9 @@ test('lifecycle: a fresh session replays undistilled observations left by a skip
     const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
     const llm = liveLlm(opFor('Boot Replay Topic', o1.id))
     h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm } })
-    // session-start: sync.pull is a no-op in local-only CFG, then the replay
-    // check finds the backlog and requests one distill.
-    h.dispatch('s1', 'agent/session-start', undefined)
+    // session-start (agent bus): sync.pull is a no-op in local-only CFG, then
+    // the replay check finds the backlog and requests one distill.
+    h.emit('agent/session-start', { agent: { id: 's1' }, source: 'fresh' })
     await waitFor(async () => (await store.readDistillState())?.ok === true, 'the boot-replay distill landed')
     assert.equal((await store.undistilledObservations()).length, 0, 'the backlog was consumed')
     assert.notEqual(await store.readTopic('boot-replay-topic'), undefined, 'its topic landed')
@@ -347,7 +356,7 @@ test('lifecycle: a fresh session with no backlog requests no replay distill', as
     // a healthy boot must not spend a model call per session start.
     assert.equal((await store.undistilledObservations()).length, 0)
     h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Nope', 'x')) } })
-    h.dispatch('s1', 'agent/session-start', undefined)
+    h.emit('agent/session-start', { agent: { id: 's1' }, source: 'fresh' })
     await new Promise((r) => setTimeout(r, 200))
     assert.equal((await store.readDistillState()) ?? undefined, undefined, 'no distill run was requested')
   } finally {
@@ -355,13 +364,14 @@ test('lifecycle: a fresh session with no backlog requests no replay distill', as
   }
 })
 
-// dsh 0.1.6 B-11 renamed the session-start event to async-serial
-// `agent/created`. The sync lifecycle handler dual-matches so the pull →
-// boot-replay → consolidation cadence → deprecated-TTL chain stays alive on
-// both 0.1.5 and 0.1.6 hosts; on 0.1.5 (no `agent/created` emission) the
-// second comparison is a no-op. These tests pin that contract.
+// The boot chain listens on the agent bus: `agent/session-start` (dsh ≤0.1.5,
+// payload { agent, source }) and `agent/created` (0.1.6-alpha.1+, the startup
+// notification merged into the serial creation announcement, payload
+// { agent, source?, signal? }). rc.2's creation transaction emits BOTH, so a
+// per-session set collapses them to one chain run; teardown re-arms. These
+// tests pin that contract.
 
-test('lifecycle: agent/created replays undistilled observations like agent/session-start', async () => {
+test('lifecycle: agent/created (rc.2 announce shape { agent }) replays undistilled observations', async () => {
   const h = bootPlugin({ ...CFG })
   try {
     const store = new BundleStore(h.root)
@@ -371,9 +381,9 @@ test('lifecycle: agent/created replays undistilled observations like agent/sessi
     const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
     const llm = liveLlm(opFor('Created Replay Topic', o1.id))
     h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm } })
-    // agent/created: the dual-match must trigger the same pull → boot-replay
-    // chain that agent/session-start triggers on 0.1.5 hosts.
-    h.dispatch('s1', 'agent/created', undefined)
+    // rc.2's announce carries { agent } alone — the plugin must trigger on it
+    // exactly as it does on the 0.1.5 session-start event.
+    h.emit('agent/created', { agent: { id: 's1' } })
     await waitFor(async () => (await store.readDistillState())?.ok === true, 'the boot-replay distill landed')
     assert.equal((await store.undistilledObservations()).length, 0, 'the backlog was consumed')
     assert.notEqual(await store.readTopic('created-replay-topic'), undefined, 'its topic landed')
@@ -390,9 +400,57 @@ test('lifecycle: agent/created with no backlog requests no replay distill', asyn
     // Empty pool: the replay check must stay idle even on the 0.1.6 event.
     assert.equal((await store.undistilledObservations()).length, 0)
     h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Nope', 'x')) } })
-    h.dispatch('s1', 'agent/created', undefined)
+    h.emit('agent/created', { agent: { id: 's1' } })
     await new Promise((r) => setTimeout(r, 200))
     assert.equal((await store.readDistillState()) ?? undefined, undefined, 'no distill run was requested')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('lifecycle: dual bus emission for one session runs the chain once, teardown re-arms', async () => {
+  const h = bootPlugin({ ...CFG, distillOnSessionEnd: false })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // rc.2 creation transaction: agent/created (announce) fires first, then
+    // agent/session-start — the per-session dedup must collapse them to one
+    // chain run. A second backlog appended afterwards must NOT be consumed by
+    // the second event (the dedup blocked the run).
+    const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('First Replay', o1.id)) } })
+    h.emit('agent/created', { agent: { id: 's1' }, source: 'fresh' })
+    const o2 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '第二个观察' })
+    h.emit('agent/session-start', { agent: { id: 's1' }, source: 'fresh' })
+    await waitFor(async () => (await store.undistilledObservations()).length === 1, 'the first backlog was consumed, the second kept')
+    assert.equal((await store.undistilledObservations())[0].id, o2.id, 'the second observation is the only one left — the chain ran once')
+    // Teardown clears the dedup entry: the same session re-arming must run the
+    // chain again and consume the remaining backlog.
+    h.dispose('s1', 'agent/disposed')
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Second Replay', o2.id)) } })
+    h.emit('agent/session-start', { agent: { id: 's1' }, source: 'resume' })
+    await waitFor(async () => (await store.undistilledObservations()).length === 0, 'the re-armed chain consumed the second backlog')
+  } finally {
+    h.cleanup()
+  }
+})
+
+test('lifecycle: a bus payload without an agent is a silent no-op', async () => {
+  const h = bootPlugin({ ...CFG })
+  try {
+    const store = new BundleStore(h.root)
+    await store.ensure()
+    // Malformed payload (no agent → no session id): the listener must return
+    // before touching the chain, and a well-formed event for the same id must
+    // still work afterwards.
+    const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
+    h.emit('agent/session-start', { source: 'fresh' })
+    await new Promise((r) => setTimeout(r, 200))
+    assert.equal((await store.undistilledObservations()).length, 1, 'the backlog is intact')
+    assert.equal((await store.readDistillState()) ?? undefined, undefined, 'no distill run was requested')
+    h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('After Malformed', o1.id)) } })
+    h.emit('agent/session-start', { agent: { id: 's1' }, source: 'fresh' })
+    await waitFor(async () => (await store.readDistillState())?.ok === true, 'a well-formed event after a malformed one still triggers the chain')
   } finally {
     h.cleanup()
   }
@@ -403,8 +461,9 @@ test('lifecycle: unrelated session/event types do not trigger the boot-replay ch
   try {
     const store = new BundleStore(h.root)
     await store.ensure()
-    // Backlog present but the trigger event is turn/start: the sync lifecycle
-    // handler must not run pull / boot-replay for arbitrary session events.
+    // Backlog present but the event is turn/start on the firehose: the boot
+    // chain listens on the agent bus only, so firehose events must never run
+    // pull / boot-replay.
     const o1 = await store.appendObservation({ kind: 'finding', source: 'auto', text: '遗留观察' })
     h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Should Not Run', o1.id)) } })
     h.dispatch('s1', 'turn/start', { turn: 1 })

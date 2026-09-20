@@ -586,6 +586,11 @@ export function apply(ctx: Context): void {
     }) as never,
   )
 
+  // Session-start boot chain dedup: rc.2's creation transaction emits BOTH
+  // `agent/session-start` and `agent/created`, so the pair collapses to one
+  // chain run per session; teardown clears the entry.
+  const bootedSessions = new Set<string>()
+
   // ---- Session teardown: real cordis events, not session/event types ----
   // dsh-session 0.1.2-alpha.4's SessionEventMap has no `agent/disposed` or
   // `session/disposed` event type — the old `event.type === 'agent/disposed'`
@@ -609,6 +614,7 @@ export function apply(ctx: Context): void {
       observer.onSessionEvent(sessionId, name, undefined)
       injectedBySession.delete(sessionId)
       slowLane.clear(sessionId)
+      bootedSessions.delete(sessionId)
       // A teardown-triggered run (session-end distill) reads the payload
       // capture lazily: drop the entry here only when no run can still read
       // it. The slow lane's in-flight pipeline reads it too (shared caller);
@@ -618,77 +624,85 @@ export function apply(ctx: Context): void {
   }
 
   // ---- Sync lifecycle: pull on session start, local commit on dispose ----
-  // dsh 0.1.6 B-11 renamed the session-start event to async-serial `agent/created`;
-  // matching both keeps the sync.pull → boot-replay → consolidation cadence →
-  // deprecated-TTL chain alive across 0.1.5 (agent/session-start) and 0.1.6
-  // (agent/created) without a host-floor bump. No-op on hosts that never emit
-  // agent/created: the second comparison short-circuits. Payload shape of
-  // agent/created to be confirmed on real 0.1.6 — only trigger timing and the
-  // first-arg session id are relied upon here.
-  ctx.on('session/event' as never, ((session: { id: unknown }, event: SessionEvent) => {
-    if (event.type === 'agent/session-start' || event.type === ('agent/created' as never)) {
-      void sync
-        .pull()
-        .catch(() => undefined)
-        .finally(() => store.ensure().catch(() => undefined))
-        .then(() => {
-          // Boot replay: the observations JSONL is the durable distill queue.
-          // Whatever the previous exit skipped (local-only exit since the
-          // no-network exit commit) or a killed run left unmarked is still
-          // undistilled here. Empty pool and no-model are cheap no-ops inside
-          // the distiller; the per-session dedup guards double runs.
-          void store
-            .undistilledObservations(1)
-            .then((pending) => {
-              if (pending.length === 0) return
-              // Same trigger-time capture the observer callback does: the
-              // replay run's caller resolves candidates lazily and a fresh
-              // session has no prior capture to lean on.
-              try {
-                captureFromAgent(agents()?.get(session.id) as unknown)
-              } catch {
-                // contained — the run below fails with the readable
-                // no-adapter detail instead
+  // Session start is an agent-bus event, never a session/event firehose type:
+  // the firehose only carries Session.append types. Tarball-verified emission
+  // sites: `agent/session-start` (sync, payload { agent, source }) is emitted
+  // by dsh-agent-loop up to 0.1.5; 0.1.6-alpha.1 merges the startup
+  // notification into the serial `agent/created` announcement (payload
+  // { agent, source, signal? }) and drops the old name. So one registration
+  // per name — a host that never emits a name simply never calls that
+  // listener. Only { agent } is structural; the rest is defensive.
+  const runBootChain = (sessionId: string) => {
+    void sync
+      .pull()
+      .catch(() => undefined)
+      .finally(() => store.ensure().catch(() => undefined))
+      .then(() => {
+        // Boot replay: the observations JSONL is the durable distill queue.
+        // Whatever the previous exit skipped (local-only exit since the
+        // no-network exit commit) or a killed run left unmarked is still
+        // undistilled here. Empty pool and no-model are cheap no-ops inside
+        // the distiller; the per-session dedup guards double runs.
+        void store
+          .undistilledObservations(1)
+          .then((pending) => {
+            if (pending.length === 0) return
+            // Same trigger-time capture the observer callback does: the
+            // replay run's caller resolves candidates lazily and a fresh
+            // session has no prior capture to lean on.
+            try {
+              captureFromAgent(agents()?.get(sessionId) as unknown)
+            } catch {
+              // contained — the run below fails with the readable
+              // no-adapter detail instead
+            }
+            const run = distiller.request(sessionId, 'boot-replay')
+            if (run !== undefined) void run.catch(() => undefined)
+          })
+          .catch(() => undefined)
+        // Consolidation cadence check — after the pull (freshest pool),
+        // fully fire-and-forget: cadence/single-flight gates live inside
+        // maybeRun, and a no-model boot just skips (no stamp advanced).
+        // Failures are NOT silent at the host log: the 2026-09-09 real-host
+        // test showed a dead distill route would otherwise hide here with
+        // zero observable trace (the state file only advances on success).
+        try {
+          captureFromAgent(agents()?.get(sessionId) as unknown)
+        } catch {
+          // contained — the run below fails with a readable no-model detail
+        }
+        void consolidator
+          .maybeRun({ sessionId })
+          .then((r) => {
+            if (r !== undefined && !r.ok && r.reason !== 'no-clusters') {
+              warn(`dsh-topics-memory 整理 lane 未执行：${r.reason ?? 'unknown'}${r.detail !== undefined ? `（${r.detail}）` : ''}`)
+            }
+          })
+          .catch(() => undefined)
+        // Deprecated-TTL sweep — pure local rule, no model, runs even when
+        // the distill route is unconfigured. Drops are logged: deletion is
+        // the one housekeeping action the user should always see happened.
+        const ttl = cfgNow().deprecatedTtlDays
+        if (ttl > 0) {
+          void dropExpiredDeprecated(service, ttl)
+            .then((dropped) => {
+              if (dropped.length > 0) {
+                warn(`dsh-topics-memory：按 ${ttl} 天 TTL 删除了 ${dropped.length} 条 deprecated topic（${dropped.map((s) => `topics/${s}`).join('、')}）；git 历史可找回`)
               }
-              const run = distiller.request(String(session.id), 'boot-replay')
-              if (run !== undefined) void run.catch(() => undefined)
             })
             .catch(() => undefined)
-          // Consolidation cadence check — after the pull (freshest pool),
-          // fully fire-and-forget: cadence/single-flight gates live inside
-          // maybeRun, and a no-model boot just skips (no stamp advanced).
-          // Failures are NOT silent at the host log: the 2026-09-09 real-host
-          // test showed a dead distill route would otherwise hide here with
-          // zero observable trace (the state file only advances on success).
-          try {
-            captureFromAgent(agents()?.get(session.id) as unknown)
-          } catch {
-            // contained — the run below fails with a readable no-model detail
-          }
-          void consolidator
-            .maybeRun({ sessionId: String(session.id) })
-            .then((r) => {
-              if (r !== undefined && !r.ok && r.reason !== 'no-clusters') {
-                warn(`dsh-topics-memory 整理 lane 未执行：${r.reason ?? 'unknown'}${r.detail !== undefined ? `（${r.detail}）` : ''}`)
-              }
-            })
-            .catch(() => undefined)
-          // Deprecated-TTL sweep — pure local rule, no model, runs even when
-          // the distill route is unconfigured. Drops are logged: deletion is
-          // the one housekeeping action the user should always see happened.
-          const ttl = cfgNow().deprecatedTtlDays
-          if (ttl > 0) {
-            void dropExpiredDeprecated(service, ttl)
-              .then((dropped) => {
-                if (dropped.length > 0) {
-                  warn(`dsh-topics-memory：按 ${ttl} 天 TTL 删除了 ${dropped.length} 条 deprecated topic（${dropped.map((s) => `topics/${s}`).join('、')}）；git 历史可找回`)
-                }
-              })
-              .catch(() => undefined)
-          }
-        })
-    }
-  }) as never)
+        }
+      })
+      .catch(() => undefined)
+  }
+  for (const name of ['agent/session-start', 'agent/created'] as const) {
+    ctx.on(name as never, ((payload: { agent?: { id?: unknown } }) => {
+      const sessionId = String(payload?.agent?.id ?? '')
+      if (sessionId === '' || bootedSessions.has(sessionId)) return
+      bootedSessions.add(sessionId)
+      runBootChain(sessionId)
+    }) as never)
+  }
 
   ctx.effect(
     () => {
