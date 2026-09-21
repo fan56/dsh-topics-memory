@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.17.1 (2026-09-21)
+
+0.17.0 审查跟进（oldfox GO-with-conditions）：CONCERN A（must）积压错位 + CONCERN B（should）归因语义。
+
+- **CONCERN A——event.seq 存在时 log 回放无条件优先**：0.17.0 的门控「投影读数为空才回放」在 next-turn 积压 ≥2 条时错位：post-splice 投影**非空**但左移一位（宿主 `claim()` 恒为 `mutate('next-turn', 0, 1, …)`，取队首一条），claim msg1 会取到残留 msg2 的文本，回放根本不武装。改为：事件带 seq 即先折叠回放且**其裁决为终审**（fold 成功后不再咨询投影——回放切片为空也不降级，否则又把错位残条读进来）；投影读数降级为无 seq 宿主（或 `snapshotEvents` 不可达）的 fallback。这也修正了 0.17.0 commit message 的过度声称「no longer depends on dispatch order at all」——在空门控下该命题不成立（非空投影仍优先），0.17.1 起才真正对派发顺序零依赖。坐标语义对照宿主源码核实（`packages/core/agent/src/inbox.ts`）：`append` 尾插 `start=len`、`claim` 取 `next-turn[0]`，事件形状 `{target, start, removedCount?, inserted, outcome?}` 与插件折叠一致。
+- **CONCERN B——claimedSource 按实际来源如实标记**：`log-replay` = 回放产出了裁决（含空裁决）；`projection` = 仅 fallback 路径（无 seq / snapshotEvents 不可达 / fold 失败）实际供文本。旧代码在投影非空时即标 `projection`，即使宿主本应以回放为权威。选择逻辑抽成纯函数 `resolveClaimedText`（handler 内不再内联，可单测）。
+- **可观测性——service 层空 roster 早退接上 silentExit**：`retrieveSync` 的三条件早退（autoInject 关 / query 空 / roster 空）不写 ilog 记录且原先全静默（P8 枚举过的静默早退，正是 E2E 空试验台的死因）；`retrieveForTurn` 现以同一低噪声日志器上报 `no-roster`（首次即告警、此后每 50 次一行）。
+- **测试**：`fast-lane.test.mjs` 9 → 16 例——积压错位双锚点（批量 insert / 两条独立 append 的 post-splice 非空错位投影，断言取到被 claim 的 msg1 而非残留 msg2）、回放终审不降级、无 seq 与 snapshotEvents 不可达两条 fallback、CONCERN B 归因、经 `resolveClaimedText` 的事故形态复现。
+
+## 0.17.0 (2026-09-21)
+
+快道注入静默死亡修复（dsh 0.1.5-rc.2 claim 时序事故，2026-09-21 探针台三向判决定谳）：宿主投影化 inbox 后，`session/event` 派发按注册顺序同步执行——SessionProjectionRegistry 的 eager drive（hooksOrder[0]）先于本插件 handler（hooksOrder[10]），`agent/inbox/spliced` 到达时 `agent.inbox.nextTurn` 已是 post-splice 空窗口，旧契约「live dispatch 先于投影变更」失效，claimed 文本重建恒空 → 静默 return，注入连续数周零轮次而无任何日志痕迹。候选 B（agents 注册表查不到会话）已被探针排除（agentFound=true）。
+
+- **claimed 文本重建改道——会话 log 回放，对监听注册顺序零依赖**：投影读数为空时，折叠 `session.snapshotEvents(0, event.seq)`（当前 splice 之前的日志前缀）里的全部 `agent/inbox/spliced` 条目重建 pre-splice pending 窗口，再按事件坐标（target/start/removedCount）切片。正确性依据（宿主源码核实）：dsh-agent-loop 的 InboxProjector 把 append/prepend/replace/remove/claim/cancel 全部经 `mutate()`，而 `mutate()` 把归一化坐标**连同 inserted 完整消息**append 进会话 log——回放数据源与投影 registry 自身的构建源相同，何时折叠都正确。原语义逐字保留：仅取 `kind:'user'`、文本块抽取规则、start 偏移、next-turn/next-step 目标区分、多消息 `\n` 连接。旧宿主（<0.1.5）上投影读数照旧先行且非空，回放不触发，零行为变化；`agent/inbox/discarded` 侧信道方案已核实不可行（claim 路径 `discardRemoved=false`，discarded 事件只随 cancel 发射）。
+- **可观测性——spliced 早退路径低噪声日志**：`agent-missing`（agents() 查不到会话）与 `empty-claimed/<source>`（重建后仍无用户文本，source 标记最后来源 projection / log-replay）经宿主 logger 首次即告警、此后每 50 次汇总一行；canceled/零删除这类常规宿主流仅 `DSH_TOPICS_DEBUG=1` 时记录；autoInject 关闭（用户意图）不记录。本次事故的死因之一就是全路径静默。
+- **`/topics status` 快道心跳**：新增「快道心跳」行，显示 `injections.jsonl` 末条轮次时间；当「观察 lane 24h 内仍在记录，但快道 >48h 无轮次（或从未注入）」时输出 stale 警告——同类静默死亡下次 24h 内可见。autoInject 关闭时不渲染该行。
+- **测试**：新增 `fast-lane.test.mjs` 9 例（事故形态复现：post-splice 空投影 + log 回放重建、next-turn/next-step 目标隔离、start 偏移、user 过滤、多文本块连接、canceled splice 亦参与折叠、畸形条目降级、seq 截断守卫）；`commands.test.mjs` 增心跳四态（新鲜/陈旧/从未注入/关闭）。
+
 ## 0.16.1-next.1 (2026-09-20)
 
 启动链监听面从 `session/event` firehose 迁到 agent bus——会话启动事件只走 agent bus、从不出现在 firehose 上（firehose 只携带 Session.append 类型，此前短暂落地的 firehose 双匹配在真实宿主上永不命中），`sync.pull → store.ensure → boot-replay 蒸馏 → consolidation cadence → deprecated-TTL 清扫`整条启动链由此在 0.1.5 / 0.1.6 宿主上都真实触发，无需抬 dsh 支持下限：
