@@ -1,16 +1,22 @@
-// Regression tests for the fast-lane claimed-text rebuild (0.17.0).
+// Regression tests for the fast-lane claimed-text rebuild (0.17.0/0.17.1).
 //
 // The 0.1.5-rc.2 incident: the eager projection drive (session/event
 // hooksOrder[0]) applies the claim splice before this plugin's handler
 // (hooksOrder[10]) runs, so the projection read yields the post-splice
 // EMPTY window and the fast lane silently died on claimedText === ''.
 // The fix rebuilds the pre-splice window by folding the session log —
-// replayPendingInbox — which depends on no dispatch order at all. These
-// tests replay exactly that incident shape plus the original semantics
-// (user-only filter, target split, start offset, multi-block text).
+// replayPendingInbox. 0.17.1 (review CONCERN A) makes that replay the
+// unconditional first source whenever event.seq exists: with ≥2 pending
+// messages the post-splice projection read is NON-empty but shifted by
+// one, so 0.17.0's empty-projection-only gating would claim msg1 and read
+// msg2's residual text. These tests replay exactly that incident shape
+// plus the original semantics (user-only filter, target split, start
+// offset, multi-block text). Splice fixtures mirror the host firehose
+// payload the probe printed: { target, start, removedCount, inserted }
+// per dsh-agent-loop mutate(), enveloped as { seq, type, data }.
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { replayPendingInbox, claimedUserText } from '../lib/index.js'
+import { replayPendingInbox, claimedUserText, resolveClaimedText } from '../lib/index.js'
 
 const user = (text, extra = {}) => ({
   source: { kind: 'user' },
@@ -156,4 +162,146 @@ test('seq guard: events at or past upToSeqExclusive never fold (missing seq stil
     replayPendingInbox(noSeq, 99)['next-turn'].map((m) => m.content[0].text),
     ['raw'],
   )
+})
+
+// ---- resolveClaimedText: source ordering + attribution (0.17.1) ----
+//
+// CONCERN A regression anchor: the claim must read msg1 (the message the
+// splice claims) even when the post-splice projection is NON-empty because
+// a second message is still pending — the 0.17.0 empty-projection-only
+// gating would have taken the residual msg2 text as the query.
+
+test('CONCERN A: backlog of 2 (batched insert) — post-splice projection non-empty but shifted, replay claims msg1', () => {
+  // One batched append inserted both messages (mutate() carries the full
+  // inserted array); the claim removes only the first.
+  const events = [
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [user('alpha'), user('beta')] }),
+    ev('turn/start', {}),
+    spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+  ]
+  const claim = events.at(-1)
+  // What agent.inbox.nextTurn holds at handler time on 0.1.5-rc.2+: the
+  // eager drive already applied the claim, leaving the shifted residual.
+  const projectionAfterSplice = [user('beta')]
+  const r = resolveClaimedText({
+    projection: projectionAfterSplice,
+    logEvents: events,
+    seq: claim.seq,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.source, 'log-replay')
+  assert.equal(r.text, 'alpha') // msg1 — NOT the residual 'beta'
+})
+
+test('CONCERN A: backlog of 2 (two separate appends) — same misalignment, replay wins', () => {
+  // Two separate append splices queue the messages (log coordinates are
+  // plain array positions — the second append lands at start:1); the
+  // claim then removes the first.
+  const events = [
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [user('first ask')] }),
+    spliced({ target: 'next-turn', start: 1, removedCount: 0, inserted: [user('second ask')] }),
+    spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+  ]
+  const r = resolveClaimedText({
+    projection: [user('second ask')], // post-splice residual at [0,1)
+    logEvents: events,
+    seq: events.at(-1).seq,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.source, 'log-replay')
+  assert.equal(r.text, 'first ask')
+})
+
+test('CONCERN B: attribution names the source that actually supplied the text', () => {
+  // Projection non-empty AND replay armed → the replay supplied the text;
+  // the attribution must not stay 'projection' just because the projection
+  // read was non-empty (the 0.17.0 gating conflated the two).
+  const events = [
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [user('alpha'), user('beta')] }),
+    spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+  ]
+  const r = resolveClaimedText({
+    projection: [user('beta')],
+    logEvents: events,
+    seq: events.at(-1).seq,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.source, 'log-replay')
+  assert.equal(r.text, 'alpha')
+})
+
+test('replay verdict is final: an empty replayed slice never falls back to the shifted projection', () => {
+  // The claimed window holds only a plugin message — the replay's empty
+  // verdict must stand; consulting the post-splice projection here would
+  // inject msg2's residual text under a claim of msg1.
+  const events = [
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [pluginMsg('system-ish'), user('beta')] }),
+    spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+  ]
+  const r = resolveClaimedText({
+    projection: [user('beta')],
+    logEvents: events,
+    seq: events.at(-1).seq,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.text, '')
+  assert.equal(r.source, 'log-replay') // the fold ran and found no user text
+})
+
+test('fallback: hosts without seq read the projection (pre-0.1.5 semantics)', () => {
+  const events = [
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [user('live dispatch first')] }),
+    spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+  ]
+  // Pre-0.1.5: the live dispatch precedes the mutation, so the projection
+  // still holds the pre-splice window at handler time.
+  const r = resolveClaimedText({
+    projection: [user('live dispatch first')],
+    logEvents: events,
+    seq: undefined,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.source, 'projection')
+  assert.equal(r.text, 'live dispatch first')
+})
+
+test('fallback: snapshotEvents unreachable (logEvents undefined) reads the projection', () => {
+  const r = resolveClaimedText({
+    projection: [user('pre-splice window')],
+    logEvents: undefined,
+    seq: 7,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.source, 'projection')
+  assert.equal(r.text, 'pre-splice window')
+})
+
+test('incident shape through resolveClaimedText: post-splice empty projection, seq-armed replay rebuilds', () => {
+  const events = [
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [user('say hi')] }),
+    ev('turn/start', {}),
+    spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
+  ]
+  const r = resolveClaimedText({
+    projection: [], // post-splice empty — the original incident window
+    logEvents: events,
+    seq: events.at(-1).seq,
+    target: 'next-turn',
+    start: 0,
+    removedCount: 1,
+  })
+  assert.equal(r.source, 'log-replay')
+  assert.equal(r.text, 'say hi')
 })

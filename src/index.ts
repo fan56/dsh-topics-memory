@@ -86,20 +86,27 @@ export function settleBounded(p: Promise<unknown> | undefined, ms: number): Prom
  *  skills registry serves the bundled usage/config guide. */
 export const inject = ['systemPrompt', 'tools', 'settings', 'agents', 'llm', 'skills']
 
-// ---- Fast-lane claim-text rebuild from the session log (0.17.0) ----
+// ---- Fast-lane claim-text rebuild from the session log (0.17.0/0.17.1) ----
 //
 // dsh 0.1.5-rc.2's SessionProjectionRegistry registers its eager inbox drive
 // at session/event hooksOrder[0]; every later handler — this plugin sits at
 // [10] — observes the projection AFTER the current splice was applied, so the
 // pre-0.1.5 contract "live dispatch precedes projection mutation" is gone and
 // the projection read at `agent/inbox/spliced` time yields the post-splice
-// (empty) window. The rebuild below depends on no dispatch order at all:
+// window. 0.17.0 armed the replay only when that read came back empty —
+// which still mis-fired with ≥2 pending messages (review CONCERN A): the
+// post-splice projection is NON-empty but shifted by one, so a claim of msg1
+// read msg2's residual text and the replay never armed. Since 0.17.1 the
+// replay is the UNCONDITIONAL first source whenever event.seq exists:
 // dsh-agent-loop's InboxProjector funnels every append/prepend/replace/
 // remove/claim/cancel through mutate(), and mutate() appends each normalized
 // splice — target, clamped coordinates, AND the full inserted messages — to
 // the session log as `agent/inbox/spliced`. Folding that log prefix up to
 // (excluding) the current event's seq reproduces the exact pre-splice pending
-// window, whenever the fold runs.
+// window — the very coordinates the claim is defined against — with zero
+// dependence on dispatch order. The projection read survives only as the
+// fallback for hosts whose events carry no seq (or whose session object
+// exposes no snapshotEvents).
 
 /** A firehose event as the replay path reads it: envelope fields only. */
 export interface InboxEventLike {
@@ -167,6 +174,64 @@ export function claimedUserText(messages: readonly unknown[]): string {
     if (text.trim() !== '') claimedText = claimedText === '' ? text : `${claimedText}\n${text}`
   }
   return claimedText
+}
+
+/** Where the resolved claimed text actually came from (see resolveClaimedText). */
+export type ClaimedTextSource = 'log-replay' | 'projection'
+
+export interface ClaimedTextResolution {
+  text: string
+  source: ClaimedTextSource
+}
+
+/**
+ * Resolve the claimed text for one splice, ordering the two sources by
+ * authority (review CONCERN A, 0.17.1):
+ *
+ * 1. Session-log replay — preferred UNCONDITIONALLY whenever the event
+ *    carries a seq and a log prefix is available. The fold reproduces the
+ *    pre-splice window the claim coordinates (start/removedCount) are
+ *    defined against, so it is immune to handler order AND to the backlog
+ *    misalignment: with ≥2 pending messages the post-splice projection
+ *    read is NON-empty but shifted by one (a claim of msg1 would read
+ *    msg2's residual text), which the 0.17.0 empty-projection-only gating
+ *    missed. The replay verdict is FINAL — when the fold succeeds the
+ *    projection is not consulted, even if the replayed slice comes back
+ *    empty (the pre-splice window genuinely held no user text).
+ * 2. Projection read — the fallback for hosts where the replay cannot arm
+ *    (no event.seq on the firehose, or snapshotEvents unreachable/failed).
+ *    Pre-0.1.5 live dispatch precedes the mutation, so this read yields
+ *    the pre-splice window, as it always did.
+ *
+ * `source` names the source that ACTUALLY produced the returned text
+ * (review CONCERN B): 'log-replay' whenever the replay supplied the
+ * verdict (empty included), 'projection' only when the fallback did (or
+ * the replay never armed).
+ */
+export function resolveClaimedText(input: {
+  /** The pending window as read at handler time (post-splice on 0.1.5+). */
+  projection: readonly unknown[]
+  /** Session-log prefix up to (excluding) `seq`, or undefined when unreachable. */
+  logEvents: readonly InboxEventLike[] | undefined
+  /** The splice event's own seq — a number marks a replay-capable host. */
+  seq: unknown
+  target: 'next-turn' | 'next-step'
+  start: number
+  removedCount: number
+}): ClaimedTextResolution {
+  if (typeof input.seq === 'number' && input.logEvents !== undefined) {
+    const window = replayPendingInbox(input.logEvents, input.seq)
+    if (window !== undefined) {
+      return {
+        text: claimedUserText(window[input.target].slice(input.start, input.start + input.removedCount)),
+        source: 'log-replay',
+      }
+    }
+  }
+  return {
+    text: claimedUserText(input.projection.slice(input.start, input.start + input.removedCount)),
+    source: 'projection',
+  }
 }
 
 // dsh-settings 0.1.2-alpha.3 removed the runtime settingsNamespace() helper:
@@ -454,6 +519,15 @@ export function apply(ctx: Context): void {
         }
       }
       const r = service.retrieveSync(query, sessionId, seen === undefined && echo === undefined ? undefined : { exclude: seen, echo }, slow, slowExpired)
+      // The service-layer early exit (empty roster — e.g. a probe home with
+      // no topics seeded) writes NO injection record and used to be fully
+      // silent (the P8 early-exit the incident audit enumerated). autoInject
+      // off never reaches here (the spliced branch gates it) and an empty
+      // query is pre-filtered by the empty-claimed exit, so rosterSize 0 on
+      // this path means exactly "roster empty".
+      if (r.outcome.rosterSize === 0) {
+        silentExit('no-roster', 'roster 为空（topics 库 0 条）——service 层早退，本轮不写 ilog 记录')
+      }
       // Mark only what entered the context this round (hits AND slow picks →
       // dedup filter → assemble → registry mark; budget-dropped slugs stay
       // injectable).
@@ -655,49 +729,39 @@ export function apply(ctx: Context): void {
       }
       const target = (splice.target ?? 'next-turn') === 'next-step' ? 'next-step' : 'next-turn'
       const list = (target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn) as readonly UserMessageLike[]
-      // Source 1 — projection read. On hosts without the eager projection
-      // drive (dsh < 0.1.5) the live dispatch still precedes the mutation
-      // and this read yields the pre-splice window, as it always did.
-      const claimed = list.slice(splice.start, splice.start + splice.removedCount)
-      let claimedText = claimedUserText(claimed)
-      let claimedSource = 'projection'
-      // Source 2 — session-log replay. On dsh 0.1.5-rc.2+ the registry's
-      // drive (hooksOrder[0]) has already applied THIS splice by the time
-      // this handler (hooksOrder[10]) runs, so the projection read above
-      // sees the post-splice window. The replay folds the same log the
-      // projection itself is built from, up to (excluding) this event —
-      // registration order becomes irrelevant.
-      if (claimedText.trim() === '') {
-        const seq = event.seq
-        if (typeof seq === 'number') {
-          try {
-            const snapshot = (session as unknown as {
-              snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly InboxEventLike[]
-            }).snapshotEvents
-            const events = typeof snapshot === 'function' ? snapshot.call(session, 0, seq) : undefined
-            const window = events === undefined ? undefined : replayPendingInbox(events, seq)
-            if (window !== undefined) {
-              claimedText = claimedUserText(window[target].slice(splice.start, splice.start + splice.removedCount))
-              if (claimedText.trim() !== '') claimedSource = 'log-replay'
-            }
-          } catch {
-            // contained — the empty-claimed exit below stays the verdict
-          }
+      // Authority — session-log replay (resolveClaimedText, CONCERN A):
+      // whenever the event carries a seq, the fold runs FIRST and its
+      // verdict is final — with ≥2 pending messages the post-splice
+      // projection read is non-empty but shifted by one, so gating the
+      // replay on an empty projection would claim msg1 and read msg2.
+      const seq = event.seq
+      let logEvents: readonly InboxEventLike[] | undefined
+      if (typeof seq === 'number') {
+        try {
+          const snapshot = (session as unknown as {
+            snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly InboxEventLike[]
+          }).snapshotEvents
+          if (typeof snapshot === 'function') logEvents = snapshot.call(session, 0, seq)
+        } catch {
+          // contained — the projection fallback inside resolveClaimedText
+          // stays the verdict
         }
       }
-      if (claimedText.trim() === '') {
-        // claimedSource names the LAST source that produced this (empty)
-        // text: 'projection' = replay never armed (pre-0.1.5 host, or
-        // snapshotEvents unreachable), 'log-replay' = the fold ran and the
-        // pre-splice window genuinely held no user text.
-        silentExit(`empty-claimed/${claimedSource}`, `target=${target} start=${String(splice.start)} removedCount=${String(splice.removedCount)}——被 claim 窗口重建后仍无用户文本`)
+      const claimed = resolveClaimedText({ projection: list, logEvents, seq, target, start: splice.start, removedCount: splice.removedCount })
+      if (claimed.text.trim() === '') {
+        // claimed.source names where the (empty) verdict actually came
+        // from (CONCERN B): 'log-replay' = the fold ran and the pre-splice
+        // window genuinely held no user text; 'projection' = the replay
+        // never armed (no seq / snapshotEvents unreachable) and the
+        // projection read was empty too.
+        silentExit(`empty-claimed/${claimed.source}`, `target=${target} start=${String(splice.start)} removedCount=${String(splice.removedCount)}——被 claim 窗口重建后仍无用户文本`)
         return
       }
       const state = turns.get(sessionId) ?? { claimedText: '', injectionText: '' }
-      state.claimedText = claimedText
+      state.claimedText = claimed.text
       state.injectionText = ''
       turns.set(sessionId, state)
-      retrieveForTurn(sessionId, claimedText)
+      retrieveForTurn(sessionId, claimed.text)
       return
       }
       if (event.type === 'turn/start') {
