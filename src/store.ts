@@ -140,6 +140,31 @@ export class BundleStore {
     return join(this.metaDir(), 'injections.jsonl')
   }
 
+  /**
+   * Fast-lane heartbeat (0.17.0): tail timestamps of the two lane sidecars —
+   * the last injection round (`injections.jsonl`) and the last observation
+   * (`observations.jsonl`). Feeds the /topics status stale check that makes
+   * "observer still recording, injection lane silently dead" visible within
+   * a day instead of weeks (the 0.1.5-rc.2 claim-order incident shape).
+   * Full-file reads are fine here: /topics status is interactive and both
+   * logs are append-per-round small; unreadable logs degrade to undefined.
+   */
+  async readLaneHeartbeat(): Promise<{ lastInjectionAt?: string; lastObservationAt?: string }> {
+    const tailAt = async (file: string): Promise<string | undefined> => {
+      try {
+        const lines = (await readFile(file, 'utf8')).trimEnd().split('\n')
+        const at = (JSON.parse(lines.at(-1) ?? '') as { at?: unknown }).at
+        return typeof at === 'string' ? at : undefined
+      } catch {
+        return undefined
+      }
+    }
+    return {
+      lastInjectionAt: await tailAt(this.injectionsPath()),
+      lastObservationAt: await tailAt(this.observationsPath()),
+    }
+  }
+
   private conflictsPath(): string {
     return join(this.metaDir(), 'conflicts.json')
   }

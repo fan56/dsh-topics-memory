@@ -149,6 +149,32 @@ async function renderStatus(service: TopicsService): Promise<string> {
     const gc = typeof lastRun.gcDropped === 'number' && lastRun.gcDropped > 0 ? `，GC 回收 ${lastRun.gcDropped}` : ''
     rows.push(['最近蒸馏', `${outcome}${gc} @ ${cell(String(lastRun.at ?? '').slice(0, 19).replace('T', ' '))}`])
   }
+  // Fast-lane heartbeat (0.17.0): pair "observer lane recorded recently"
+  // with "no injection round for >48h" — exactly the asymmetry a silent
+  // fast-lane death produces (the 0.1.5-rc.2 claim-order incident shape).
+  // With autoInject off there is no fast lane to be stale.
+  if (cfg.autoInject) {
+    const HOUR = 3_600_000
+    const hb = await service.store.readLaneHeartbeat()
+    const stamp = (iso: string): string => cell(iso.slice(0, 19).replace('T', ' '))
+    const ago = (ms: number): string => {
+      const h = ms / HOUR
+      if (!Number.isFinite(h)) return ''
+      return h < 1 ? `${Math.max(1, Math.round(h * 60))} 分钟前` : h < 48 ? `${Math.round(h)}h 前` : `${Math.round(h / 24)} 天前`
+    }
+    const lastAt = hb.lastInjectionAt
+    const fastIdleMs = lastAt !== undefined ? Date.now() - Date.parse(lastAt) : Number.POSITIVE_INFINITY
+    const obsAgeMs = hb.lastObservationAt !== undefined ? Date.now() - Date.parse(hb.lastObservationAt) : Number.POSITIVE_INFINITY
+    const obsRecent = obsAgeMs < 24 * HOUR
+    if (lastAt === undefined) {
+      rows.push(['快道心跳', obsRecent ? `⚠️ 从未注入，但观察 lane ${ago(obsAgeMs)}仍在记录——快道疑似静默死亡` : '从未注入'])
+    } else if (fastIdleMs > 48 * HOUR && obsRecent) {
+      rows.push(['快道心跳', `⚠️ ${stamp(lastAt)}（${ago(fastIdleMs)}）无注入轮次，而观察 lane ${ago(obsAgeMs)}仍在记录——快道疑似静默死亡`])
+    } else {
+      const since = ago(fastIdleMs)
+      rows.push(['快道心跳', `${stamp(lastAt)}${since === '' ? '' : `（${since}）`}`])
+    }
+  }
   const lastConsolidate = await service.store.readConsolidateState()
   if (lastConsolidate !== undefined) {
     const count = (v: unknown): number => (Array.isArray(v) ? v.length : 0)

@@ -103,6 +103,62 @@ test('command: status shows mode, counts, injection settings', async () => {
   }
 })
 
+test('command: status fast-lane heartbeat — fresh round, stale warning, never-injected, off', async () => {
+  const HOUR = 3_600_000
+  const iso = (msAgo) => new Date(Date.now() - msAgo).toISOString()
+  // Fresh: last round 2h ago, observer 1h ago → plain row, no warning.
+  {
+    const { service, mutate, cleanup } = makeService()
+    try {
+      await service.store.ensure()
+      await service.store.appendInjectionRecord({ at: iso(2 * HOUR), queryTokenCount: 3, rosterSize: 0, hits: [], nearMisses: [], injected: false })
+      await service.store.appendObservation({ at: iso(HOUR), kind: 'finding', text: 'x' })
+      const r = await buildTopicsCommand(service, mutate).handler(inv('status'))
+      assert.match(r.text, /快道心跳/)
+      assert.doesNotMatch(r.text, /静默死亡/)
+    } finally {
+      cleanup()
+    }
+  }
+  // Stale: observer recorded 1h ago but the last round is 3 days old → warn.
+  {
+    const { service, mutate, cleanup } = makeService()
+    try {
+      await service.store.ensure()
+      await service.store.appendInjectionRecord({ at: iso(72 * HOUR), queryTokenCount: 3, rosterSize: 0, hits: [], nearMisses: [], injected: false })
+      await service.store.appendObservation({ at: iso(HOUR), kind: 'finding', text: 'x' })
+      const r = await buildTopicsCommand(service, mutate).handler(inv('status'))
+      assert.match(r.text, /快道心跳.*静默死亡/s)
+    } finally {
+      cleanup()
+    }
+  }
+  // Never injected while the observer is active → warn.
+  {
+    const { service, mutate, cleanup } = makeService()
+    try {
+      await service.store.ensure()
+      await service.store.appendObservation({ at: iso(HOUR), kind: 'finding', text: 'x' })
+      const r = await buildTopicsCommand(service, mutate).handler(inv('status'))
+      assert.match(r.text, /快道心跳.*从未注入.*静默死亡/s)
+    } finally {
+      cleanup()
+    }
+  }
+  // autoInject off → no heartbeat row (nothing can be stale).
+  {
+    const { service, mutate, cleanup } = makeService({ autoInject: false })
+    try {
+      await service.store.ensure()
+      await service.store.appendObservation({ at: iso(HOUR), kind: 'finding', text: 'x' })
+      const r = await buildTopicsCommand(service, mutate).handler(inv('status'))
+      assert.doesNotMatch(r.text, /快道心跳/)
+    } finally {
+      cleanup()
+    }
+  }
+})
+
 test('command: stats empty vs populated + list + show', async () => {
   const { service, mutate, cleanup } = makeService()
   try {

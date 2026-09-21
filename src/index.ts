@@ -86,6 +86,89 @@ export function settleBounded(p: Promise<unknown> | undefined, ms: number): Prom
  *  skills registry serves the bundled usage/config guide. */
 export const inject = ['systemPrompt', 'tools', 'settings', 'agents', 'llm', 'skills']
 
+// ---- Fast-lane claim-text rebuild from the session log (0.17.0) ----
+//
+// dsh 0.1.5-rc.2's SessionProjectionRegistry registers its eager inbox drive
+// at session/event hooksOrder[0]; every later handler — this plugin sits at
+// [10] — observes the projection AFTER the current splice was applied, so the
+// pre-0.1.5 contract "live dispatch precedes projection mutation" is gone and
+// the projection read at `agent/inbox/spliced` time yields the post-splice
+// (empty) window. The rebuild below depends on no dispatch order at all:
+// dsh-agent-loop's InboxProjector funnels every append/prepend/replace/
+// remove/claim/cancel through mutate(), and mutate() appends each normalized
+// splice — target, clamped coordinates, AND the full inserted messages — to
+// the session log as `agent/inbox/spliced`. Folding that log prefix up to
+// (excluding) the current event's seq reproduces the exact pre-splice pending
+// window, whenever the fold runs.
+
+/** A firehose event as the replay path reads it: envelope fields only. */
+export interface InboxEventLike {
+  seq?: unknown
+  type?: unknown
+  data?: unknown
+}
+
+/** The pending-inbox projection replayed from a session-log prefix. */
+export interface PendingInboxWindow {
+  'next-turn': readonly unknown[]
+  'next-step': readonly unknown[]
+}
+
+/** One `agent/inbox/spliced` log entry (shape per dsh-agent-loop mutate()). */
+interface InboxSpliceData {
+  target?: string
+  start: number
+  removedCount?: number
+  inserted?: readonly unknown[]
+}
+
+/**
+ * Fold a session-log prefix into the pending-inbox projection state.
+ * Coordinates in the log are already normalize-at-append (dsh-agent-loop
+ * clamps start/deleteCount before appending), so each entry applies as a
+ * plain toSpliced. Events at or past `upToSeqExclusive` are ignored — pass
+ * the current splice's own seq to fold everything BEFORE it. Returns
+ * undefined when any entry is malformed enough to break the fold (the
+ * caller degrades to the projection read, as before).
+ */
+export function replayPendingInbox(events: readonly InboxEventLike[], upToSeqExclusive: number): PendingInboxWindow | undefined {
+  const window: { 'next-turn': unknown[]; 'next-step': unknown[] } = { 'next-turn': [], 'next-step': [] }
+  try {
+    for (const event of events) {
+      const seq = event.seq
+      if (typeof seq === 'number' && seq >= upToSeqExclusive) break
+      if (event.type !== 'agent/inbox/spliced') continue
+      const splice = event.data as InboxSpliceData | null | undefined
+      if (splice === null || typeof splice !== 'object') continue
+      const target = splice.target ?? 'next-turn'
+      if (target !== 'next-turn' && target !== 'next-step') continue
+      const start = Math.trunc(splice.start)
+      const removedCount = Math.trunc(splice.removedCount ?? 0)
+      if (!Number.isFinite(start) || !Number.isFinite(removedCount) || start < 0 || removedCount < 0) continue
+      window[target] = window[target].toSpliced(start, removedCount, ...(splice.inserted ?? []))
+    }
+  } catch {
+    return undefined
+  }
+  return window
+}
+
+/**
+ * Claimed-text extraction, shared verbatim by the projection read and the
+ * log replay: user-kind messages only, text blocks joined per message —
+ * the pre-0.17.0 splice-window semantics.
+ */
+export function claimedUserText(messages: readonly unknown[]): string {
+  let claimedText = ''
+  for (const message of messages) {
+    const data = message as UserMessageData | null | undefined
+    if (data === null || typeof data !== 'object' || data.source?.kind !== 'user') continue
+    const text = textOf(data as UserMessageLike)
+    if (text.trim() !== '') claimedText = claimedText === '' ? text : `${claimedText}\n${text}`
+  }
+  return claimedText
+}
+
 // dsh-settings 0.1.2-alpha.3 removed the runtime settingsNamespace() helper:
 // register() now brand-checks the namespace at the type level
 // (SettingsNamespaceInput) and validates the same lowercase-hyphenated
@@ -105,6 +188,10 @@ interface AgentMapLike {
 interface SessionEvent {
   type: string
   data: unknown
+  /** Log sequence number, present on hosts whose firehose carries appended
+   * events (dsh 0.1.5+). The fast-lane log replay keys on it; absent on
+   * older hosts, where the replay simply never arms. */
+  seq?: number
 }
 
 interface UserMessageData {
@@ -274,6 +361,22 @@ export function apply(ctx: Context): void {
   // fail-open, idempotent — see migrateLegacySettings). Fire-and-forget: the
   // write settles on its own; a rejection only skips the migration.
   void migrateLegacySettings(settingsNs as unknown as SettingsNsLike, warn)
+  // Low-noise observability for the fast lane's early exits. The 2026-09-21
+  // silent-death incident (0.1.5-rc.2 claim order) died precisely because
+  // every exit path was silent: the injected log stayed empty for weeks
+  // while the observer kept recording. First occurrence warns immediately;
+  // repeats batch into one count line per SILENT_EXIT_LOG_EVERY occurrences.
+  // DSH_TOPICS_DEBUG=1 logs every single one for bench debugging.
+  const SILENT_EXIT_LOG_EVERY = 50
+  const debugVerbose = process.env.DSH_TOPICS_DEBUG === '1'
+  const silentExitCounts = new Map<string, number>()
+  const silentExit = (key: string, detail: string): void => {
+    const n = (silentExitCounts.get(key) ?? 0) + 1
+    silentExitCounts.set(key, n)
+    if (debugVerbose || n === 1 || n % SILENT_EXIT_LOG_EVERY === 0) {
+      warn(`dsh-topics-memory 快道本轮未触发（${key}，累计 ${n} 次）：${detail}`)
+    }
+  }
   const cfgNow = (): TopicsConfigValue => {
     const v = scope.get() as Partial<TopicsConfigValue> | undefined
     // Schema defaults may not be applied by bare test harnesses; fill them in.
@@ -529,9 +632,17 @@ export function apply(ctx: Context): void {
       if (event.type === 'agent/inbox/spliced') {
       if (!cfgNow().autoInject) return
       const splice = event.data as { target?: string; start: number; removedCount?: number; outcome?: string }
-      if (!splice.removedCount || splice.outcome === 'canceled') return
+      // A canceled claim is routine host flow (inbox cancel/remove), not a
+      // fault signal — it only logs under DSH_TOPICS_DEBUG, never warns.
+      if (!splice.removedCount || splice.outcome === 'canceled') {
+        if (debugVerbose) silentExit('canceled', `target=${String(splice.target)} removedCount=${String(splice.removedCount)} outcome=${String(splice.outcome)}`)
+        return
+      }
       const agent = agents()?.get(session.id)
-      if (agent === undefined) return
+      if (agent === undefined) {
+        silentExit('agent-missing', `agents() 无此会话 ${sessionId}——快道文本无法定位`)
+        return
+      }
       // The agent-scoped context carries the llm instance this agent's own
       // loop streams through (adapters included) — capture it while alive.
       try {
@@ -542,16 +653,46 @@ export function apply(ctx: Context): void {
       } catch {
         // scope already unwinding — the root fallback stays
       }
-      const list = ((splice.target ?? 'next-turn') === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn) as readonly UserMessageLike[]
-      // Live dispatch precedes projection mutation: read the pre-splice window.
+      const target = (splice.target ?? 'next-turn') === 'next-step' ? 'next-step' : 'next-turn'
+      const list = (target === 'next-step' ? agent.inbox.nextStep : agent.inbox.nextTurn) as readonly UserMessageLike[]
+      // Source 1 — projection read. On hosts without the eager projection
+      // drive (dsh < 0.1.5) the live dispatch still precedes the mutation
+      // and this read yields the pre-splice window, as it always did.
       const claimed = list.slice(splice.start, splice.start + splice.removedCount)
-      let claimedText = ''
-      for (const message of claimed) {
-        if ((message as UserMessageData).source?.kind !== 'user') continue
-        const text = textOf(message as UserMessageLike)
-        if (text.trim() !== '') claimedText = claimedText === '' ? text : `${claimedText}\n${text}`
+      let claimedText = claimedUserText(claimed)
+      let claimedSource = 'projection'
+      // Source 2 — session-log replay. On dsh 0.1.5-rc.2+ the registry's
+      // drive (hooksOrder[0]) has already applied THIS splice by the time
+      // this handler (hooksOrder[10]) runs, so the projection read above
+      // sees the post-splice window. The replay folds the same log the
+      // projection itself is built from, up to (excluding) this event —
+      // registration order becomes irrelevant.
+      if (claimedText.trim() === '') {
+        const seq = event.seq
+        if (typeof seq === 'number') {
+          try {
+            const snapshot = (session as unknown as {
+              snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly InboxEventLike[]
+            }).snapshotEvents
+            const events = typeof snapshot === 'function' ? snapshot.call(session, 0, seq) : undefined
+            const window = events === undefined ? undefined : replayPendingInbox(events, seq)
+            if (window !== undefined) {
+              claimedText = claimedUserText(window[target].slice(splice.start, splice.start + splice.removedCount))
+              if (claimedText.trim() !== '') claimedSource = 'log-replay'
+            }
+          } catch {
+            // contained — the empty-claimed exit below stays the verdict
+          }
+        }
       }
-      if (claimedText.trim() === '') return
+      if (claimedText.trim() === '') {
+        // claimedSource names the LAST source that produced this (empty)
+        // text: 'projection' = replay never armed (pre-0.1.5 host, or
+        // snapshotEvents unreachable), 'log-replay' = the fold ran and the
+        // pre-splice window genuinely held no user text.
+        silentExit(`empty-claimed/${claimedSource}`, `target=${target} start=${String(splice.start)} removedCount=${String(splice.removedCount)}——被 claim 窗口重建后仍无用户文本`)
+        return
+      }
       const state = turns.get(sessionId) ?? { claimedText: '', injectionText: '' }
       state.claimedText = claimedText
       state.injectionText = ''
