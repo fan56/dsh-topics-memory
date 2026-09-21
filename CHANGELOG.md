@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.0 (2026-09-21)
+
+快道注入静默死亡修复（dsh 0.1.5-rc.2 claim 时序事故，2026-09-21 探针台三向判决定谳）：宿主投影化 inbox 后，`session/event` 派发按注册顺序同步执行——SessionProjectionRegistry 的 eager drive（hooksOrder[0]）先于本插件 handler（hooksOrder[10]），`agent/inbox/spliced` 到达时 `agent.inbox.nextTurn` 已是 post-splice 空窗口，旧契约「live dispatch 先于投影变更」失效，claimed 文本重建恒空 → 静默 return，注入连续数周零轮次而无任何日志痕迹。候选 B（agents 注册表查不到会话）已被探针排除（agentFound=true）。
+
+- **claimed 文本重建改道——会话 log 回放，对监听注册顺序零依赖**：投影读数为空时，折叠 `session.snapshotEvents(0, event.seq)`（当前 splice 之前的日志前缀）里的全部 `agent/inbox/spliced` 条目重建 pre-splice pending 窗口，再按事件坐标（target/start/removedCount）切片。正确性依据（宿主源码核实）：dsh-agent-loop 的 InboxProjector 把 append/prepend/replace/remove/claim/cancel 全部经 `mutate()`，而 `mutate()` 把归一化坐标**连同 inserted 完整消息**append 进会话 log——回放数据源与投影 registry 自身的构建源相同，何时折叠都正确。原语义逐字保留：仅取 `kind:'user'`、文本块抽取规则、start 偏移、next-turn/next-step 目标区分、多消息 `\n` 连接。旧宿主（<0.1.5）上投影读数照旧先行且非空，回放不触发，零行为变化；`agent/inbox/discarded` 侧信道方案已核实不可行（claim 路径 `discardRemoved=false`，discarded 事件只随 cancel 发射）。
+- **可观测性——spliced 早退路径低噪声日志**：`agent-missing`（agents() 查不到会话）与 `empty-claimed/<source>`（重建后仍无用户文本，source 标记最后来源 projection / log-replay）经宿主 logger 首次即告警、此后每 50 次汇总一行；canceled/零删除这类常规宿主流仅 `DSH_TOPICS_DEBUG=1` 时记录；autoInject 关闭（用户意图）不记录。本次事故的死因之一就是全路径静默。
+- **`/topics status` 快道心跳**：新增「快道心跳」行，显示 `injections.jsonl` 末条轮次时间；当「观察 lane 24h 内仍在记录，但快道 >48h 无轮次（或从未注入）」时输出 stale 警告——同类静默死亡下次 24h 内可见。autoInject 关闭时不渲染该行。
+- **测试**：新增 `fast-lane.test.mjs` 9 例（事故形态复现：post-splice 空投影 + log 回放重建、next-turn/next-step 目标隔离、start 偏移、user 过滤、多文本块连接、canceled splice 亦参与折叠、畸形条目降级、seq 截断守卫）；`commands.test.mjs` 增心跳四态（新鲜/陈旧/从未注入/关闭）。
+
 ## 0.16.1-next.1 (2026-09-20)
 
 启动链监听面从 `session/event` firehose 迁到 agent bus——会话启动事件只走 agent bus、从不出现在 firehose 上（firehose 只携带 Session.append 类型，此前短暂落地的 firehose 双匹配在真实宿主上永不命中），`sync.pull → store.ensure → boot-replay 蒸馏 → consolidation cadence → deprecated-TTL 清扫`整条启动链由此在 0.1.5 / 0.1.6 宿主上都真实触发，无需抬 dsh 支持下限：
