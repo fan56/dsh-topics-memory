@@ -142,7 +142,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 - **子代理默认不参与记忆，可整体打开**：默认（`include-subagents` off，0.7.0 起）delegation depth > 0 的子代理会话被整体跳过——不注入、不观察、不触发蒸馏；`/topics set include-subagents on` 后注入与观察同样作用于子代理会话。topic 工具始终在全局层（子代理显式 `topic_save` 不受开关影响）。跨进程子代理（claude-code/codex 等 provider）本就不加载本插件。
 - **退出路径本地化（0.10.0）**：插件 disposer 只做一步本地 git commit（meta 侧车文件：observations / injections / distill state），不再等待任何网络——没有 pull、没有 push、没有模型调用，宿主退出不再支付 git 双程与有界蒸馏等待（旧的 90s 上限移除，仅保留 10s 兜底以防病理性 git 卡死）。退出蒸馏触发改为 fire-and-forget；已有 session-end run 在跑时整体跳过（否则同一全局队头批次会被双份喂给模型）。跳过不丢活：observations 本就 write-through 落盘，推迟的 push 由下次启动的 pull 补推，被跳过的蒸馏同样由下次启动回放（boot-replay）。`meta/distill-state.json` 记录每次 lane 的结局，`/topics status` 可查。
 - **观察 GC（三振删除）**：被模型实际评估（返回了可解析应答，无论内容有无价值）却未被任何 op 消费的观察记一次 failed attempt，连续 3 次即物理删除（用户已明确授权删除 lane 确实无法处理的原始观察）。模型从未评估过的批次永不计数：基础设施失败（网络错误、蒸馏路由未配置 → 可读 `no-model` 短路）与输出不可解析（`invalid-output`）豁免；输出上限减半重试中的批次只有到达裁决（成功 / 触底 / stalled / 明确跳过）才计一次。删除立即 commit（数据销毁 git 可追溯），纯计数沿用 flush 节奏。
-- **配置读取时机**：`/topics set` 与 settings.yaml 修改在下次会话启动后生效最稳。
+- **配置读取时机**：`/topics set` 与 profile patch 修改在下次会话启动后生效最稳（dsh 0.1.7 起 settings 文档即 profile patch；旧 settings.yaml 导入一次后改名）。
 - **蒸馏选模型**：`/topics onboard` 的蒸馏一步拆成两问（先 provider 后 model，模型列表取自该 provider 的目录），选完经 `resolveModelInfo` 预校验——provider 无活路由会阻断重选，模型目录校验非 NO_ADAPTER 失败（目录外，可能仍可用）则警告但放行；无 ask UI 或无可用模型路由的环境自动退回文本输入。`/topics set` 的选择面板走同一套校验。
 
 ## 设计文档
