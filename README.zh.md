@@ -4,7 +4,7 @@
 
 一个 dsh 插件：把「工作 topic 记忆」维护成 [OKF 标准（Open Knowledge Format v0.2）](https://github.com/GoogleCloudPlatform/open-knowledge-format)的知识 bundle，持久化在本地 git 仓库（可选同步到 GitHub 私有仓库），利用 git 历史提供结论可追溯性，自动观察会话沉淀知识，并在每轮对话前向模型注入相关 Topic。
 
-> **要求 dsh >= 0.1.5-rc.2** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
+> **要求 dsh >= 0.1.7-rc.1** — 本插件只跟随 dsh RC/stable 线（CI 与发版在运行时解析 latest/next 中更新的 dist-tag）。**不再支持 alpha 线。**
 
 ## 演示
 
@@ -90,14 +90,14 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 以下内容有意保留在磁盘上（这是你的记忆本体）：
 
 - `~/.dsh/topics/` —— 整个话题包：话题 markdown、`meta/`、以及内嵌的 `.git` 仓库（完整历史；可能带有 `origin` 远端 —— GitHub 同步随插件停止）。要异地归档就原样拷贝/克隆这个目录。
-- `~/.dsh/settings.yaml` 的 `topics:` 段 —— 用户覆盖项。注意：重装会静默恢复同步（包括已配置的 `repo`）；想干净重来就先删这一段。
+- 设置页 `dsh-topics-memory` 条目（profile patch）—— 用户覆盖项。注意：重装会静默恢复同步（包括已配置的 `repo`）；想干净重来就先清空该条目。
 - 0.5.x → 0.6.x 迁移留下的 `llmwiki:` 旧设置段不会被自动删除；确认无用后手动移除。
 
 彻底清除：先备份 `~/.dsh/topics`，再 `rm -rf ~/.dsh/topics`。
 
 ## 配置
 
-首次配置交给 `/topics onboard`；日常微调用 `/topics set <key> <value>`（写 `settings.yaml` 的 `topics` namespace，下次会话启动生效）。全部键与默认值：
+首次配置交给 `/topics onboard`；日常微调用 `/topics set <key> <value>`——0.1.7+ 宿主上写设置页 `dsh-topics-memory` 条目（profile patch），全部键 volatile 免重启即时生效。全部键与默认值：
 
 | 键 | 默认 | 说明 |
 |---|---|---|

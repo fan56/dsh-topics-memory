@@ -4,7 +4,7 @@ English | [中文](README.zh.md)
 
 A dsh plugin: maintains "working topic memory" as an [OKF (Open Knowledge Format v0.2)](https://github.com/GoogleCloudPlatform/open-knowledge-format) knowledge bundle, persisted in a local git repository (optionally synced to a private GitHub repo), with conclusions traceable through git history, sessions automatically observed and distilled into knowledge, and relevant topics injected to the model before every turn.
 
-> **Requires dsh >= 0.1.5-rc.2** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
+> **Requires dsh >= 0.1.7-rc.1** — this plugin targets the dsh RC/stable line only (CI and releases resolve the newest of the `latest`/`next` dist-tags at runtime). **The alpha line is no longer supported.**
 
 ## Demo
 
@@ -90,14 +90,14 @@ The host reconciles the profile automatically: the `dsh.profile.bundles` entry i
 What stays on disk (kept on purpose — this is your memory):
 
 - `~/.dsh/topics/` — the whole topic bundle: topic markdown, `meta/`, and the embedded `.git` repo (the full history; it may carry an `origin` remote — GitHub sync stops with the plugin). To archive the bundle elsewhere, copy or clone this directory as-is.
-- `~/.dsh/settings.yaml` `topics:` section — user overrides. Reinstalling silently reactivates sync including any configured `repo`; delete the section first if you want a clean start.
-- The legacy `llmwiki:` settings section left by the 0.5.x → 0.6.x migration is never auto-deleted; remove it by hand once nothing needs it.
+- The settings-page `dsh-topics-memory` entry (profile patch) — user overrides. Reinstalling silently reactivates sync including any configured `repo`; clear the entry first if you want a clean start.
+- A legacy `llmwiki:` section left inside the old `settings.yaml` (renamed `settings.yaml.imported` after the host's one-shot 0.1.7 import) is never touched again; mine it by hand if something still needs it.
 
 Purge everything: back up `~/.dsh/topics` first, then `rm -rf ~/.dsh/topics`.
 
 ## Configuration
 
-First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set <key> <value>` (writes the `topics` namespace in `settings.yaml`, effective from the next session). All keys and defaults:
+First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set <key> <value>` — on dsh 0.1.7+ it writes the settings-page `dsh-topics-memory` entry (the profile patch) and every key is volatile: edits take effect immediately, no restart. All keys and defaults:
 
 | Key | Default | Meaning |
 |---|---|---|

@@ -62,7 +62,6 @@ function bootPlugin(overrides = {}) {
   const contexts = []
   const agentsMap = new Map()
   const ctx = {
-    settings: { register: () => ({ get: () => overrides }) },
     systemPrompt: {
       section: () => undefined,
       context: (input) => contexts.push(input),
@@ -81,7 +80,7 @@ function bootPlugin(overrides = {}) {
       },
     },
   }
-  apply(ctx)
+  apply(ctx, overrides)
   const onEvent = handlers[0]
   const dispatch = (sessionId, type, data) => onEvent.call(undefined, { id: sessionId }, { type, data })
   // Real teardown events are cordis events, not session/event types: deliver

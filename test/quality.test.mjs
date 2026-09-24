@@ -378,7 +378,6 @@ test('wiring: turn/end produces a pending, the next spliced consumes it', async 
   }, { message: 'seed' })
   const cfg = { ...CFG, qualityLane: 'always', autoObserve: false }
   const ctx = {
-    settings: { register: () => ({ get: () => cfg }) },
     systemPrompt: { section: () => undefined, context: (input) => contexts.push(input) },
     tools: { register: () => undefined },
     agents: { get: (id) => agentsMap.get(String(id)) },
@@ -393,7 +392,7 @@ test('wiring: turn/end produces a pending, the next spliced consumes it', async 
       },
     },
   }
-  apply(ctx)
+  apply(ctx, cfg)
   const onEvent = handlers[0]
   const dispatch = (sessionId, type, data) => onEvent.call(undefined, { id: sessionId }, { type, data })
   const userMsg = (text) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
@@ -456,7 +455,6 @@ test('wiring: autoInject off → the slow lane never produces (no unconsumable s
   await store.ensure()
   const cfg = { ...CFG, qualityLane: 'always', autoObserve: false, autoInject: false }
   const ctx = {
-    settings: { register: () => ({ get: () => cfg }) },
     systemPrompt: { section: () => undefined, context: (input) => contexts.push(input) },
     tools: { register: () => undefined },
     agents: { get: (id) => agentsMap.get(String(id)) },
@@ -471,7 +469,7 @@ test('wiring: autoInject off → the slow lane never produces (no unconsumable s
       },
     },
   }
-  apply(ctx)
+  apply(ctx, cfg)
   const onEvent = handlers[0]
   const dispatch = (sessionId, type, data) => onEvent.call(undefined, { id: sessionId }, { type, data })
   const userMsg = (text) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })

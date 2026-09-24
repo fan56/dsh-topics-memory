@@ -13,6 +13,20 @@
 import * as okf from './okf.ts'
 import type { TopicsService } from './service.ts'
 
+// dsh 0.1.7 removed the shared catch-all 'plugin' message-source kind:
+// MessageSourceMap is now a merge-extensible sum type and every producer
+// declares its own kind in its own module (dsh-skill: 'skill-invocation',
+// dsh-agent: 'model-selection', …). This plugin's distill call therefore
+// registers 'topics-memory' — consumers fall through unknown kinds by
+// contract, so hosts without the augmentation still render the message.
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    /** Producer context contributed by the dsh-topics-memory plugin. */
+    'topics-memory': { kind: 'topics-memory' }
+  }
+}
+
+
 export interface ModelRequest {
   system: string
   user: string
@@ -838,7 +852,7 @@ export function defaultModelCaller(
     const messages = [
       createUserMessage({
         content: [{ type: 'text', text: req.user }],
-        source: { kind: 'plugin', plugin: 'dsh-topics-memory' },
+        source: { kind: 'topics-memory' },
       }),
     ]
     const options = deepFreeze({

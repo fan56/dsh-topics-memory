@@ -17,11 +17,6 @@ function mockCtx() {
     get() {
       return undefined
     },
-    settings: {
-      register() {
-        return { get: () => ({}) }
-      },
-    },
     systemPrompt: { section: () => undefined, context: () => undefined },
     tools: { register: () => undefined },
     skills: {

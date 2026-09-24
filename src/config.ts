@@ -9,71 +9,71 @@ import z from '@deepseek-ai/schemastery'
 
 export const TopicsConfig = z.object({
   /** GitHub repo `owner/name`; empty = local-only mode (ADR 0008). */
-  repo: z.string().default(''),
+  repo: z.string().default('').volatile(),
   /** Master switch for per-turn injection. */
-  autoInject: z.boolean().default(true),
+  autoInject: z.boolean().default(true).volatile(),
   /** Skip re-injecting topics already injected earlier in the same session. */
-  injectDedup: z.boolean().default(true),
+  injectDedup: z.boolean().default(true).volatile(),
   /** Skip re-injecting topics distilled from the CURRENT session's own turns
    *  (蒸馏回声): the conversation already carries that knowledge, so a
    *  pointer is a stale echo at best (2026-09 audit: 3 of 6 useless rounds).
    *  Provenance rides the observations log (sessionId → distilledInto). */
-  suppressEcho: z.boolean().default(true),
+  suppressEcho: z.boolean().default(true).volatile(),
   /** Max topics injected per round (ADR 0006: ≤4). */
-  topK: z.number().default(4),
+  topK: z.number().default(4).volatile(),
   /** Per-topic digest budget in tokens. */
-  perTopicBudget: z.number().default(300),
+  perTopicBudget: z.number().default(300).volatile(),
   /** Total injection budget in tokens. */
-  totalBudget: z.number().default(1500),
+  totalBudget: z.number().default(1500).volatile(),
   /** Retrieval score threshold — tune via /topics stats near-miss evidence. */
-  matchThreshold: z.number().default(0.3),
+  matchThreshold: z.number().default(0.3).volatile(),
   /** Additive boost per tag hit (v4: total cap = this value, was ×3). */
-  tagBoost: z.number().default(0.15),
+  tagBoost: z.number().default(0.15).volatile(),
   /** Injection shape: pointer (default, ≤600 tok) keeps the legacy digest view. */
-  injectMode: z.string().default('pointer'),
+  injectMode: z.string().default('pointer').volatile(),
   /** Slow quality lane (v4 §4.2): off | sampled (1/3 of turns) | always. */
-  qualityLane: z.string().default('sampled'),
+  qualityLane: z.string().default('sampled').volatile(),
   /** depends-graph expansion depth (0 disables). */
-  graphDepth: z.number().default(2),
+  graphDepth: z.number().default(2).volatile(),
   /** Days within which a topic counts as recent (+0.2). */
-  recencyWindowDays: z.number().default(7),
+  recencyWindowDays: z.number().default(7).volatile(),
   /** Capture each turn's user/assistant text as raw observations (M2). */
-  autoObserve: z.boolean().default(true),
+  autoObserve: z.boolean().default(true).volatile(),
   /** Whether injection and observation also engage delegated subagent sessions (ADR 0011).
    *  v4 default flipped to false: one-shot subagent turns diluted the pool.
    *  The slow quality lane never runs for subagents either way (hard guard). */
-  includeSubagents: z.boolean().default(false),
+  includeSubagents: z.boolean().default(false).volatile(),
   /** Max auto-captured chars per side (user/assistant) per turn. */
-  observationMaxChars: z.number().default(2000),
+  observationMaxChars: z.number().default(2000).volatile(),
   /** Background distill cadence: every N turns of a long session. */
-  distillEveryTurns: z.number().default(5),
+  distillEveryTurns: z.number().default(5).volatile(),
   /** Distill once when a session ends. */
-  distillOnSessionEnd: z.boolean().default(true),
+  distillOnSessionEnd: z.boolean().default(true).volatile(),
   /** Distill lane model route; both must be set, else distill stays idle. */
-  distillProvider: z.string().default(''),
-  distillModel: z.string().default(''),
+  distillProvider: z.string().default('').volatile(),
+  distillModel: z.string().default('').volatile(),
   /** Observations per distill model call; auto-halves on output-limit failures (floor 5). */
-  distillBatchSize: z.number().default(40),
+  distillBatchSize: z.number().default(40).volatile(),
   /** Max model calls per distill run — successful batches keep their marks (partial progress).
    *  Default 8: with the batch loop, one run then drains ~30-40 observations
    *  instead of ~10, which is what makes a real backlog actually shrink. */
-  distillMaxModelCalls: z.number().default(8),
+  distillMaxModelCalls: z.number().default(8).volatile(),
   /** Consolidation lane (整理) cadence: how often a session start may run the
    *  LLM gardener over the EXISTING pool (merge near-duplicates, promote
    *  settled drafts, deprecate superseded, refresh metadata). Reuses the
    *  distill model route; off disables the lane entirely. */
-  consolidateCadence: z.string().default('daily'),
+  consolidateCadence: z.string().default('daily').volatile(),
   /** Deprecated topics older than this many days are dropped at session start
    *  (local TTL sweep, no model; each drop is its own git commit, so history
    *  stays recoverable on the remote). 0 disables the sweep. */
-  deprecatedTtlDays: z.number().default(15),
+  deprecatedTtlDays: z.number().default(15).volatile(),
   /** UsageBoost (ADR 0015): behavioral bonus for topics injected/opened in
    *  the last 30 days, folded into the gate score — capped at 0.2 and never
    *  granted to zero-lexical candidates; the structural gate still applies.
    *  0 = off. */
-  usageBoost: z.number().default(0.15),
+  usageBoost: z.number().default(0.15).volatile(),
   /** Debounced push delay in GitHub mode. */
-  pushDebounceSeconds: z.number().default(45),
+  pushDebounceSeconds: z.number().default(45).volatile(),
 })
 
 export type TopicsConfigValue = {

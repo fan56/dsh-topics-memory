@@ -2,7 +2,8 @@
  * dsh-topics-memory — OKF topic memory for DeepSeek Harness.
  *
  * Wiring (per ADR 0001–0008):
- *  - `topics` settings namespace (user-tunable via /topics set)
+ *  - settings page = projection of the plugin `Config` schema, namespace =
+ *    profile entry id `dsh-topics-memory` (user-tunable via /topics set)
  *  - static systemPrompt section teaching the topic tools (never volatile
  *    content — the provider cache prefix stays byte-stable)
  *  - same-turn injection: retrieval runs synchronously at inbox-claim time
@@ -234,17 +235,34 @@ export function resolveClaimedText(input: {
   }
 }
 
-// dsh-settings 0.1.2-alpha.3 removed the runtime settingsNamespace() helper:
-// register() now brand-checks the namespace at the type level
-// (SettingsNamespaceInput) and validates the same lowercase-hyphenated
-// pattern at runtime via parseSettingsNamespace. A plain literal is the
-// supported spelling (same adaptation as dsh-cron / dsh-model-sync).
-const OWN_NS = 'topics'
+// dsh 0.1.7 settings: the runtime namespace registry (register/describe per
+// plugin) is gone. A plugin's settings page is the projection of its `Config`
+// schema below, and the settings namespace is the profile entry id
+// (`dsh-topics-memory`, cordis.patch.yml) — the same spelling /topics set
+// passes to ctx.settings.mutate(). A legacy top-level `topics:` section in
+// settings.yaml is NOT auto-imported under this id — the host imports the
+// old settings.yaml once, then renames it to settings.yaml.imported.
+export const Config = TopicsConfig
 
-/** Pre-rename settings namespace (dsh-llmwiki-memory ≤ 0.5.x). The plugin
- *  itself never writes to it, but while the migration window is open the
- *  registration shows up in config UIs like any other namespace (ADR 0013). */
-const LEGACY_NS = 'llmwiki'
+/** Settings namespace this plugin reads and writes: the profile entry id. */
+const ENTRY_ID = 'dsh-topics-memory'
+
+/** Live config reference as a 0.1.7 host passes it (cron / mcp-adapter
+ * spelling): `.get()` snapshots the current value — the host swaps the
+ * reference in-place when a volatile field is edited on the settings page. */
+interface VolatileRef<T> {
+  get(): T
+}
+
+/** apply()-time config: live VolatileRef fields on real hosts, plain values
+ * on bare test harnesses — {@link readConfigValue} accepts both. */
+export type TopicsRuntimeConfig = Partial<{ [K in keyof TopicsConfigValue]: VolatileRef<TopicsConfigValue[K]> | TopicsConfigValue[K] }>
+
+/** Snapshot one config slot: live ref → current value, plain value → itself. */
+function readConfigValue(slot: unknown): unknown {
+  const ref = slot as { get?: unknown } | undefined
+  return typeof ref?.get === 'function' ? (ref as { get(): unknown }).get() : slot
+}
 
 interface AgentMapLike {
   get(id: unknown): { inbox: { nextTurn: readonly unknown[]; nextStep: readonly unknown[] } } | undefined
@@ -264,71 +282,6 @@ interface UserMessageData {
   content: readonly { type: string; text?: string }[]
 }
 
-/**
- * Settings-provider surface the legacy-namespace migration needs. Structurally
- * typed like every other host seam in this file, so bare test harnesses
- * without dsh-settings still load the module: a host lacking `describe` or
- * `mutate` simply skips the migration.
- */
-interface SettingsNsLike {
-  register(n: unknown, s: unknown): { get(): unknown }
-  describe?(): { ns: unknown; user?: unknown }[]
-  mutate?(ns: unknown, ops: readonly { op: 'set'; path: string[]; value?: unknown }[]): Promise<void>
-}
-
-/**
- * One-time carry-over of user-tuned values from the pre-rename `llmwiki`
- * settings namespace into `topics` (ADR 0013). Constraints:
- * - one-time: only fires while the new namespace holds NO raw user overrides —
- *   describe().user is the only way to tell user keys from schema defaults,
- *   because scope.get() folds the defaults in;
- * - idempotent: after the copy (or any config written on the new name) the
- *   override check short-circuits every later boot;
- * - fail-open: registering the legacy namespace can throw (duplicate or
- *   schema-invalid stored section) and the write can reject — both contained,
- *   so plugin startup never depends on the migration.
- * Keys whose stored value equals the schema default are not copied (nothing
- * user-tuned to preserve). Returns the in-flight write for tests; apply()
- * fire-and-forgets it.
- */
-export function migrateLegacySettings(settings: SettingsNsLike, warn?: (message: string) => void): Promise<void> | undefined {
-  try {
-    const describe = settings.describe?.bind(settings)
-    if (describe === undefined) return undefined
-    const findUser = (ns: unknown): Record<string, unknown> | undefined => {
-      const user = describe().find((entry) => entry.ns === ns)?.user
-      return user !== undefined && user !== null && typeof user === 'object' ? (user as Record<string, unknown>) : undefined
-    }
-    // Already migrated / user-configured on the new name — never touch it.
-    if (findUser(OWN_NS) !== undefined) return undefined
-    // Old-plugin coexistence (ADR 0013): `llmwiki` already registered means
-    // the pre-rename dsh-llmwiki-memory 0.5.x is still loaded in this host.
-    // Our register below would hit the duplicate guard, migration would
-    // silently skip, and both plugins would drift onto separate bundles
-    // (split brain). Warn loudly instead of registering blind.
-    if (describe().some((entry) => entry.ns === LEGACY_NS)) {
-      warn?.(
-        'dsh-topics-memory: the legacy dsh-llmwiki-memory (0.5.x) is still running in this host — ' +
-          'settings migration was skipped because the "llmwiki" namespace is already registered. ' +
-          'Remove @aiwayds/dsh-llmwiki-memory from this profile so only dsh-topics-memory loads.',
-      )
-      return undefined
-    }
-    // Registering the legacy namespace is the only API that surfaces its
-    // stored section; a duplicate or schema-invalid section throws — contained.
-    settings.register(LEGACY_NS, TopicsConfig)
-    const legacyUser = findUser(LEGACY_NS)
-    if (legacyUser === undefined) return undefined
-    const ops = CONFIG_KEYS.filter((k) => k in legacyUser && legacyUser[k] !== DEFAULTS[k]).map(
-      (k) => ({ op: 'set' as const, path: [k], value: legacyUser[k] }),
-    )
-    if (ops.length === 0) return undefined
-    return settings.mutate?.call(settings, OWN_NS, ops)?.catch(() => undefined)
-  } catch {
-    return undefined
-  }
-}
-
 // --- Bundled skill -----------------------------------------------------------
 
 /** Provider name under `ctx.skills`; doubles as the skill name. */
@@ -346,7 +299,7 @@ const SKILL_RESOURCE_BASE = {
 const SKILL_INVOCATION = { modelInvocable: true, userInvocable: true } as const
 
 /** Routing description; must stay identical to the SKILL.md frontmatter (asserted in tests). */
-const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、usageBoost、使用加成、autoInject、记忆库、llmwiki、include-subagents。'
+const SKILL_DESCRIPTION = 'dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 时先读本指南：设置页 `dsh-topics-memory` 条目全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、usageBoost、使用加成、autoInject、记忆库、include-subagents。'
 
 const SKILL_CANDIDATE: SkillCandidate = {
   name: SKILL_PROVIDER_NAME,
@@ -401,18 +354,16 @@ export function stripFrontmatter(raw: string): string {
   return raw
 }
 
-export function apply(ctx: Context): void {
+export function apply(ctx: Context, config: TopicsRuntimeConfig = {}): void {
   // `inject = ['skills']` guarantees the service exists on every real host;
   // register unconditionally so a missing service fails loud instead of
   // silently dropping the bundled skill.
   ctx.skills.registerProvider(() => skillProvider)
-  // dsh-settings is part of every real host closure but is a runtime-optional
-  // peer so bare test harnesses can still load this module.
-  const settingsNs = (ctx as unknown as { settings?: { register(n: unknown, s: unknown): { get(): unknown } } }).settings
-  if (settingsNs === undefined) return
-  const scope = settingsNs.register(OWN_NS, TopicsConfig)
+  // 0.1.7 hosts validate the profile patch against `Config` above and hand
+  // apply() live volatile references; bare harnesses pass plain values (or
+  // nothing) — readConfigValue treats both shapes the same.
   // Host logger access is best-effort: cordis always provides one, but bare
-  // test harnesses may not — the migration stays silent rather than throwing.
+  // test harnesses may not — the logging stays silent rather than throwing.
   const warn = (message: string): void => {
     try {
       const logger = (ctx as unknown as { logger?: { warn?: (m: string) => void; error?: (m: string) => void; info?: (m: string) => void } }).logger
@@ -422,10 +373,6 @@ export function apply(ctx: Context): void {
       // contained — a missing/broken logger must not break startup
     }
   }
-  // Carry user-tuned values over from the pre-rename namespace (one-time,
-  // fail-open, idempotent — see migrateLegacySettings). Fire-and-forget: the
-  // write settles on its own; a rejection only skips the migration.
-  void migrateLegacySettings(settingsNs as unknown as SettingsNsLike, warn)
   // Low-noise observability for the fast lane's early exits. The 2026-09-21
   // silent-death incident (0.1.5-rc.2 claim order) died precisely because
   // every exit path was silent: the injected log stayed empty for weeks
@@ -443,9 +390,15 @@ export function apply(ctx: Context): void {
     }
   }
   const cfgNow = (): TopicsConfigValue => {
-    const v = scope.get() as Partial<TopicsConfigValue> | undefined
+    const v: Record<string, unknown> = {}
+    for (const k of CONFIG_KEYS) {
+      const slot = (config as Record<string, unknown>)[k]
+      // Skip absent keys so the DEFAULTS fold below keeps them (an explicit
+      // undefined spread would wipe the default).
+      if (slot !== undefined) v[k] = readConfigValue(slot)
+    }
     // Schema defaults may not be applied by bare test harnesses; fill them in.
-    return { ...DEFAULTS, ...v }
+    return { ...DEFAULTS, ...v } as TopicsConfigValue
   }
 
   const root = paths.resolveBundleRoot()
@@ -738,6 +691,11 @@ export function apply(ctx: Context): void {
       let logEvents: readonly InboxEventLike[] | undefined
       if (typeof seq === 'number') {
         try {
+          // Soft-deprecated surface, deliberately kept (dsh 0.17 migration):
+          // `snapshotEvents` still ships in dsh-session 0.1.7-rc.1 and this is
+          // the replay's data source, reachable only behind event.seq with a
+          // full projection-read fallback below. Migrating to registered
+          // SessionMessageProjections is a dedicated project, not a drive-by.
           const snapshot = (session as unknown as {
             snapshotEvents?: (fromSeq?: number, toSeqExclusive?: number) => readonly InboxEventLike[]
           }).snapshotEvents
@@ -791,11 +749,6 @@ export function apply(ctx: Context): void {
     }) as never,
   )
 
-  // Session-start boot chain dedup: rc.2's creation transaction emits BOTH
-  // `agent/session-start` and `agent/created`, so the pair collapses to one
-  // chain run per session; teardown clears the entry.
-  const bootedSessions = new Set<string>()
-
   // ---- Session teardown: real cordis events, not session/event types ----
   // dsh-session 0.1.2-alpha.4's SessionEventMap has no `agent/disposed` or
   // `session/disposed` event type — the old `event.type === 'agent/disposed'`
@@ -819,7 +772,6 @@ export function apply(ctx: Context): void {
       observer.onSessionEvent(sessionId, name, undefined)
       injectedBySession.delete(sessionId)
       slowLane.clear(sessionId)
-      bootedSessions.delete(sessionId)
       // A teardown-triggered run (session-end distill) reads the payload
       // capture lazily: drop the entry here only when no run can still read
       // it. The slow lane's in-flight pipeline reads it too (shared caller);
@@ -828,86 +780,121 @@ export function apply(ctx: Context): void {
     }) as never)
   }
 
-  // ---- Sync lifecycle: pull on session start, local commit on dispose ----
+  // ---- Boot chain: pull on session start, replay-distill, consolidate, TTL ----
   // Session start is an agent-bus event, never a session/event firehose type:
-  // the firehose only carries Session.append types. Tarball-verified emission
-  // sites: `agent/session-start` (sync, payload { agent, source }) is emitted
-  // by dsh-agent-loop up to 0.1.5; 0.1.6-alpha.1 merges the startup
-  // notification into the serial `agent/created` announcement (payload
-  // { agent, source, signal? }) and drops the old name. So one registration
-  // per name — a host that never emits a name simply never calls that
-  // listener. Only { agent } is structural; the rest is defensive.
+  // the firehose only carries Session.append types. dsh 0.1.7 announces ONE
+  // serial `agent/created` event (payload { agent, source, signal? }, source
+  // ∈ 'startup' | 'resume' | 'clear' | 'compact') and `agent/session-start`
+  // is gone with no shim — 0.16.1's dual-name registration collapses to a
+  // single listener, and with it the per-session dedup Set: the registry
+  // guarantees exactly one announce per agent entry (a second announce
+  // throws), so a 'clear'/'compact' re-creation legitimately re-runs the
+  // chain on its fresh entry and teardown has nothing to re-arm. Only
+  // { agent } is structural; the rest is defensive.
+  //
+  // BOOT GUARANTEE (dsh 0.1.7): the serial dispatch awaits every
+  // `agent/created` listener and a throw or rejection ROLLS THE ENTIRE AGENT
+  // CREATION BACK. This listener is therefore total and synchronous — it
+  // never throws, never returns a promise — and the chain is deferred off
+  // the creation transaction entirely (setImmediate, unref'd): the pull /
+  // replay-distill / consolidation slow work starts only after the serial
+  // dispatch has moved on. Plugin initialization must never block, delay,
+  // or abort session startup; a chain failure at most warns.
   const runBootChain = (sessionId: string) => {
-    void sync
-      .pull()
-      .catch(() => undefined)
-      .finally(() => store.ensure().catch(() => undefined))
-      .then(() => {
-        // Boot replay: the observations JSONL is the durable distill queue.
-        // Whatever the previous exit skipped (local-only exit since the
-        // no-network exit commit) or a killed run left unmarked is still
-        // undistilled here. Empty pool and no-model are cheap no-ops inside
-        // the distiller; the per-session dedup guards double runs.
-        void store
-          .undistilledObservations(1)
-          .then((pending) => {
-            if (pending.length === 0) return
-            // Same trigger-time capture the observer callback does: the
-            // replay run's caller resolves candidates lazily and a fresh
-            // session has no prior capture to lean on.
-            try {
-              captureFromAgent(agents()?.get(sessionId) as unknown)
-            } catch {
-              // contained — the run below fails with the readable
-              // no-adapter detail instead
-            }
-            const run = distiller.request(sessionId, 'boot-replay')
-            if (run !== undefined) void run.catch(() => undefined)
-          })
-          .catch(() => undefined)
-        // Consolidation cadence check — after the pull (freshest pool),
-        // fully fire-and-forget: cadence/single-flight gates live inside
-        // maybeRun, and a no-model boot just skips (no stamp advanced).
-        // Failures are NOT silent at the host log: the 2026-09-09 real-host
-        // test showed a dead distill route would otherwise hide here with
-        // zero observable trace (the state file only advances on success).
-        try {
-          captureFromAgent(agents()?.get(sessionId) as unknown)
-        } catch {
-          // contained — the run below fails with a readable no-model detail
-        }
-        void consolidator
-          .maybeRun({ sessionId })
-          .then((r) => {
-            if (r !== undefined && !r.ok && r.reason !== 'no-clusters') {
-              warn(`dsh-topics-memory 整理 lane 未执行：${r.reason ?? 'unknown'}${r.detail !== undefined ? `（${r.detail}）` : ''}`)
-            }
-          })
-          .catch(() => undefined)
-        // Deprecated-TTL sweep — pure local rule, no model, runs even when
-        // the distill route is unconfigured. Drops are logged: deletion is
-        // the one housekeeping action the user should always see happened.
-        const ttl = cfgNow().deprecatedTtlDays
-        if (ttl > 0) {
-          void dropExpiredDeprecated(service, ttl)
-            .then((dropped) => {
-              if (dropped.length > 0) {
-                warn(`dsh-topics-memory：按 ${ttl} 天 TTL 删除了 ${dropped.length} 条 deprecated topic（${dropped.map((s) => `topics/${s}`).join('、')}）；git 历史可找回`)
+    // Contained at the top too: a synchronous prologue throw (config read,
+    // sync bookkeeping) must degrade to a warn, not leak toward the host.
+    try {
+      void sync
+        .pull()
+        .catch((error: unknown) => {
+          // The pull failing must stay non-fatal for the chain (replay and
+          // TTL still run on the local pool), but no longer silent — a dead
+          // sync route should leave a host-log trace.
+          warn(`dsh-topics-memory 启动同步 pull 失败（继续本地启动链）：${error instanceof Error ? error.message : String(error)}`)
+        })
+        .finally(() => store.ensure().catch(() => undefined))
+        .then(() => {
+          // Boot replay: the observations JSONL is the durable distill queue.
+          // Whatever the previous exit skipped (local-only exit since the
+          // no-network exit commit) or a killed run left unmarked is still
+          // undistilled here. Empty pool and no-model are cheap no-ops inside
+          // the distiller; the per-session dedup guards double runs.
+          void store
+            .undistilledObservations(1)
+            .then((pending) => {
+              if (pending.length === 0) return
+              // Same trigger-time capture the observer callback does: the
+              // replay run's caller resolves candidates lazily and a fresh
+              // session has no prior capture to lean on.
+              try {
+                captureFromAgent(agents()?.get(sessionId) as unknown)
+              } catch {
+                // contained — the run below fails with the readable
+                // no-adapter detail instead
+              }
+              const run = distiller.request(sessionId, 'boot-replay')
+              if (run !== undefined) void run.catch(() => undefined)
+            })
+            .catch(() => undefined)
+          // Consolidation cadence check — after the pull (freshest pool),
+          // fully fire-and-forget: cadence/single-flight gates live inside
+          // maybeRun, and a no-model boot just skips (no stamp advanced).
+          // Failures are NOT silent at the host log: the 2026-09-09 real-host
+          // test showed a dead distill route would otherwise hide here with
+          // zero observable trace (the state file only advances on success).
+          try {
+            captureFromAgent(agents()?.get(sessionId) as unknown)
+          } catch {
+            // contained — the run below fails with a readable no-model detail
+          }
+          void consolidator
+            .maybeRun({ sessionId })
+            .then((r) => {
+              if (r !== undefined && !r.ok && r.reason !== 'no-clusters') {
+                warn(`dsh-topics-memory 整理 lane 未执行：${r.reason ?? 'unknown'}${r.detail !== undefined ? `（${r.detail}）` : ''}`)
               }
             })
             .catch(() => undefined)
-        }
-      })
-      .catch(() => undefined)
+          // Deprecated-TTL sweep — pure local rule, no model, runs even when
+          // the distill route is unconfigured. Drops are logged: deletion is
+          // the one housekeeping action the user should always see happened.
+          const ttl = cfgNow().deprecatedTtlDays
+          if (ttl > 0) {
+            void dropExpiredDeprecated(service, ttl)
+              .then((dropped) => {
+                if (dropped.length > 0) {
+                  warn(`dsh-topics-memory：按 ${ttl} 天 TTL 删除了 ${dropped.length} 条 deprecated topic（${dropped.map((s) => `topics/${s}`).join('、')}）；git 历史可找回`)
+                }
+              })
+              .catch(() => undefined)
+          }
+        })
+        .catch((error: unknown) => {
+          warn(`dsh-topics-memory 启动链失败（不影响会话启动）：${error instanceof Error ? error.message : String(error)}`)
+        })
+    } catch (error) {
+      warn(`dsh-topics-memory 启动链无法启动（不影响会话启动）：${error instanceof Error ? error.message : String(error)}`)
+    }
   }
-  for (const name of ['agent/session-start', 'agent/created'] as const) {
-    ctx.on(name as never, ((payload: { agent?: { id?: unknown } }) => {
+  ctx.on('agent/created' as never, ((payload: { agent?: { id?: unknown } }) => {
+    // The boot-fallback contract lives HERE, not inside runBootChain: dsh
+    // 0.1.7 rolls agent creation back when this listener throws, so even a
+    // hostile/malformed payload (a throwing getter, a proxy trap) degrades to
+    // a warn. Returning undefined (never a thenable) keeps the serial
+    // dispatch from awaiting anything.
+    try {
       const sessionId = String(payload?.agent?.id ?? '')
-      if (sessionId === '' || bootedSessions.has(sessionId)) return
-      bootedSessions.add(sessionId)
-      runBootChain(sessionId)
-    }) as never)
-  }
+      if (sessionId === '') return
+      // Off the creation transaction: the unref'd immediate fires after the
+      // current serial dispatch slice, so the chain's synchronous prologue
+      // (config read, sync state) never delays the remaining listeners nor
+      // the loop start, and the timer cannot hold a dying process open.
+      const deferred = setImmediate(() => runBootChain(sessionId))
+      deferred.unref?.()
+    } catch (error) {
+      warn(`dsh-topics-memory boot 链触发失败（不影响会话启动）：${error instanceof Error ? error.message : String(error)}`)
+    }
+  }) as never)
 
   ctx.effect(
     () => {
@@ -941,11 +928,13 @@ export function apply(ctx: Context): void {
     const commands = (cmdCtx as unknown as { commands?: { register(definition: unknown): () => void } }).commands
     if (commands === undefined || commands.register === undefined) return
     const settingsMutator = (ctx as unknown as {
-      settings?: { mutate?: (ns: unknown, ops: readonly { op: 'set'; path: string[]; value?: unknown }[], expected?: number) => Promise<void> }
+      settings?: { mutate?: (ns: string, ops: readonly { op: 'set'; path: string[]; value?: unknown }[], expected?: number) => Promise<void> }
     }).settings
     const mutate = async (ops: readonly { op: 'set'; path: string[]; value?: unknown }[]): Promise<void> => {
       if (settingsMutator?.mutate === undefined) throw new Error('settings 服务不可用，无法写入配置')
-      await settingsMutator.mutate(OWN_NS, ops)
+      // 0.1.7: the settings namespace is the profile entry id, not the old
+      // `topics` namespace name.
+      await settingsMutator.mutate(ENTRY_ID, ops)
     }
     // Resolved lazily at invocation time: whichever UI registered the ask-user
     // provider (TUI panel / web composer / feishu card, ask-router optional)

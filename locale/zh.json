@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-topics-memory",
+    "description": "质量优先的主题记忆：每个主题留存问题、结论、影响与依赖，落在本地 git 追踪的 OKF 包里，注入零 LLM 开销。"
+  }
+}

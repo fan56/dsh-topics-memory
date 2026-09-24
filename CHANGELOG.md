@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased（dsh 0.1.7-rc.1 迁移；随 wave 统一发版，不单独 tag）
+
+dsh 支持下限抬到 `>= 0.1.7-rc.1`（peer floors：dsh-tools / dsh-llm / dsh-settings / dsh-skill / dsh-commands / dsh-util-values；devDeps 闭包同步钉 0.1.7-rc.1，README 同步）。
+
+- **启动事件单监听**：0.1.7 的 creation transaction 只发一次串行 `agent/created`（payload `{ agent, source: 'startup'|'resume'|'clear'|'compact', signal? }`），`agent/session-start` 已删除且无 shim——0.16.1 的双名注册与 per-session 去重 Set 一并拆除（registry 保证每 entry 恰好一次 announce，`/clear`、compaction 重建的新 entry 合法地重跑启动链；teardown 无需再重新武装）。插件逻辑不依赖旧 source 语义，新枚举天然对齐。
+- **boot 兜底（语义：插件初始化永远不能挡死会话启动）**：0.1.7 里串行 `agent/created` 监听器抛错＝该 agent 创建整体回滚。监听器改为「全量且同步」——payload 读取（含 getter/proxy 抛错的敌意 payload）、启动链触发全程 try/catch，失败只 warn 从不外抛、从不返回 thenable；启动链整体（pull → replay 蒸馏 → 整理 cadence → deprecated-TTL 清扫）经 unref 的 `setImmediate` 挪出创建事务——串行派发的其余监听器与 loop start 不再等链路的同步前奏，定时器也不挽留垂死进程。链路内部失败同样只 warn（pull 失败不再静默、链级异常有宿主日志落点），replay 蒸馏与 TTL 清扫照旧 fire-and-forget。
+- **模型消息 source 声明**：0.1.7 删除共享 catch-all 的 `'plugin'` message-source kind（MessageSourceMap 改为各生产者在自己模块内 merge 扩展），蒸馏调用改用本插件自声明的 `'topics-memory'` kind；未知 kind 按契约降级为不透明内容，旧宿主渲染不受影响。
+- **删除 `@deepseek-ai/dsh-code-runtime` devDep**：src 未使用且 0.1.7-rc.1 该包不存在（404），按拍板直接删除而非抬版；dev 闭包新增 `@deepseek-ai/dsh-sandbox`（dsh-tools 0.1.7-rc.1 的模块图硬引入）。
+- **`session.snapshotEvents` 保留**：0.1.7-rc.1 仍在 dsh-session 上；本仓唯一调用点是快道 log 回放的数据源且带投影读数 fallback，迁 SessionMessageProjection 属存量清零专项（地图雾区），不在本次顺手迁移，调用点已注明。
+- **settings 迁移（SettingsForms）**：0.1.7 删除运行时 namespace 注册表——`ctx.settings.register()` 不存在导致 apply() 抛 `settingsNs.register is not a function`、插件整体不激活（真实 home 冷启 smoke 抓到）。迁移到官方新形态（同 dsh-cron / dsh-mcp-adapter 拼法）：插件 `export const Config`（= TopicsConfig，26 键全部 `.volatile()`，设置页可编辑且免重启热更），`apply(ctx, config)` 接收活引用（`VolatileRef.get()` 快照读，裸夹具传纯值同核）；`/topics set` 写 `ctx.settings.mutate('dsh-topics-memory', ops)`（ns=profile entry id）。`migrateLegacySettings`（llmwiki→topics 运行时迁移）随之删除：0.1.7 宿主自行一次性导入旧 settings.yaml 后改名，插件级迁移无 API 可依；数据目录 `~/.dsh/llmwiki` 迁移不受影响。schemastery devDep/peer 抬 3.18.2→3.18.4 对齐宿主闭包（3.18.2 类型无 `volatile`）。
+- **测试**：315 → 305（新增：敌意 payload 监听器不抛错、`'compact'` 重建重跑链路消费新积压；删除 settings-migration 11 例——被迁移 API 已不存在；dedup/quality/llm-scope/skill 夹具从 `ctx.settings.register` fake 改为 `apply(ctx, overrides)` 直传纯值）；既有启动链用例迁到新枚举（`source: 'startup'/'resume'/'compact'`），双发射去重用例改写为重建语义；夹具 source kind 从已删除的 `'plugin'` 迁到 `'topics-memory'`；1 skip 为既有本地语料跳过。README/README.zh/SKILL.md 配置入口章节同步到设置页条目模型。
+- **Plugin Manager 展示元数据**：新增 icon.svg 与 locale/{en,zh}.json（`meta.title`/`meta.description`，官方 readPluginMeta 约定），package.json 声明 `icon` 并将两者入包。
+
 ## 0.17.1 (2026-09-21)
 
 0.17.0 编号跳过（从未发布到 npm），两轮审查修复合并首发：第一轮为快道注入静默死亡修复（原 0.17.0），第二轮为审查跟进（oldfox GO-with-conditions：CONCERN A 积压错位 + CONCERN B 归因语义）。

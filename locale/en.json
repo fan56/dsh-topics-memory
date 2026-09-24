@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "dsh-topics-memory",
+    "description": "Quality-first topic memory: each topic keeps the question, conclusion, impact and dependencies in a local git-traced OKF bundle."
+  }
+}

@@ -1,6 +1,6 @@
 ---
 name: dsh-topics-memory-config
-description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 段时先读本指南：settings.yaml 顶层 `topics:` 段全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest、legacy llmwiki 段自动迁移。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、usageBoost、使用加成、autoInject、记忆库、llmwiki、include-subagents。"
+description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指南。凡涉及 dsh 记忆/话题库/GitHub 同步/蒸馏/整理，或要配置 topics 时先读本指南：设置页 `dsh-topics-memory` 条目全部键（repo/autoInject/topK/注入预算/蒸馏/整理/观察/图游走等）、/topics 命令族（onboard/status/distill/consolidate/stats/list/show/history/graph/sync/config/set）、首次配置 ask_user_question 向导（local-only 或绑 GitHub 仓、蒸馏模型路由、注入档位、自动观察）、注入形态 pointer/digest。触发词：topics、记忆、topic、蒸馏、distill、整理、consolidate、合并重复、deprecatedTtl、usageBoost、使用加成、autoInject、记忆库、include-subagents。"
 ---
 
 # dsh-topics-memory 使用指南（工作记忆 / 蒸馏 / 注入）
@@ -9,9 +9,9 @@ description: "dsh 记忆插件（@aiwayds/dsh-topics-memory）使用与配置指
 > 可选同步 GitHub 私有仓跨机共享。记忆是编辑出来的不是攒出来的——一个 topic 只记四件事
 > （起始问题、结论、影响、依赖），过程属于 session，结束就随它去。
 
-## 配置入口（settings.yaml 顶层 `topics:` 段）
+## 配置入口（设置页 `dsh-topics-memory` 条目）
 
-在 `~/.dsh/settings.yaml` 写顶层 `topics:` 段（只写非默认值即可）：
+0.1.7+ 宿主在设置页编辑 `dsh-topics-memory` 条目（全部字段免重启热更）；`/topics set` 写同一处，profile patch 持久化：
 
 | 键 | 默认 | 作用 |
 |---|---|---|
@@ -95,6 +95,6 @@ GitHub 模式凭据走 `$GITHUB_TOKEN` 或已登录的 gh CLI（`gh auth status`
 4. **GitHub 同步**：repo 须形如 owner/name；推送有 push-debounce-seconds 去抖；退出只做
    本地 commit 不等网络，推迟的 push 由下次启动 pull 后补推；rebase 冲突的 topic 降权标记，
    `/topics status` 可查。
-5. **旧版 llmwiki 段自动迁移**：0.5.x 的 `llmwiki:` 设置段与 `~/.dsh/llmwiki` 数据目录在
-   首次启动时自动迁移到 `topics` / `~/.dsh/topics`，无需手工；旧插件还在运行时会警告跳过
-   （防双载脑裂），先从 profile 移除旧包。
+5. **旧版数据目录迁移**：0.5.x 的 `~/.dsh/llmwiki` 数据目录在首次启动时自动迁移到
+   `~/.dsh/topics`，无需手工。旧版 `llmwiki:` 设置段不再自动迁移（0.1.7 宿主一次性导入
+   settings.yaml 后改名 settings.yaml.imported）；如有残留旧值，在设置页手工搬入。

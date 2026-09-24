@@ -23,8 +23,10 @@ const user = (text, extra = {}) => ({
   content: Array.isArray(text) ? text : [{ type: 'text', text }],
   ...extra,
 })
-const pluginMsg = (text) => ({
-  source: { kind: 'plugin', plugin: 'x' },
+// dsh 0.1.7: the catch-all 'plugin' source kind is gone — producer context
+// now declares its own kind (this plugin registers 'topics-memory').
+const producerMsg = (text) => ({
+  source: { kind: 'topics-memory' },
   content: [{ type: 'text', text }],
 })
 // A log event as dsh-session appends it (envelope + normalized splice data).
@@ -86,8 +88,8 @@ test('start offset: claiming the second message slices one, not the first', () =
 })
 
 test('user-only filter: non-user messages in the claimed window contribute no text', () => {
-  assert.equal(claimedUserText([pluginMsg('system-ish'), user('real')]), 'real')
-  assert.equal(claimedUserText([pluginMsg('only-plugin')]), '')
+  assert.equal(claimedUserText([producerMsg('system-ish'), user('real')]), 'real')
+  assert.equal(claimedUserText([producerMsg('only-producer')]), '')
   // kind missing entirely
   assert.equal(claimedUserText([{ content: [{ type: 'text', text: 'anon' }] }]), '')
 })
@@ -241,7 +243,7 @@ test('replay verdict is final: an empty replayed slice never falls back to the s
   // verdict must stand; consulting the post-splice projection here would
   // inject msg2's residual text under a claim of msg1.
   const events = [
-    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [pluginMsg('system-ish'), user('beta')] }),
+    spliced({ target: 'next-turn', start: 0, removedCount: 0, inserted: [producerMsg('system-ish'), user('beta')] }),
     spliced({ target: 'next-turn', start: 0, removedCount: 1, inserted: [] }),
   ]
   const r = resolveClaimedText({

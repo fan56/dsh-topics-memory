@@ -38,7 +38,9 @@ function make() {
 }
 
 const userMsg = (text) => ({ source: { kind: 'user' }, content: [{ type: 'text', text }] })
-const pluginMsg = (text) => ({ source: { kind: 'plugin' }, content: [{ type: 'text', text }] })
+// dsh 0.1.7: the catch-all 'plugin' source kind is gone — producer context
+// now declares its own kind (this plugin registers 'topics-memory').
+const producerMsg = (text) => ({ source: { kind: 'topics-memory' }, content: [{ type: 'text', text }] })
 // dsh 0.1.5-rc.1: streaming chunks are gone — the assistant side arrives as
 // `assistant/message` settlements carrying the committed message.
 const assistantMsg = (text) => ({ role: 'assistant', content: [{ type: 'text', text }] })
@@ -67,7 +69,7 @@ test('observer: plugin-sourced messages and non-user sources are ignored', async
   const h = make()
   try {
     await h.store.ensure()
-    h.observer.onSessionEvent('s1', 'user/message', pluginMsg('注入的上下文'))
+    h.observer.onSessionEvent('s1', 'user/message', producerMsg('注入的上下文'))
     h.observer.onSessionEvent('s1', 'turn/end', {})
     await new Promise((r) => setTimeout(r, 30))
     assert.equal((await h.store.allObservations()).length, 0)
