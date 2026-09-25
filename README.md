@@ -97,7 +97,7 @@ Purge everything: back up `~/.dsh/topics` first, then `rm -rf ~/.dsh/topics`.
 
 ## Configuration
 
-First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set <key> <value>` — on dsh 0.1.7+ it writes the settings-page `dsh-topics-memory` entry (the profile patch) and every key is volatile: edits take effect immediately, no restart. All keys and defaults:
+First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set <key> <value>` — on dsh 0.1.7+ it writes the settings-page `dsh-topics-memory` entry (the profile patch) and every key is volatile: edits take effect immediately, no restart. Upgrading from a pre-0.1.7 install: a legacy top-level `topics:` section in the old `settings.yaml` is imported once into the new entry automatically at the next plugin boot (the audit record lands in `~/.dsh/storages/dsh-topics-memory/legacy-import.json`). All keys and defaults:
 
 | Key | Default | Meaning |
 |---|---|---|

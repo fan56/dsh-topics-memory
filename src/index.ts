@@ -52,6 +52,7 @@ import type { SlowDelivery } from './service.ts'
 import { CONFIG_KEYS, TopicsConfig, type TopicsConfigValue } from './config.ts'
 import type { AskServiceResolver, AskServiceShape, LlmDirectoryResolver, LlmDirectoryShape } from './onboard.ts'
 import { isDelegated } from './delegation.ts'
+import { runLegacySettingsImport, type LegacyImportLogger, type SettingsUpdateSeam } from './legacy-import.ts'
 
 export const name = 'dsh-topics-memory'
 
@@ -354,7 +355,7 @@ export function stripFrontmatter(raw: string): string {
   return raw
 }
 
-export function apply(ctx: Context, config: TopicsRuntimeConfig = {}): void {
+export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Promise<void> {
   // `inject = ['skills']` guarantees the service exists on every real host;
   // register unconditionally so a missing service fails loud instead of
   // silently dropping the bundled skill.
@@ -1010,6 +1011,27 @@ export function apply(ctx: Context, config: TopicsRuntimeConfig = {}): void {
     }
     cmdCtx.effect(() => commands.register(buildTopicsCommand(service, mutate as never, resolveAsk, resolveLlm, manualDistill, manualConsolidate)), 'topics: /topics')
   })
+
+  // ---- One-time legacy settings import (0.1.5 → 0.1.7 upgrade path) ----
+  // The 0.1.7 host imports the old settings.yaml ONCE by "section name =
+  // entry id" and renames it settings.yaml.imported — this plugin's legacy
+  // section was named `topics`, so the host's import silently dropped it.
+  // Recover it here (see legacy-import.ts). Awaited as apply()'s LAST step:
+  // every registration above stays synchronous (fake-ctx tests dispatch
+  // immediately), while a real boot — whose loader awaits the fiber setup —
+  // also settles the import before activation completes. Fully contained:
+  // any failure only warns and leaves the audit marker unwritten, so the
+  // next boot retries; activation never depends on this.
+  try {
+    await runLegacySettingsImport({
+      home: paths.resolveDshHome(),
+      settings: ctx.settings as SettingsUpdateSeam,
+      logger: (ctx as unknown as { logger?: LegacyImportLogger }).logger,
+      getCurrent: (key) => cfgNow()[key],
+    })
+  } catch (error) {
+    warn(`dsh-topics-memory 旧 settings 迁移失败（不影响启动，下次启动重试）：${error instanceof Error ? error.message : String(error)}`)
+  }
 }
 
 /** Config defaults for harnesses that skip schemastery's default application. */

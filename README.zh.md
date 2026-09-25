@@ -97,7 +97,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 
 ## 配置
 
-首次配置交给 `/topics onboard`；日常微调用 `/topics set <key> <value>`——0.1.7+ 宿主上写设置页 `dsh-topics-memory` 条目（profile patch），全部键 volatile 免重启即时生效。全部键与默认值：
+首次配置交给 `/topics onboard`；日常微调用 `/topics set <key> <value>`——0.1.7+ 宿主上写设置页 `dsh-topics-memory` 条目（profile patch），全部键 volatile 免重启即时生效。从 0.1.7 之前升级：旧 `settings.yaml` 里的 `topics:` 段会在下次插件 boot 时一次性自动迁入新条目（审计档在 `~/.dsh/storages/dsh-topics-memory/legacy-import.json`）。全部键与默认值：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
