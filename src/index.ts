@@ -1016,22 +1016,26 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
   // The 0.1.7 host imports the old settings.yaml ONCE by "section name =
   // entry id" and renames it settings.yaml.imported — this plugin's legacy
   // section was named `topics`, so the host's import silently dropped it.
-  // Recover it here (see legacy-import.ts). Awaited as apply()'s LAST step:
-  // every registration above stays synchronous (fake-ctx tests dispatch
-  // immediately), while a real boot — whose loader awaits the fiber setup —
-  // also settles the import before activation completes. Fully contained:
-  // any failure only warns and leaves the audit marker unwritten, so the
-  // next boot retries; activation never depends on this.
-  try {
-    await runLegacySettingsImport({
+  // Recover it here (see legacy-import.ts). Wired through
+  // ctx.inject(['settings'], …) instead of a direct `ctx.settings` read: a
+  // real boot can run apply() before the settings service is mounted, the
+  // direct read came up undefined, and the import then took the silent
+  // no-settings exit EVERY boot (no marker, nothing ever recovered). The
+  // inject callback fires the moment the service exists (immediately when
+  // it already does — fake-ctx tests stay synchronous), fire-and-forget so
+  // activation never waits on it. Fully contained: any failure only warns
+  // and leaves the audit marker unwritten, so the next boot retries;
+  // activation never depends on this.
+  ctx.inject(['settings'], (sctx) => {
+    void runLegacySettingsImport({
       home: paths.resolveDshHome(),
-      settings: ctx.settings as SettingsUpdateSeam,
+      settings: (sctx as unknown as { settings?: SettingsUpdateSeam }).settings,
       logger: (ctx as unknown as { logger?: LegacyImportLogger }).logger,
       getCurrent: (key) => cfgNow()[key],
+    }).catch((error) => {
+      warn(`dsh-topics-memory 旧 settings 迁移失败（不影响启动，下次启动重试）：${error instanceof Error ? error.message : String(error)}`)
     })
-  } catch (error) {
-    warn(`dsh-topics-memory 旧 settings 迁移失败（不影响启动，下次启动重试）：${error instanceof Error ? error.message : String(error)}`)
-  }
+  })
 }
 
 /** Config defaults for harnesses that skip schemastery's default application. */

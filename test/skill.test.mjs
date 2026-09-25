@@ -19,6 +19,11 @@ function mockCtx() {
     },
     systemPrompt: { section: () => undefined, context: () => undefined },
     tools: { register: () => undefined },
+    // apply() wires the legacy settings import through ctx.inject — the fake
+    // fires the callback immediately with a seam-less context, exactly like
+    // the other fake ctxs in this suite (the import then no-settings-warns
+    // and writes nothing).
+    inject: (_deps, cb) => cb({}),
     skills: {
       registerProvider(create) {
         const provider = create({

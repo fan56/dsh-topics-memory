@@ -61,6 +61,18 @@ export interface LegacyImportInput {
   logger?: LegacyImportLogger | undefined
   /** Current effective value for one legacy key (Volatile ref `.get()` at the call site). */
   getCurrent(key: LegacyKey): unknown
+  /**
+   * Retry budget for `settings.update`. The host serializes profile writes
+   * (settings.update → dsh-config-editor) behind the `<profile>/package.json`
+   * writer lock with a 2s per-call deadline, and during BOOT the host itself
+   * holds that lock while preparing the profile — a single bare call almost
+   * always times out (2026-09-25 incident: the import failed EVERY boot and
+   * the migration never converged). Defaults to 5 attempts 2s apart; a
+   * permanently orphaned lock (a SIGKILLed host never releases it — orphan
+   * recovery is an operator action) still exhausts the budget and stays
+   * retry-worthy. Tests shrink this to keep the suite fast.
+   */
+  updateRetry?: { attempts: number; delayMs: number } | undefined
 }
 
 export type LegacyImportOutcome =
@@ -200,8 +212,11 @@ export async function runLegacySettingsImport(input: LegacyImportInput): Promise
   // A settings seam that cannot accept the patch is a retry-worthy state:
   // return WITHOUT reading/marking, so a host that mounts the service later
   // (and a test harness pointing at a real home) neither imports nor writes.
+  // Not silent: the 2026-09-24 incident hid exactly behind this quiet exit —
+  // the warn is what makes a never-mounting seam observable in a boot log.
   const settings = input.settings
   if (settings === undefined || typeof settings.update !== 'function') {
+    warn(`${ENTRY_ID}: legacy settings import deferred: settings seam unusable (no-settings; will retry next boot)`)
     return { outcome: 'no-settings', imported, skipped }
   }
 
@@ -241,11 +256,26 @@ export async function runLegacySettingsImport(input: LegacyImportInput): Promise
     return { outcome: 'no-op', imported, skipped }
   }
 
-  try {
-    await settings.update(ENTRY_ID, imported)
-  } catch (error) {
+  // The update contends on the host's profile writer lock (see
+  // {@link LegacyImportInput.updateRetry}): retry with a fixed gap before
+  // conceding. Every failed attempt warns — a silent loss here cost a full
+  // day of "the migration never runs" debugging (2026-09-25).
+  const retry = input.updateRetry ?? { attempts: 5, delayMs: 2_000 }
+  let updateFailed: unknown
+  for (let attempt = 1; attempt <= retry.attempts; attempt++) {
+    try {
+      await settings.update(ENTRY_ID, imported)
+      updateFailed = undefined
+      break
+    } catch (error) {
+      updateFailed = error
+      warn(`${ENTRY_ID}: legacy settings import: settings.update attempt ${attempt}/${retry.attempts} failed: ${error instanceof Error ? error.message : String(error)}`)
+      if (attempt < retry.attempts) await new Promise((resolve) => setTimeout(resolve, retry.delayMs))
+    }
+  }
+  if (updateFailed !== undefined) {
+    warn(`${ENTRY_ID}: legacy settings import failed (will retry next boot): ${updateFailed instanceof Error ? updateFailed.message : String(updateFailed)}`)
     // No marker: the next boot retries the import.
-    warn(`${ENTRY_ID}: legacy settings import failed (will retry next boot): ${error instanceof Error ? error.message : String(error)}`)
     return { outcome: 'update-failed', imported, skipped }
   }
 

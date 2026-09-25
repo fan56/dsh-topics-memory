@@ -264,22 +264,55 @@ test('import: settings.update rejects → warn, NO marker (next boot retries)', 
   const t = boot({ settings: fakeSettings({ fail: true }) })
   try {
     writeLegacyDoc(t.home, 'settings.yaml.imported', LEGACY_DOC)
-    const result = await runLegacySettingsImport({ home: t.home, settings: t.settings.seam, logger: t.logger.logger, getCurrent: (k) => CURRENT[k] })
+    const result = await runLegacySettingsImport({ home: t.home, settings: t.settings.seam, logger: t.logger.logger, getCurrent: (k) => CURRENT[k], updateRetry: { attempts: 3, delayMs: 1 } })
     assert.equal(result.outcome, 'update-failed')
     assert.equal(existsSync(legacyMarkerPath(t.home)), false, 'no marker on a failed update')
+    assert.equal(t.logger.lines.filter((l) => l.level === 'warn' && l.message.includes('attempt 3/3')).length, 1, 'all retry attempts ran and were logged')
     assert.ok(t.logger.lines.some((l) => l.level === 'warn' && l.message.includes('retry next boot')))
   } finally {
     t.cleanup()
   }
 })
 
-test('import: no settings seam → no marker, nothing read or written', async () => {
+test('import: settings.update recovers within the retry budget → imported (boot-time lock contention)', async () => {
+  // The real-host failure mode (2026-09-25): during boot the host holds the
+  // profile writer lock, so the first update calls time out and only a retry
+  // lands. The seam here rejects twice, then accepts.
+  const t = boot()
+  let failures = 2
+  const flakySeam = {
+    async update(ns, patch) {
+      if (failures > 0) {
+        failures -= 1
+        throw new Error('atomic-write: timed out waiting for the writer lock at package.json.lock')
+      }
+      t.settings.calls.push({ ns, patch })
+    },
+  }
+  try {
+    writeLegacyDoc(t.home, 'settings.yaml.imported', LEGACY_DOC)
+    const result = await runLegacySettingsImport({ home: t.home, settings: flakySeam, logger: t.logger.logger, getCurrent: (k) => CURRENT[k], updateRetry: { attempts: 5, delayMs: 1 } })
+    assert.equal(result.outcome, 'imported')
+    assert.deepEqual(t.settings.calls[0].patch, { repo: 'fan56/dsh-wiki-memory', distillProvider: 'zai-coding-cn', distillModel: 'glm-5.3-flash' })
+    const marker = JSON.parse(readFileSync(legacyMarkerPath(t.home), 'utf8'))
+    assert.equal(marker.outcome, 'imported')
+    assert.ok(t.logger.lines.some((l) => l.level === 'warn' && l.message.includes('attempt 1/5')), 'failed attempts are logged, not silent')
+  } finally {
+    t.cleanup()
+  }
+})
+
+test('import: no settings seam → warn (not silent), no marker, nothing read or written', async () => {
   const t = boot()
   try {
     writeLegacyDoc(t.home, 'settings.yaml.imported', LEGACY_DOC)
-    const result = await runLegacySettingsImport({ home: t.home, settings: undefined, getCurrent: (k) => CURRENT[k] })
+    const result = await runLegacySettingsImport({ home: t.home, settings: undefined, logger: t.logger.logger, getCurrent: (k) => CURRENT[k] })
     assert.equal(result.outcome, 'no-settings')
     assert.equal(existsSync(legacyMarkerPath(t.home)), false)
+    // The 2026-09-24 incident hid behind a silent no-settings exit — the
+    // branch must leave a trace in the boot log.
+    const warnLine = t.logger.lines.find((l) => l.level === 'warn' && l.message.includes('no-settings'))
+    assert.ok(warnLine, 'a no-settings warn line is logged')
   } finally {
     t.cleanup()
   }
@@ -349,4 +382,54 @@ test('contract: entry id, section name, marker dir and key mapping are stable', 
     ['repo', 'distillProvider', 'distillModel', 'topK', 'totalBudget', 'autoObserve'],
     'identity key mapping: legacy name = Config key name',
   )
+})
+
+// Regression gate for the 2026-09-24 incident: apply() used to read
+// `ctx.settings` DIRECTLY at its tail, which is undefined on a real boot
+// whose settings service mounts after apply — the import then silently
+// no-settings'd every boot. apply must wire the import through
+// ctx.inject(['settings'], …) so it fires the moment the seam exists.
+test('apply wiring: import rides ctx.inject(settings) and lands the marker in $DSH_HOME', async () => {
+  const { apply } = await import('../lib/index.js')
+  const home = tmpHome()
+  const bundle = mkdtempSync(join(tmpdir(), 'topics-legacy-bundle-'))
+  const prevDshHome = process.env.DSH_HOME
+  const prevTopicsHome = process.env.DSH_TOPICS_HOME
+  process.env.DSH_HOME = home
+  process.env.DSH_TOPICS_HOME = bundle
+  const seam = fakeSettings()
+  const logger = fakeLogger()
+  // Minimal fake dsh ctx (same recipe as dedup.test.mjs); the inject stub
+  // fires immediately with a context carrying the fake settings seam.
+  const ctx = {
+    systemPrompt: { section: () => undefined, context: () => undefined },
+    tools: { register: () => undefined },
+    agents: { get: () => undefined },
+    on: () => () => {},
+    effect: () => () => {},
+    skills: { registerProvider: () => () => {} },
+    logger: logger.logger,
+    inject: (_deps, cb) => cb({ settings: seam.seam }),
+  }
+  try {
+    writeLegacyDoc(home, 'settings.yaml.imported', LEGACY_DOC)
+    apply(ctx)
+    // Fire-and-forget: let the floating import promise settle.
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assert.deepEqual(seam.calls, [{
+      ns: ENTRY_ID,
+      patch: { repo: 'fan56/dsh-wiki-memory', distillProvider: 'zai-coding-cn', distillModel: 'glm-5.3-flash' },
+    }], 'only the keys differing from the (default) effective values are written')
+    const marker = JSON.parse(readFileSync(legacyMarkerPath(home), 'utf8'))
+    assert.equal(marker.outcome, 'imported')
+    assert.equal(marker.source, 'settings.yaml.imported')
+    assert.ok(logger.lines.some((l) => l.level === 'info' && l.message.includes('legacy settings import')), 'summary logged')
+  } finally {
+    if (prevDshHome === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = prevDshHome
+    if (prevTopicsHome === undefined) delete process.env.DSH_TOPICS_HOME
+    else process.env.DSH_TOPICS_HOME = prevTopicsHome
+    rmSync(home, { recursive: true, force: true })
+    rmSync(bundle, { recursive: true, force: true })
+  }
 })
