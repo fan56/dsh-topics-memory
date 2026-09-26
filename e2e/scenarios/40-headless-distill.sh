@@ -12,7 +12,12 @@ export DSH_HOME=/root/.dsh-e2e
 P="$DSH_HOME/profiles/e2e"
 B="$DSH_HOME/topics"
 
-: "${DSH_VERSION:=$(npm view @deepseek-ai/dsh version)}"
+# dsh version: pinned to 0.1.7-rc.1 — the line this repo's peerDependencies
+# target and the fixtures were validated against. NEVER resolve this bare:
+# `latest` is a vendor placeholder (moved 0.0.1-rc.3 → 0.1.5-rc.3, breaking
+# schemastery .volatile()) and rc.2 tightened replay fixture validation.
+# Bump deliberately with the next rc wave.
+: "${DSH_VERSION:=$(echo 0.1.7-rc.1)}"
 
 echo '==> configuring distill route (replay provider) + every-turn cadence'
 cat > "$DSH_HOME/settings.yaml" <<'EOF'

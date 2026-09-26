@@ -15,6 +15,11 @@ ARG NODE_DIST_BASE=https://npmmirror.com/mirrors/node
 ARG PNPM_VERSION=10.33.0
 # The dsh CLI version is resolved at build time from the npm registry's
 # latest tag when not provided (no hand-pinned rc — the rc.8 lesson).
+# dsh version: pinned to 0.1.7-rc.1 — the line this repo's peerDependencies
+# target and the fixtures were validated against. NEVER resolve this bare:
+# `latest` is a vendor placeholder (moved 0.0.1-rc.3 → 0.1.5-rc.3, breaking
+# schemastery .volatile()) and rc.2 tightened replay fixture validation.
+# Bump deliberately with the next rc wave.
 ARG DSH_VERSION=
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -39,7 +44,7 @@ RUN case "$(uname -m)" in \
 
 # pnpm + the dsh CLI (version resolved from the registry when the ARG is
 # empty). The global dsh install is what the scenarios boot against.
-RUN DSH_VER="${DSH_VERSION:-$(npm view @deepseek-ai/dsh version)}" \
+RUN DSH_VER="${DSH_VERSION:-$(echo 0.1.7-rc.1)}" \
  && echo "installing @deepseek-ai/dsh@${DSH_VER}" \
  && npm install -g --no-fund --no-audit \
       pnpm@${PNPM_VERSION} \

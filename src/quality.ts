@@ -5,8 +5,12 @@
  *   1. intent-query build over the observer's last-K ring buffer — kills
  *      verbatim priming at the root (the query is what the model needs, not
  *      what the user typed);
- *   2. lexical candidate band (hits + near-misses, recall-oriented) then an
- *      LLM rerank that releases 0-2 picks, each with a one-line why.
+ *   2. lexical candidate band (hits + near-misses, recall-oriented) then a
+ *      rerank that releases 0-2 picks, each with a one-line why. With
+ *      `jevEnabled` on (design 2026-09-25 §2) the rerank is a batched System
+ *      One noul request, probability-band gated; any failure fails open to the
+ *      legacy LLM rerank below. The same trigger also runs the fastgate
+ *      SHADOW (zero behavior, decisions.jsonl only).
  *
  * Picks rest in a per-session pending slot and inject at the NEXT spliced
  * (steer message), then the slot is gone (消费即清). Hard bounds: per-call
@@ -23,6 +27,13 @@ import type { ModelCaller } from './distill.ts'
 import { searchTopics } from './retrieval.ts'
 import type { RingEntry } from './observer.ts'
 import type { QueryBuildShape } from './ilog.ts'
+import type { TopicsConfigValue } from './config.ts'
+import { jevAsk } from './jev/client.ts'
+import type { JevAskConfig, JevQuestion } from './jev/client.ts'
+import { band as jevBand } from './jev/thresholds.ts'
+import type { JevBand } from './jev/thresholds.ts'
+import { digestFor, logVerdicts } from './jev/log.ts'
+import type { JevVerdictRecord } from './jev/log.ts'
 
 export const PENDING_TTL_MS = 10 * 60_000
 /** Hard drift bound: a pending older than this many turn-ends expires. */
@@ -38,6 +49,8 @@ const RING_CHARS = 6000
 const CANDIDATE_LIMIT = 6
 /** Over-fetch before the exclude filter, so excluded slugs don't thin the band. */
 const CANDIDATE_OVERFETCH = 6
+/** Fastgate shadow cap (design §2 row 3): topK hits + near-misses, ≤8 questions. */
+export const FASTGATE_MAX_QUESTIONS = 8
 
 export const QUERY_BUILD_PROMPT = [
   '你是检索查询构建器。输入是最近几轮对话。任务：判断「模型此刻需要什么背景知识」，输出一个用于关键词检索的 query。',
@@ -56,6 +69,90 @@ export const RERANK_PROMPT = [
   '- why 面向模型自己读：说清这条记忆能帮上当前哪一步。',
   '- slug 必须逐字取自候选列表，禁止编造。',
 ].join('\n')
+
+// ---- jev (System One) decision branch, design 2026-09-25 §2 rows 1+3 ----
+//
+// When jevEnabled is on, the rerank step asks the decision model instead of
+// the generative LLM: one batched noul request over the candidate band, the
+// calibrated bands (jev/thresholds: adopt ≥ 0.60 / record 0.10–0.60 / veto
+// < 0.10) decide the picks, and every candidate lands in decisions.jsonl.
+// Any failure falls open to the RERANK_PROMPT path below (red line ②).
+// The fastgate shadow audits the fast lane's OWN lexical disposition from the
+// same sampled turn-end trigger — zero behavior, decisions.jsonl only.
+
+/** The candidate slice the jev questions see (content-bearing metadata). */
+interface JevCandidate {
+  slug: string
+  title: string
+  status: string
+  tags?: readonly string[]
+  description?: string
+  conclusion: string
+}
+
+/**
+ * §6.2 state for one batch: the round's query plus the task frame. Shared by
+ * the rerank and the fastgate shadow so both seams speak ONE batch protocol —
+ * the calibrated bands are protocol-bound (design §5), a second state shape
+ * would need its own sweep.
+ */
+export function jevState(query: string): string {
+  return `检索 query：${query}\n任务背景：模型正在推进当前会话的工作，需要判断哪些长期记忆 topic 值得注入上下文作参考。`
+}
+
+/** Per-candidate question: full candidate inline (title/tags/conclusion
+ *  excerpt), RERANK_PROMPT's rendering style but compact. */
+function candidateInstructions(c: JevCandidate): string {
+  const tags = c.tags !== undefined && c.tags.length > 0 ? `，标签: ${c.tags.join('/')}` : ''
+  const desc = c.description !== undefined && c.description.trim() !== '' ? ` ${c.description.trim().slice(0, 80)}` : ''
+  return `候选 topic「${c.title}」（slug: ${c.slug}，状态: ${c.status}${tags}）。${desc}结论摘录：${c.conclusion.slice(0, 160)}。该候选与当前 query 对应的工作真的相关、值得注入模型上下文吗？`
+}
+
+/** Two-sided criteria built from the candidate content (calibration protocol:
+ *  single-sided instructions measurably degrade). */
+function candidateCriteria(c: JevCandidate): { true: string; false: string } {
+  return {
+    true: `相关——「${c.title}」的记忆对当前工作有实质帮助，应该注入作参考`,
+    false: `无关——「${c.title}」与当前工作没有实质交集，注入只是噪音，不应该注入`,
+  }
+}
+
+/** The noul probability of one answer; undefined when the answer is not a
+ *  usable number in [0,1] (a 坏答案 — fail-open for the caller). */
+function noulProbability(answer: unknown): number | undefined {
+  if (answer === null || typeof answer !== 'object') return undefined
+  const p = (answer as { noul?: unknown }).noul
+  return typeof p === 'number' && Number.isFinite(p) && p >= 0 && p <= 1 ? p : undefined
+}
+
+/** The config slice jevAsk needs, tolerating bare harnesses (§4: consumers
+ *  treat undefined as the documented default). */
+function jevConfigOf(cfg: TopicsConfigValue): JevAskConfig {
+  return {
+    jevBackend: cfg.jevBackend ?? 'zen',
+    jevModel: cfg.jevModel ?? '',
+    jevTimeoutMs: typeof cfg.jevTimeoutMs === 'number' && cfg.jevTimeoutMs > 0 ? cfg.jevTimeoutMs : 3000,
+    jevSecretFile: cfg.jevSecretFile ?? '',
+  }
+}
+
+/** The lexical disposition the fast lane recorded for one candidate — the
+ *  agree-reconciliation key (§6.2; retrieval.ts hits/nearMisses split). */
+export type FastGateDisposition = 'hit' | 'nearFloor' | 'gate-blocked'
+
+export interface FastGateCandidate {
+  slug: string
+  disposition: FastGateDisposition
+}
+
+export interface FastGateShadowInput {
+  /** The fast-lane round's query (the claimed text), captured at spliced. */
+  query: string
+  /** hits + near-misses of that round, with their lexical dispositions. */
+  candidates: readonly FastGateCandidate[]
+  /** Observer turn count at the trigger — the sampled-cadence clock. */
+  turnId: number
+}
 
 export interface PendingInjection {
   items: { slug: string; why: string }[]
@@ -141,6 +238,8 @@ export function parseJsonObject(raw: string): Record<string, unknown> {
 export class SlowLane {
   private pending = new Map<string, PendingInjection>()
   private inFlight = new Map<string, Promise<void>>()
+  /** Same-session shadow serialization — a second trigger never overlaps. */
+  private shadowInFlight = new Map<string, Promise<void>>()
   private readonly service: TopicsService
   private readonly caller: ModelCaller | undefined
   /**
@@ -171,6 +270,87 @@ export class SlowLane {
   /** Drop the pending slot (session teardown, restore boundary). */
   clear(sessionId: string): void {
     this.pending.delete(sessionId)
+    this.shadowInFlight.delete(sessionId)
+  }
+
+  /**
+   * Fastgate shadow (design §2 row 3): fire-and-forget on the SAME sampled
+   * turn-end trigger as the slow lane, zero behavior — verdicts land only in
+   * decisions.jsonl, reconciled against the lexical disposition. Needs no LLM
+   * caller, so it also runs on turns where the slow lane itself yields (distill
+   * in flight, no model configured). `dispatch()`'s own guards (lane mode,
+   * sampled cadence) are mirrored here so both seams share one cadence.
+   */
+  dispatchFastGateShadow(sessionId: string, input: FastGateShadowInput): void {
+    try {
+      const cfg = this.service.cfg
+      if (cfg.jevEnabled !== true) return
+      if (cfg.qualityLane !== 'sampled' && cfg.qualityLane !== 'always') return
+      if (cfg.qualityLane === 'sampled' && input.turnId % SAMPLED_EVERY !== 0) return
+      if (input.query.trim() === '' || input.candidates.length === 0) return
+      if (this.shadowInFlight.has(sessionId)) return // never overlap shadows
+      // Serialize behind a same-session produce pipeline (rerank 完成后);
+      // standalone when no pipeline is running (无慢道任务时独立跑).
+      const prior = this.inFlight.get(sessionId) ?? Promise.resolve()
+      const run = prior.then(() => this.fastGateShadow(input)).finally(() => {
+        this.shadowInFlight.delete(sessionId)
+      })
+      this.shadowInFlight.set(sessionId, run)
+      void run.catch(() => undefined)
+    } catch {
+      // contained — the shadow must never break the event handler
+    }
+  }
+
+  /** Shadow body: resolve candidate content from the roster, one batched noul
+   *  request, verdict rows only. A jevAsk failure leaves just its auto-written
+   *  call row — there is no legacy path to fall back to, and nothing to gate. */
+  private async fastGateShadow(input: FastGateShadowInput): Promise<void> {
+    const roster = await this.service.roster().catch(() => [])
+    const bySlug = new Map(roster.map((r) => [r.slug, r]))
+    const state = jevState(input.query)
+    const questions: Record<string, JevQuestion> = {}
+    const metas: { qid: string; slug: string; instructions: string; disposition: FastGateDisposition }[] = []
+    for (const cand of input.candidates.slice(0, FASTGATE_MAX_QUESTIONS)) {
+      const meta = bySlug.get(cand.slug)
+      if (meta === undefined) continue // vanished between retrieval and the shadow
+      const qid = `c${metas.length + 1}`
+      const instructions = candidateInstructions(meta)
+      questions[qid] = { type: 'noul', instructions, criteria: candidateCriteria(meta) }
+      metas.push({ qid, slug: cand.slug, instructions, disposition: cand.disposition })
+    }
+    if (metas.length === 0) return
+    const result = await jevAsk({
+      state,
+      questions,
+      config: jevConfigOf(this.service.cfg),
+      lane: 'fastgate-shadow',
+      fallback: false, // pure shadow — no behavior to fall back
+    })
+    if (!result.ok) return
+    const at = new Date().toISOString()
+    const recs: JevVerdictRecord[] = []
+    for (const m of metas) {
+      const probability = noulProbability(result.answers[m.qid])
+      if (probability === undefined) continue // unparseable answer: no fabricated row
+      const b = jevBand(probability, 'rerank')
+      // agree reconciliation (§6.2): the ilog disposition, with wouldBlock for
+      // the reverse disagreement (lexical let it through, jev lands in the veto
+      // band — the other half of the calibration goldmine).
+      const agree: JevVerdictRecord['agree'] = m.disposition === 'hit' && b === 'fallback' ? 'wouldBlock' : m.disposition
+      recs.push({
+        at,
+        lane: 'fastgate-shadow',
+        questionId: m.qid,
+        qtype: 'noul',
+        ref: `slug:${m.slug}`,
+        digest: digestFor(state, m.qid, m.instructions),
+        probability,
+        band: b,
+        agree,
+      })
+    }
+    await logVerdicts(recs)
   }
 
   /**
@@ -270,6 +450,18 @@ export class SlowLane {
         ]
       })
       if (payload.length === 0) return
+      // ---- jev batch rerank (design §2 row 1) — replaces the LLM rerank ----
+      // One batched noul request over the whole band; the calibrated bands
+      // decide the picks. A settled jev round is FINAL here (picks or none) —
+      // only a jev FAILURE (jevRerank → undefined) falls open to the legacy
+      // LLM rerank below (§3.2: 本轮回退旧 LLM rerank, picks 照常产出).
+      if (this.service.cfg.jevEnabled === true) {
+        const jevItems = await this.jevRerank(query, payload)
+        if (jevItems !== undefined) {
+          if (jevItems.length > 0) this.settlePending(sessionId, input, jevItems, queryBuild, started)
+          return
+        }
+      }
       const rerankRaw = await withTimeout(
         caller({
           system: RERANK_PROMPT,
@@ -309,20 +501,82 @@ export class SlowLane {
         if (items.length >= 2) break
       }
       if (items.length === 0) return
-      const route = this.service.cfg
-      this.pending.set(sessionId, {
-        items,
-        computedAt: new Date().toISOString(),
-        turnId: input.turnId,
-        queryBuild,
-        model: `${route.distillProvider}/${route.distillModel}`,
-        ms: Date.now() - started,
-      })
+      this.settlePending(sessionId, input, items, queryBuild, started)
     } catch {
       // timeouts, aborts, model errors — I3: the async product is simply absent
     } finally {
       clearTimeout(deadline)
     }
+  }
+
+  /** One pending slot per settled pipeline (the 0-2 picks + lane metadata). */
+  private settlePending(sessionId: string, input: DispatchInput, items: { slug: string; why: string }[], queryBuild: QueryBuildShape, started: number): void {
+    const route = this.service.cfg
+    this.pending.set(sessionId, {
+      items,
+      computedAt: new Date().toISOString(),
+      turnId: input.turnId,
+      queryBuild,
+      model: `${route.distillProvider}/${route.distillModel}`,
+      ms: Date.now() - started,
+    })
+  }
+
+  /**
+   * The jev rerank (design §2 row 1): one batched noul request over the whole
+   * candidate band; per-candidate verdict rows (agree: 'n/a' — no lexical
+   * disposition applies on this seam). Gate: adopt band (≥ 0.60) ranked by
+   * probability, top 2 (the 0-2 picks semantics); record band only logs;
+   * fallback band (< 0.10) is a hard veto.
+   *
+   * Returns undefined on ANY failure — jevAsk !ok (timeout / network / gate /
+   * bad shape) or an unparseable probability (坏答案) — so the caller fails
+   * open to the legacy LLM rerank (red line ②; the call-layer row already
+   * carries fallback=true via jevAsk's flag).
+   */
+  private async jevRerank(query: string, payload: JevCandidate[]): Promise<{ slug: string; why: string }[] | undefined> {
+    const state = jevState(query)
+    const questions: Record<string, JevQuestion> = {}
+    const metas: { qid: string; slug: string; instructions: string }[] = []
+    for (const [i, c] of payload.entries()) {
+      const qid = `c${i + 1}`
+      const instructions = candidateInstructions(c)
+      questions[qid] = { type: 'noul', instructions, criteria: candidateCriteria(c) }
+      metas.push({ qid, slug: c.slug, instructions })
+    }
+    const result = await jevAsk({
+      state,
+      questions,
+      config: jevConfigOf(this.service.cfg),
+      lane: 'slowlane-rerank',
+      fallback: true, // any failure falls open to the legacy LLM rerank (§6.2)
+    })
+    if (!result.ok) return undefined
+    const scored: { qid: string; slug: string; instructions: string; probability: number; band: JevBand }[] = []
+    for (const m of metas) {
+      const probability = noulProbability(result.answers[m.qid])
+      if (probability === undefined) return undefined // 坏答案 → fail-open (§1)
+      scored.push({ ...m, probability, band: jevBand(probability, 'rerank') })
+    }
+    const at = new Date().toISOString()
+    await logVerdicts(
+      scored.map((m) => ({
+        at,
+        lane: 'slowlane-rerank' as const,
+        questionId: m.qid,
+        qtype: 'noul' as const,
+        ref: `slug:${m.slug}`,
+        digest: digestFor(state, m.qid, m.instructions),
+        probability: m.probability,
+        band: m.band,
+        agree: 'n/a' as const,
+      })),
+    )
+    return scored
+      .filter((m) => m.band === 'adopt')
+      .sort((a, b) => b.probability - a.probability)
+      .slice(0, 2)
+      .map((m) => ({ slug: m.slug, why: `jev 判定相关（p=${m.probability.toFixed(2)}）` }))
   }
 
   /**

@@ -23,13 +23,25 @@
  *  - the cadence stamp (meta/consolidate-state.json) advances only when the
  *    model actually evaluated at least one cluster — a run that died on the
  *    first call leaves the stamp alone, and the next session start retries.
+ *  - jev prefilter (design 2026-09-25 §2, default-off): with jevEnabled the
+ *    cluster first answers to ONE cheap System One batch (≤6 questions: the
+ *    top-5 similar pairs each ask 「同一问题吗」, plus a record-only
+ *    cluster-level 「值得动吗」). Only when ≥1 pair reaches the adopt band
+ *    (≥0.50) does the cluster go to the LLM — an all-non-adopt cluster skips
+ *    the model call entirely. Any jev failure fails open to today's behavior;
+ *    the merge conclusion generation itself stays LLM.
  *
  * @module consolidate
  */
 
 import * as okf from './okf.ts'
+import type { TopicsConfigValue } from './config.ts'
 import type { TopicsService } from './service.ts'
 import { parseOps, type ModelCaller } from './distill.ts'
+import { jevAsk, type JevAskConfig, type JevQuestion } from './jev/client.ts'
+import { band, type JevBand } from './jev/thresholds.ts'
+import { digestFor, logVerdicts } from './jev/log.ts'
+import type { JevVerdictRecord } from './jev/log.ts'
 
 /** Below this pairwise Jaccard two topics never share a cluster. */
 const CLUSTER_THRESHOLD = 0.3
@@ -42,6 +54,12 @@ const MAX_OPS_PER_RUN = 12
 /** Conclusion chars fed per topic in a cluster payload. */
 const CONCLUSION_SNIPPET_CHARS = 600
 const CONSOLIDATE_MAX_TOKENS = 2500
+/**
+ * Pair questions per cluster batch (design §2: k≤5, so with the record-only
+ * cluster-level question a batch stays ≤6 问/簇 — the measured cheap end of
+ * the batch protocol).
+ */
+const PREFILTER_TOP_PAIRS = 5
 
 export interface ConsolidateOp {
   op: 'merge' | 'promote' | 'deprecate' | 'refresh'
@@ -134,10 +152,22 @@ export interface ClusterEntry {
   conclusion: string
 }
 
+/** One similar pair inside a cluster — the jev prefilter's question units. */
+export interface ClusterPair {
+  /** Indices into the cluster's `entries`. */
+  i: number
+  j: number
+  /** Pairwise Jaccard from clustering — REUSED for the prefilter's pair
+   *  selection (top-k at ask time), never recomputed. */
+  similarity: number
+}
+
 export interface TopicCluster {
   entries: ClusterEntry[]
   /** Peak pairwise similarity inside the cluster — runs process peaks first. */
   similarity: number
+  /** Similar pairs (edges ≥ threshold) inside the cluster, best first. */
+  pairs: ClusterPair[]
 }
 
 /**
@@ -199,14 +229,100 @@ export function clusterTopics(
         .sort((a, b) => (degree.get(b) ?? 0) - (degree.get(a) ?? 0))
         .slice(0, MAX_CLUSTER_SIZE)
     }
+    // Reuse the clustering edges for the prefilter's pair list: positions map
+    // into the (possibly capped) kept order, best similarity first. Edges
+    // lost to the cap — or transitively-clustered pairs below threshold — are
+    // not pair candidates; a capped cluster with no inner edge left simply
+    // has no pairs (the prefilter then behaves as today).
+    const position = new Map<number, number>()
+    kept.forEach((original, pos) => position.set(original, pos))
+    const pairs: ClusterPair[] = []
+    for (const [key, s] of scores) {
+      const i = Math.floor(key / entries.length)
+      const j = key % entries.length
+      const pi = position.get(i)
+      const pj = position.get(j)
+      if (pi === undefined || pj === undefined) continue
+      pairs.push({ i: pi, j: pj, similarity: s })
+    }
+    pairs.sort((a, b) => b.similarity - a.similarity)
     clusters.push({
       entries: kept.map((i) => entries[i] as ClusterEntry),
       similarity: peak,
+      pairs,
     })
   }
   clusters.sort((a, b) => b.similarity - a.similarity)
   return clusters
 }
+
+// --- Jev prefilter protocol (design 2026-09-25 §2, sweep-aligned) ------------
+
+// The merge-pair thresholds (band(..., 'mergePair')) are BOUND to the t4
+// threshold-sweep batch protocol: shared state, two-sided criteria, two
+// 600-char side excerpts per question. Absolute scores are protocol-sensitive
+// (t4 §4: the same case scored 0.15 / 0.60 / 0.71 across protocols), so the
+// texts below are copied VERBATIM from
+// .wayfinder/research/t4-labeling-kit/threshold-sweep.mjs (MRG_STATE /
+// MRG_CRITERIA / mrgInstructions) — changing any of them requires a re-sweep
+// of the lines, do not tune in place.
+const PREFILTER_STATE = [
+  '背景：你在为一个个人记忆库做簇内 merge 校准。整理（consolidate）时会把讲同一问题的多个 topic 合并成一份；误并会造成信息丢失，漏并会造成库内冗余与后续漂移。',
+  '判定标准：同一问题指两条记录的是同一件事——同一 bug/特性/任务的不同阶段、两面或后续进展，合并保留一份不丢实质信息。相邻但独立不算：两条各自成立、合并会丢失各自信息（如命名澄清 vs 机制对照、修不同 bug 的相邻提交、不同仓库的两次发版）。',
+].join('\n')
+
+const PAIR_CRITERIA = {
+  true: '同一问题——两条记录的是同一件事的不同阶段/两面/后续进展，合并保留一份不丢实质信息',
+  false: '相邻但独立——各自成立，合并会丢失各自信息（如命名澄清 vs 机制对照、修不同 bug、不同仓库发版）',
+}
+
+// Cluster-level 「值得动吗」 — v1 records it only, never gates (design §2:
+// 簇级问只记不门控，无扫描数据).
+const CLUSTER_CRITERIA = {
+  true: '值得整理——簇内存在值得动作的条目（重复可并、draft 已稳定、已被取代、元数据失准），动作有实质收益',
+  false: '不值得动——条目各自成立，或任何整理动作都不会带来实质收益',
+}
+
+/** Pair question body — the sweep's mrgInstructions: two sides of
+ *  title/tags/conclusion excerpt (ClusterEntry.conclusion is already capped
+ *  at CONCLUSION_SNIPPET_CHARS = the sweep's 600-char protocol). */
+function pairInstructions(a: ClusterEntry, b: ClusterEntry): string {
+  const side = (t: ClusterEntry, name: string): string =>
+    [`## topic ${name}`, `- title: ${t.title}`, `- tags: ${t.tags.join(', ')}`, '- conclusion:', t.conclusion].join('\n')
+  return [side(a, 'A'), '', side(b, 'B'), '', '综合以上材料判断：这两个 topic 讲的是同一个问题、应当合并吗？'].join('\n')
+}
+
+/** Cluster-level question body — titles/status/tags only, no conclusions. */
+function clusterInstructions(cluster: TopicCluster): string {
+  const lines = cluster.entries.map((e) => `- ${e.title}（${e.status}，tags: ${e.tags.join(', ')}）`)
+  return [
+    '## 候选簇内的 topic',
+    ...lines,
+    '',
+    '综合以上材料判断：这一簇值得一次整理动作吗（merge/promote/deprecate/refresh 任一）？',
+  ].join('\n')
+}
+
+/**
+ * The prefilter's jev config slice — undefined unless jevEnabled is explicitly
+ * true (default-off master switch: false ⇒ the whole branch is dead code and
+ * today's behavior runs untouched). Optional keys fall back to their
+ * documented defaults (config.ts: the bare-harness DEFAULTS literal predates
+ * them; consumers treat undefined as the default).
+ */
+function jevConfigOf(cfg: TopicsConfigValue): JevAskConfig | undefined {
+  if (cfg.jevEnabled !== true) return undefined
+  return {
+    jevBackend: cfg.jevBackend ?? 'zen',
+    jevModel: cfg.jevModel ?? '',
+    jevTimeoutMs: cfg.jevTimeoutMs ?? 3000,
+    jevSecretFile: cfg.jevSecretFile ?? '',
+  }
+}
+
+/** The jev seam — injectable so tests run hermetic (same pattern as
+ *  ModelCaller: production never passes it, the real jevAsk is the default). */
+export type JevAsker = typeof jevAsk
 
 // --- Deprecated-TTL housekeeping (local rule, no model) ----------------------
 
@@ -257,6 +373,14 @@ interface ClusterOutcome {
   ops: ConsolidateOp[]
 }
 
+/** Per-cluster prefilter verdict. */
+interface PrefilterOutcome {
+  /** false = every pair missed the adopt band ⇒ the LLM call is skipped. */
+  proceed: boolean
+  /** jev failed or a gate question had no usable score ⇒ fail-open path. */
+  failOpen: boolean
+}
+
 interface AppliedConsolidation {
   merged: string[]
   promoted: string[]
@@ -270,10 +394,21 @@ export class Consolidator {
   private inFlight: Promise<ConsolidateResult> | undefined
   private readonly service: TopicsService
   private readonly caller: ModelCaller | undefined
+  private readonly askJev: JevAsker
+  /** Best-effort host-logger sink (warn-style); undefined = stay silent,
+   *  aligned with the lane's quiet discipline for success/no-clusters. */
+  private readonly note: ((message: string) => void) | undefined
 
-  constructor(service: TopicsService, caller: ModelCaller | undefined) {
+  constructor(
+    service: TopicsService,
+    caller: ModelCaller | undefined,
+    askJev: JevAsker = jevAsk,
+    note?: (message: string) => void,
+  ) {
     this.service = service
     this.caller = caller
+    this.askJev = askJev
+    this.note = note
   }
 
   get configured(): boolean {
@@ -356,8 +491,23 @@ export class Consolidator {
     let evaluated = 0
     let fatal: 'model-error' | 'invalid-output' | undefined
     let failureDetail: string | undefined
+    // jev prefilter (design §2): one cheap System One batch decides whether a
+    // cluster is worth the LLM call at all. undefined = jevEnabled off ⇒ the
+    // whole branch never executes and behavior is exactly as before.
+    const jev = jevConfigOf(this.service.cfg)
+    let prefilterSkipped = 0
     for (const cluster of clusters) {
       if (calls >= MAX_MODEL_CALLS_PER_RUN) break
+      if (jev !== undefined) {
+        const pf = await this.prefilterCluster(jev, cluster)
+        if (!pf.proceed) {
+          prefilterSkipped += 1
+          this.note?.(
+            `topics consolidate: 前置过滤跳过簇（pair 均未达 adopt 线）：${cluster.entries.map((e) => e.slug).join('、')}`,
+          )
+          continue
+        }
+      }
       const outcome = await this.runCluster(sessionId, cluster)
       calls += 1
       if (outcome.fatal !== undefined) {
@@ -411,6 +561,7 @@ export class Consolidator {
     const tail = [
       applied.dropped > 0 ? `丢弃 ${applied.dropped} 个无效 op` : undefined,
       `${calls} 次模型调用（评估 ${evaluated} 簇 / 候选 ${clusters.length} 簇）`,
+      prefilterSkipped > 0 ? `前置过滤跳过 ${prefilterSkipped} 簇` : undefined,
       fatal !== undefined ? `中途失败：${failureDetail ?? 'unknown'}` : undefined,
       stampNote === '' ? undefined : stampNote.replace(/^；/, ''),
     ]
@@ -453,6 +604,89 @@ export class Consolidator {
       })
     }
     return clusterTopics(entries).slice(0, MAX_MODEL_CALLS_PER_RUN)
+  }
+
+  /**
+   * One jev request per cluster (design 2026-09-25 §2 整理 lane 前置). The
+   * top-k similar pairs (k ≤ {@link PREFILTER_TOP_PAIRS}, edges reused from
+   * clustering) each get a pair noul question 「同一问题吗」; one record-only
+   * cluster-level 「值得动吗」 rides along (固定 band='record', never gates).
+   * Gate: ≥1 pair in the adopt band → the cluster goes to the LLM; all pairs
+   * below → skipped (省调用). Any jev failure proceeds fail-open — the
+   * call-layer telemetry row (fallback=true) was already written by jevAsk
+   * itself; only the verdict layer is ours here (agree='n/a', nothing lexical
+   * to reconcile against on this lane).
+   */
+  private async prefilterCluster(jev: JevAskConfig, cluster: TopicCluster): Promise<PrefilterOutcome> {
+    const pairs = cluster.pairs.slice(0, PREFILTER_TOP_PAIRS)
+    // No local similarity evidence (e.g. a capped cluster whose edges all
+    // fell outside) — behave exactly as today, zero jev calls.
+    if (pairs.length === 0) return { proceed: true, failOpen: false }
+    const questions: Record<string, JevQuestion> = {}
+    interface QuestionMeta {
+      questionId: string
+      ref: string
+      instructions: string
+      /** Pair questions gate; the cluster-level question records only. */
+      gating: boolean
+    }
+    const metas: QuestionMeta[] = []
+    pairs.forEach((p, idx) => {
+      const a = cluster.entries[p.i]
+      const b = cluster.entries[p.j]
+      const instructions = pairInstructions(a, b)
+      const questionId = `p${idx + 1}`
+      questions[questionId] = { type: 'noul', instructions, criteria: PAIR_CRITERIA }
+      metas.push({ questionId, ref: `pair:${a.slug}|${b.slug}`, instructions, gating: true })
+    })
+    const clusterQuestion = clusterInstructions(cluster)
+    questions['cluster'] = { type: 'noul', instructions: clusterQuestion, criteria: CLUSTER_CRITERIA }
+    metas.push({
+      questionId: 'cluster',
+      ref: `cluster:${cluster.entries[0]?.slug ?? ''}`,
+      instructions: clusterQuestion,
+      gating: false,
+    })
+
+    const r = await this.askJev({
+      state: PREFILTER_STATE,
+      questions,
+      config: jev,
+      lane: 'consolidate-prefilter',
+      fallback: true, // fail-open is the wiring: on failure the cluster goes to the LLM as today
+    })
+    if (!r.ok) return { proceed: true, failOpen: true }
+    const at = new Date().toISOString()
+    const recs: JevVerdictRecord[] = []
+    let adopt = false
+    let failOpen = false
+    for (const meta of metas) {
+      // Answer shape per the sweep protocol: noul answers carry the
+      // probability on the `noul` field; anything else is unusable.
+      const raw = (r.answers[meta.questionId] as { noul?: unknown } | undefined)?.noul
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) {
+        // A gate question without a usable score must never veto the cluster.
+        if (meta.gating) failOpen = true
+        continue
+      }
+      const probability = Math.min(1, Math.max(0, raw))
+      const verdictBand: JevBand = meta.gating ? band(probability, 'mergePair') : 'record'
+      if (verdictBand === 'adopt') adopt = true
+      recs.push({
+        at,
+        lane: 'consolidate-prefilter',
+        questionId: meta.questionId,
+        qtype: 'noul',
+        ref: meta.ref,
+        digest: digestFor(PREFILTER_STATE, meta.questionId, meta.instructions),
+        probability,
+        band: verdictBand,
+        agree: 'n/a',
+      })
+    }
+    await logVerdicts(recs)
+    if (failOpen) return { proceed: true, failOpen: true }
+    return { proceed: adopt, failOpen: false }
   }
 
   /** One model call over one cluster, ops shape-validated but not yet applied. */

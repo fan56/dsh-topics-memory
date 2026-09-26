@@ -74,6 +74,23 @@ export const TopicsConfig = z.object({
   usageBoost: z.number().default(0.15).volatile(),
   /** Debounced push delay in GitHub mode. */
   pushDebounceSeconds: z.number().default(45).volatile(),
+  /** System One decision-model integration (design 2026-09-25), default-off
+   *  master switch: false means zero behavior change anywhere (the fast lane
+   *  never calls out regardless — hard guard); the usage stats stop with it. */
+  jevEnabled: z.boolean().default(false).volatile(),
+  /** Decision backend: zen (free, opencode.ai) | native (typesafe
+   *  first-party) | openrouter (decisions protocol). */
+  jevBackend: z.string().default('zen').volatile(),
+  /** Pinned model id; '' = resolve the backend default at call time
+   *  (distillProvider sentinel pattern): jev-1.13-free / jev-1.13.0 /
+   *  typesafe/jev-1.13 — an upgrade is a deliberate act. */
+  jevModel: z.string().default('').volatile(),
+  /** Single-request timeout in ms; one AbortSignal, NO retry (the calling
+   *  lane's next cadence is the natural retry, fail-open hard-coded). */
+  jevTimeoutMs: z.number().default(3000).volatile(),
+  /** External secret list for the outbound secret gate (JEV_SECRET_FILE
+   *  semantics, design §3.3); swapping the path hot reloads the list. */
+  jevSecretFile: z.string().default('').volatile(),
 })
 
 export type TopicsConfigValue = {
@@ -103,6 +120,15 @@ export type TopicsConfigValue = {
   deprecatedTtlDays: number
   usageBoost: number
   pushDebounceSeconds: number
+  /** System One integration keys (design 2026-09-25 §4). Optional in this TS
+   *  view only: index.ts's bare-harness DEFAULTS literal predates them and
+   *  schemastery applies the runtime defaults on real hosts — consumers must
+   *  treat undefined as the documented default. */
+  jevEnabled?: boolean
+  jevBackend?: 'zen' | 'native' | 'openrouter'
+  jevModel?: string
+  jevTimeoutMs?: number
+  jevSecretFile?: string
 }
 
 export const CONFIG_KEYS = [
@@ -132,6 +158,11 @@ export const CONFIG_KEYS = [
   'deprecatedTtlDays',
   'usageBoost',
   'pushDebounceSeconds',
+  'jevEnabled',
+  'jevBackend',
+  'jevModel',
+  'jevTimeoutMs',
+  'jevSecretFile',
 ] as const
 
 export type ConfigKey = (typeof CONFIG_KEYS)[number]
@@ -155,10 +186,15 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'suppressEcho':
     case 'autoObserve':
     case 'distillOnSessionEnd':
-    case 'includeSubagents': {
+    case 'includeSubagents':
+    case 'jevEnabled': {
       if (raw === 'on' || raw === 'true') return true
       if (raw === 'off' || raw === 'false') return false
       return { error: `${key} 取值 on|off` }
+    }
+    case 'jevBackend': {
+      if (raw === 'zen' || raw === 'native' || raw === 'openrouter') return raw
+      return { error: 'jev-backend 取值 zen|native|openrouter' }
     }
     case 'topK':
     case 'perTopicBudget':
@@ -170,7 +206,8 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'distillBatchSize':
     case 'distillMaxModelCalls':
     case 'deprecatedTtlDays':
-    case 'pushDebounceSeconds': {
+    case 'pushDebounceSeconds':
+    case 'jevTimeoutMs': {
       const n = Number(raw)
       if (!Number.isFinite(n) || n < 0 || !Number.isInteger(n)) return { error: `${key} 需要非负整数` }
       return n
@@ -196,6 +233,8 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     }
     case 'distillProvider':
     case 'distillModel':
+    case 'jevModel':
+    case 'jevSecretFile':
       return raw
   }
 }

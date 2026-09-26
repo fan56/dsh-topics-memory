@@ -16,6 +16,7 @@ import type { ConsolidateResult } from './consolidate.ts'
 import { serializeTopicDoc, slugify, firstParagraph } from './okf.ts'
 import { buildGraph, renderGraphHtml } from './viz.ts'
 import { CONFIG_KEYS, displayKey, type ConfigKey, type TopicsConfigValue, parseConfigValue } from './config.ts'
+import { reloadSecrets } from './jev/gate.ts'
 import { aggregateStats } from './ilog.ts'
 import {
   askDistillSingle,
@@ -630,5 +631,6 @@ async function doSet(
   if (typeof parsed === 'object' && parsed !== null && 'error' in parsed) return fail(parsed.error)
   await mutate([{ op: 'set', path: [key], value: parsed }])
   if (key === 'repo' || key === 'autoInject') service.invalidate()
+  if (key === 'jevSecretFile') reloadSecrets(String(parsed)) // hot-swapped list: force re-read
   return ok(`✅ topics.${displayKey(key)} = ${String(parsed)}`)
 }

@@ -450,6 +450,16 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
 
   const agents = () => (ctx as unknown as { agents?: AgentMapLike }).agents
 
+  // Fastgate shadow context (design §2 row 3): the fast-lane round's query and
+  // candidate set, captured at spliced time so the SAME turn's turn-end shadow
+  // can audit them against the lexical disposition. Metadata only (slug +
+  // disposition); overwritten every round, consumed once at the trigger.
+  interface FastGateCapture {
+    query: string
+    candidates: { slug: string; disposition: 'hit' | 'nearFloor' | 'gate-blocked' }[]
+  }
+  const fastGateBySession = new Map<string, FastGateCapture>()
+
   // SYNCHRONOUS retrieval: the spliced event dispatches before prompt
   // assembly, and the context() provider reads the assembled digest
   // synchronously — an async round would always lose this race.
@@ -494,9 +504,47 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
         for (const slug of r.included) marked.add(slug)
         for (const slug of r.slowIncluded) marked.add(slug)
       }
+      // Fastgate shadow capture (design §2 row 3): this round's candidates with
+      // their lexical dispositions (retrieval.ts split: gate-blocked rides the
+      // near-miss reasons). Pure metadata on an already-built result — no hot
+      // path cost beyond the array literal, and hard-gated on the master switch.
+      if (cfg.jevEnabled === true && r.outcome.rosterSize > 0) {
+        fastGateBySession.set(sessionId, {
+          query,
+          candidates: [
+            ...r.outcome.hits.map((h) => ({ slug: h.slug, disposition: 'hit' as const })),
+            ...r.outcome.nearMisses.map((nm) => ({
+              slug: nm.slug,
+              disposition: nm.reasons.includes('gate-blocked') ? ('gate-blocked' as const) : ('nearFloor' as const),
+            })),
+          ],
+        })
+      }
       state.injectionText = r.text
     } catch {
       // Contained: a retrieval failure must never break the turn.
+    }
+  }
+
+  /**
+   * Fastgate shadow trigger: consumes the spliced-time capture and hands it to
+   * the lane's shadow entry (which applies the jevEnabled / cadence gates and
+   * serializes behind a same-session produce pipeline). One audit per round —
+   * the capture is consumed here.
+   */
+  function dispatchFastGateShadow(sessionId: string): void {
+    try {
+      if (cfgNow().jevEnabled !== true) return
+      const captured = fastGateBySession.get(sessionId)
+      if (captured === undefined) return
+      fastGateBySession.delete(sessionId)
+      slowLane.dispatchFastGateShadow(sessionId, {
+        query: captured.query,
+        candidates: captured.candidates,
+        turnId: observer.turnCountOf(sessionId),
+      })
+    } catch {
+      // contained — the shadow must never break the event handler
     }
   }
 
@@ -513,7 +561,12 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
       // autoInject before reaching the consume point).
       if (!cfgNow().autoInject) return
       if (isDelegated(agents()?.get(sessionId))) return
-      if (distiller.hasPending(sessionId)) return
+      if (distiller.hasPending(sessionId)) {
+        // The lane yields to the distill run — but the shadow shares no LLM
+        // route, so it still fires on this sampled trigger.
+        dispatchFastGateShadow(sessionId)
+        return
+      }
       // Same trigger-time capture the distill trigger uses: the agent's
       // scoped llm is alive NOW, and the lane's caller reads the captured
       // entry lazily inside its async pipeline (released via the
@@ -539,6 +592,10 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
           return merged
         })(),
       })
+      // Same trigger, after the dispatch call: the shadow serializes behind
+      // the produce pipeline (rerank 完成后) or runs standalone when the
+      // dispatch produced nothing (无慢道任务时独立跑).
+      dispatchFastGateShadow(sessionId)
     } catch {
       // contained — the lane must never break the event handler
     }
@@ -606,7 +663,7 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
   // Consolidation lane (整理): same caller/route as distill, global single
   // flight inside. Reads the pool and merges/promotes/deprecates/refreshes;
   // cadence-gated at session start, manual via /topics consolidate.
-  const consolidator = new Consolidator(service, caller)
+  const consolidator = new Consolidator(service, caller, undefined, warn)
 
   // ---- Observer (M2) ----
   // Trigger runs are fire-and-forget everywhere now — including the exit
@@ -739,6 +796,7 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
         // fresh process has no dedup registry, so allow re-injection.
         injectedBySession.delete(sessionId)
         slowLane.clear(sessionId)
+        fastGateBySession.delete(sessionId)
       }
       observer.onSessionEvent(sessionId, event.type, event.data)
       // AFTER the observer processed the turn (turnCount already bumped, so
@@ -773,6 +831,7 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
       observer.onSessionEvent(sessionId, name, undefined)
       injectedBySession.delete(sessionId)
       slowLane.clear(sessionId)
+      fastGateBySession.delete(sessionId)
       // A teardown-triggered run (session-end distill) reads the payload
       // capture lazily: drop the entry here only when no run can still read
       // it. The slow lane's in-flight pipeline reads it too (shared caller);

@@ -18,7 +18,12 @@ P="$DSH_HOME/profiles/e2e"
 echo '==> adding headless app + replay LLM to the profile'
 # Pin to the same closure as the global dsh CLI (ENV DSH_VERSION from the
 # image); bare latest can resolve to an old line with unpublished deps.
-: "${DSH_VERSION:=$(npm view @deepseek-ai/dsh version)}"
+# dsh version: pinned to 0.1.7-rc.1 — the line this repo's peerDependencies
+# target and the fixtures were validated against. NEVER resolve this bare:
+# `latest` is a vendor placeholder (moved 0.0.1-rc.3 → 0.1.5-rc.3, breaking
+# schemastery .volatile()) and rc.2 tightened replay fixture validation.
+# Bump deliberately with the next rc wave.
+: "${DSH_VERSION:=$(echo 0.1.7-rc.1)}"
 echo "closure: ${DSH_VERSION}"
 dsh plugin --profile e2e add "@deepseek-ai/dsh-headless@${DSH_VERSION}"
 dsh plugin --profile e2e add "@deepseek-ai/dsh-llm-replay@${DSH_VERSION}"
@@ -82,11 +87,11 @@ mkdir -p "$F"
 TS=$(date +%s000)
 cat > "$F/session.jsonl" <<EOF
 {"type":"session","version":0,"id":"fixture-echo-1","createdAt":$TS,"cwd":"/tmp","delegationDepth":0}
-{"type":"assistant/chunk","seq":1,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"block-start","index":0,"blockType":"text"}}}
-{"type":"assistant/chunk","seq":2,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"text-delta","index":0,"text":"ECHOED:{{fromRequest:Marker ([A-Z0-9]+)}}"}}}
-{"type":"assistant/chunk","seq":3,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"block-end","index":0,"block":{"type":"text","text":"ECHOED:{{fromRequest:Marker ([A-Z0-9]+)}}"}}}}
-{"type":"assistant/chunk","seq":4,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":100,"outputTokens":10,"cacheReadTokens":0,"reasoningTokens":0}}}}
-{"type":"assistant/chunk","seq":5,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"finish","reason":{"kind":"stop"}}}}
+{"type":"assistant/chunk","seq":0,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"block-start","index":0,"blockType":"text"}}}
+{"type":"assistant/chunk","seq":1,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"text-delta","index":0,"text":"ECHOED:{{fromRequest:Marker ([A-Z0-9]+)}}"}}}
+{"type":"assistant/chunk","seq":2,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"block-end","index":0,"block":{"type":"text","text":"ECHOED:{{fromRequest:Marker ([A-Z0-9]+)}}"}}}}
+{"type":"assistant/chunk","seq":3,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"usage","usage":{"inputTokens":100,"outputTokens":10,"cacheReadTokens":0,"reasoningTokens":0}}}}
+{"type":"assistant/chunk","seq":4,"time":$TS,"data":{"turn":1,"step":1,"chunk":{"type":"finish","reason":{"kind":"stop"}}}}
 EOF
 
 export DSH_SNAPSHOT_FILE="$F/session.jsonl"

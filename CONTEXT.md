@@ -87,3 +87,17 @@ _Avoid_: view、read、click
 **UsageBoost**：
 近 30 天使用信号（Injection 命中与 Open 按票权折算）对检索得分的加成项，让「实际帮到过对话」的 Topic 更容易被再次选中；它受结构门与上限约束，永不救起零词面相关的条目。
 _Avoid_: quality score、popularity、评分
+
+### 决策层（实验）
+
+**Jev Decision Layer**：
+异步决策缝的总称：在慢车道与整理 lane 的既有 LLM 判断之前，接入 System One 决策模型（jev）做批量 noul 门控——慢车道 rerank、整理 lane pair 前置、快道词法门 shadow 对账三条缝；全部异步、失败回退纯本地行为，绝不进入注入热路径。
+_Avoid_: System One layer（"System One" 保留给概念层——标题与 ADR，不作机制名）、decision layer（裸用易与已废的 decision* 键族混淆）
+
+**Decision Log**：
+jev 调用与判定的本地统计流水（`meta/decisions.jsonl`）：调用层（每次 HTTP 的 lane/backend/延迟/token/outcome/fallback）与判定层（每问的 probability/band/agree）落点，闭环层（ECE 分桶）由离线 join 产出；只存元数据与概率、绝不存 state 原文。与 Injection Log 是姊妹记录：ilog 记「注入了什么」，Decision Log 记「jev 判了什么」。
+_Avoid_: stats log、telemetry、决策日志
+
+**Jev Backend**：
+jev 决策调用的托管端点档位：`zen`（默认，免费）/`native`/`openrouter` 三档，由 `jevBackend` 配置；zen/native 走 systemone 协议、openrouter 走 decisions 协议，模型钉版本（`jev-1.13-free` / `jev-1.13.0` / `typesafe/jev-1.13`）。
+_Avoid_: provider（与 distillProvider 冲突——那是蒸馏 lane 的模型路由，这是决策层的推理端点）

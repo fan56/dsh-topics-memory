@@ -126,6 +126,69 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `deprecatedTtlDays` | `15` | Deprecated topics older than N days are dropped at session start (local rule, no model; each drop is its own git commit — history stays recoverable); `0` disables the sweep |
 | `usageBoost` | `0.15` | Usage boost (ADR 0015): topics injected/opened in the last 30 days score higher at retrieval (gate-scoped, capped at 0.2, never granted to zero-lexical candidates, structural gate not waived); `0` disables |
 | `pushDebounceSeconds` | `45` | GitHub-mode debounced push interval |
+| `jevEnabled` | `false` | System One decision layer master switch (experimental): `false` = zero behavior change — see the section below |
+| `jevBackend` | `zen` | Decision endpoint: `zen` (free) / `native` / `openrouter` |
+| `jevModel` | empty (per backend: `jev-1.13-free` / `jev-1.13.0` / `typesafe/jev-1.13`) | Version-pinned decision model; upgrading is an explicit action |
+| `jevTimeoutMs` | `3000` | Per-request decision timeout; single attempt, no retry |
+| `jevSecretFile` | none | External secret list for the outbound secret gate; re-read when hot-changed |
+
+## System One decision layer (experimental, default off)
+
+An optional decision layer on the asynchronous lanes, powered by a System One typed-decision model (jev): it batch-scores slow-lane rerank candidates (replacing the LLM rerank), pre-filters consolidation merge pairs before the LLM gardener sees them, and shadow-audits the fast-lane lexical gate from a turn-end lane. Every verdict is probability-gated, and any failure — timeout, network error, bad answer — falls back to today's pure-local behavior (hardcoded fail-open, no switch key). The injection hot path never makes a remote call (ADR 0016–0019; design doc: `docs/design/2026-09-25-system-one-integration.md`). Off by default: `jevEnabled: false` means zero behavior change.
+
+### Keys
+
+| Key | Default | Meaning |
+|---|---|---|
+| `jevEnabled` | `false` | Master switch (rollout: default off → shadow → opt-in per profile → default-on observation); `false` stops the stats too |
+| `jevBackend` | `zen` | `zen` (free) / `native` / `openrouter` |
+| `jevModel` | empty sentinel | Resolved per backend at call time: `jev-1.13-free` (zen) / `jev-1.13.0` (native) / `typesafe/jev-1.13` (openrouter) — pinned, never an alias |
+| `jevTimeoutMs` | `3000` | Per-request timeout; single `AbortSignal.timeout`, no retry (the lane's next cadence retries naturally) |
+| `jevSecretFile` | none | Path to an external secret list; loaded once at boot, re-read when the path is hot-changed |
+
+### Keys provisioning
+
+| Backend | Key source |
+|---|---|
+| `zen` (default, free) | `JEV_ZEN_API_KEY` env, or the macOS keychain service `opencode-zen-inference` (default fallback — zero config) |
+| `native` | `TYPESAFE_API_KEY` |
+| `openrouter` | `OPENROUTER_API_KEY`; the keychain service `openrouter-inference` requires an explicit `JEV_KEYCHAIN` |
+
+dsh scrubs ambient `KEY|PASSWORD|SECRET|TOKEN` variables from plugin environments, so a key exported in your shell never reaches the plugin — pass it explicitly through the profile patch `env:` block, or keep it out of files entirely via the keychain (`JEV_KEYCHAIN` / zen's default service; neither matches the scrub rules):
+
+```yaml
+# ~/.dsh/cordis.patch.yml — merge into your profile patch. The !!js
+# expression keeps the key out of the file (same convention as dsh-jev-mcp).
+- insert:
+    - id: dsh-topics-memory
+      name: '@aiwayds/dsh-topics-memory'
+      env:
+        JEV_ZEN_API_KEY: !!js process.env.JEV_ZEN_API_KEY ?? ''
+        # native:     TYPESAFE_API_KEY: !!js process.env.TYPESAFE_API_KEY ?? ''
+        # openrouter: OPENROUTER_API_KEY: !!js process.env.OPENROUTER_API_KEY ?? ''
+        #   plus JEV_KEYCHAIN: 'openrouter-inference'
+        #   (zen needs no JEV_KEYCHAIN — with no env key it reads the
+        #   default keychain service 'opencode-zen-inference')
+```
+
+### Thresholds
+
+Adopt / record / fallback bands (calibrated offline on a 383-case gold corpus; the numbers are bound to the batch protocol — design doc §5). Record-band verdicts only land in the decision log without affecting behavior. The cluster-level "worth consolidating?" question records without gating in v1:
+
+| Seam | Adopt | Record-only | Fallback line |
+|---|---|---|---|
+| Slow-lane rerank (per candidate) | noul ≥ 0.60 → enters picks | 0.10 – 0.60 | < 0.10 → strong veto, lexical-gate behavior |
+| Consolidation merge (per pair) | noul ≥ 0.50 → pair sent to the LLM | 0.15 – 0.50 (pair still evaluated by the LLM) | < 0.15 → pair cut before the LLM |
+
+### Fallback behavior
+
+| Seam | On failure / timeout / bad answer | Legacy path |
+|---|---|---|
+| Slow-lane rerank | The round falls back to the old LLM rerank; picks still produced | Old RERANK_PROMPT path kept until rollout step 4 (default-on observation), then removed |
+| Consolidation prefilter | The cluster goes to the LLM in full, exactly as today | none |
+| Fast-lane shadow | Records the outcome only; zero behavior impact | none |
+
+Every call and verdict lands in `~/.dsh/topics/meta/decisions.jsonl` — local-only and redacted: slugs, pair hashes, question types, probabilities, latency and token counts; never conversation text or conclusion bodies. It has no config key (it stops together with `jevEnabled: false`); `/topics status` shows a 30-day summary line.
 
 ## Acknowledgements
 
@@ -148,7 +211,7 @@ This project's shape is directly inspired and supported by:
 ## Design docs
 
 - [CONTEXT.md](CONTEXT.md) — domain glossary
-- [docs/adr/](docs/adr/) — 0001–0013: OKF compliance, remote shape, sync strategy, two-stage observer, bundle layout, injection defaults, observability & tunables, dual-mode persistence, onboarding wizard, subagent isolation, the include-subagents switch, injection dedup default-on, the rename & migration
+- [docs/adr/](docs/adr/) — 0001–0019: OKF compliance, remote shape, sync strategy, two-stage observer, bundle layout, injection defaults, observability & tunables, dual-mode persistence, onboarding wizard, subagent isolation, the include-subagents switch, injection dedup default-on, the rename & migration, dual-channel injection, the usage boost, direct-HTTP decisions, the fast-lane zero-remote-calls line, hardcoded fail-open, the embedded secret gate
 
 ## License
 

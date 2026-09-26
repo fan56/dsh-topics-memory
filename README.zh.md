@@ -126,6 +126,60 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `deprecatedTtlDays` | `15` | deprecated 条目超过 N 天在会话启动时自动删除（本地规则不依赖模型，逐条 git commit 可回溯找回）；`0` 关闭清扫 |
 | `usageBoost` | `0.15` | 使用加成（ADR 0015）：近 30 天被注入命中/点开过的 Topic 检索加分（计入门槛分、帽 0.2、零词面相关不加、结构门不豁免）；`0` 关闭 |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
+| `jevEnabled` | `false` | System One 决策层总开关（实验）：`false` = 零行为变化——见下节 |
+| `jevBackend` | `zen` | 决策端点：`zen`（免费）/ `native` / `openrouter` |
+| `jevModel` | 空（按 backend：`jev-1.13-free` / `jev-1.13.0` / `typesafe/jev-1.13`） | 版本钉定的决策模型；升级是显式动作 |
+| `jevTimeoutMs` | `3000` | 单次决策请求超时；单发不重试 |
+| `jevSecretFile` | 无 | 出网 secret gate 的外部清单路径；热更换路径即重读 |
+| `jevDebug` | 关 | 诊断日志开关（走宿主 logger，默认静默） |
+
+## System One 决策层（实验，default off）
+
+架在异步 lane 上的可选决策层，由 System One typed-decision 模型（jev）驱动：慢车道 rerank 候选改批量 noul 打分（替换 LLM rerank）、整理 lane 的 merge 候选对在 LLM 园丁接手前先做前置过滤、快道词法门由 turn-end lane 做影子对账。每个判定都过概率门控，任何失败——超时、网络错、坏答案——一律回退到今天的纯本地行为（fail-open 硬编码，无开关键）。注入热路径永不发起远程调用（ADR 0016–0019；设计文档：`docs/design/2026-09-25-system-one-integration.md`）。默认关闭：`jevEnabled: false` 即零行为变化。
+
+### 键
+
+| 键 | 默认 | 说明 |
+|---|---|---|
+| `jevEnabled` | `false` | 总开关（灰度：default off → shadow → opt-in per profile → 默认开观察）；`false` 连统计一起停 |
+| `jevBackend` | `zen` | `zen`（免费）/ `native` / `openrouter` |
+| `jevModel` | 空串哨兵 | 调用时按 backend 解析：`jev-1.13-free`（zen）/ `jev-1.13.0`（native）/ `typesafe/jev-1.13`（openrouter）——钉版本号，永不指向别名 |
+| `jevTimeoutMs` | `3000` | 单请求超时；单发 `AbortSignal.timeout` 不重试（lane 的下一节拍自然重试） |
+| `jevSecretFile` | 无 | 外部 secret 清单路径；启动加载一次，热更换路径即重读 |
+
+### key 配置
+
+| Backend | key 来源 |
+|---|---|
+| `zen`（默认，免费） | `JEV_ZEN_API_KEY` env，或 macOS 钥匙串服务 `opencode-zen-inference`（默认回退——零配置） |
+| `native` | `TYPESAFE_API_KEY` |
+| `openrouter` | `OPENROUTER_API_KEY`；钥匙串服务 `openrouter-inference` 需显式 `JEV_KEYCHAIN` |
+
+dsh 会清洗插件环境里匹配 `KEY|PASSWORD|SECRET|TOKEN` 的 ambient 变量，shell 里 export 的 key 到不了插件——请走 profile patch 的 `env:` 块显式透传，或用钥匙串（`JEV_KEYCHAIN` / zen 默认服务；都不匹配清洗规则）完全避开文件落 key：
+
+```yaml
+# ~/.dsh/cordis.patch.yml — 并入你的 profile patch。!!js 表达式让 key 不落文件
+# （与 dsh-jev-mcp 同款约定）。
+- insert:
+    - id: dsh-topics-memory
+      name: '@aiwayds/dsh-topics-memory'
+      env:
+        JEV_ZEN_API_KEY: !!js process.env.JEV_ZEN_API_KEY ?? ''
+        # native:     TYPESAFE_API_KEY: !!js process.env.TYPESAFE_API_KEY ?? ''
+        # openrouter: OPENROUTER_API_KEY: !!js process.env.OPENROUTER_API_KEY ?? ''
+        #   另加 JEV_KEYCHAIN: 'openrouter-inference'
+        #   （zen 无需 JEV_KEYCHAIN——无 env key 时自动读默认钥匙串服务）
+```
+
+### 阈值（rerank / merge pair）
+
+| 档 | rerank（慢车道） | merge pair（整理前置） | 动作 |
+|---|---|---|---|
+| 采纳 | noul ≥ 0.60 | ≥ 0.50 | 进 picks / 送 LLM 生成 |
+| 记录带 | 0.10 – 0.60 | 0.15 – 0.50 | 只落 decisions.jsonl，不影响行为 |
+| 回退 | < 0.10 | < 0.15 | 强否决，回退词法/现状行为 |
+
+绝对线绑定批量协议（换协议必须重扫）。三缝失败回退行为见 ADR 0018。判定与调用明细落 `meta/decisions.jsonl`（本地 only，脱敏——绝不存 state 原文）。
 
 ## Acknowledgements
 
@@ -148,7 +202,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 ## 设计文档
 
 - [CONTEXT.md](CONTEXT.md) — 领域术语表
-- [docs/adr/](docs/adr/) — 0001–0013：OKF 合规、Remote 形态、同步策略、两段式 Observer、Bundle 布局、注入默认值、可观测与调参、双模式持久化、配置向导、子代理隔离、include-subagents 开关、注入去重默认开、更名与迁移
+- [docs/adr/](docs/adr/) — 0001–0019：OKF 合规、Remote 形态、同步策略、两段式 Observer、Bundle 布局、注入默认值、可观测与调参、双模式持久化、配置向导、子代理隔离、include-subagents 开关、注入去重默认开、更名与迁移、双通道注入、使用加成、决策层直连 HTTP、快道零远程红线、fail-open 硬编码、secret gate 内嵌
 
 ## License
 

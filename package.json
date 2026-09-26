@@ -42,7 +42,7 @@
     "build": "tsc -p tsconfig.json",
     "check": "tsc --noEmit -p tsconfig.json",
     "pretest": "tsc -p tsconfig.json",
-    "test": "node --test test/yaml.test.mjs test/okf.test.mjs test/retrieval.test.mjs test/digest.test.mjs test/ilog.test.mjs test/store.test.mjs test/paths.test.mjs test/git.test.mjs test/sync.test.mjs test/tools.test.mjs test/dedup.test.mjs test/commands.test.mjs test/onboard.test.mjs test/delegation.test.mjs test/observer.test.mjs test/distill.test.mjs test/consolidate.test.mjs test/viz.test.mjs test/corpus.test.mjs test/llm-scope.test.mjs test/quality.test.mjs test/replay-gate.test.mjs test/depends-repair.test.mjs test/skill.test.mjs test/fast-lane.test.mjs test/legacy-import.test.mjs",
+    "test": "node --test test/yaml.test.mjs test/okf.test.mjs test/retrieval.test.mjs test/digest.test.mjs test/ilog.test.mjs test/store.test.mjs test/paths.test.mjs test/git.test.mjs test/sync.test.mjs test/tools.test.mjs test/dedup.test.mjs test/commands.test.mjs test/onboard.test.mjs test/delegation.test.mjs test/observer.test.mjs test/distill.test.mjs test/consolidate.test.mjs test/viz.test.mjs test/corpus.test.mjs test/llm-scope.test.mjs test/quality.test.mjs test/replay-gate.test.mjs test/depends-repair.test.mjs test/skill.test.mjs test/fast-lane.test.mjs test/legacy-import.test.mjs test/jev-config.test.mjs test/jev-gate.test.mjs test/jev-client.test.mjs test/jev-log.test.mjs test/jev-fastgate.test.mjs",
     "smoke": "node scripts/smoke-boot.mjs"
   },
   "dependencies": {},

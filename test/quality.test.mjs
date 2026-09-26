@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../lib/index.js'
@@ -486,4 +486,201 @@ test('wiring: autoInject off → the slow lane never produces (no unconsumable s
     else process.env.DSH_TOPICS_HOME = prevHome
     await rmRetry(root)
   }
+})
+
+// ---------------------------------------------------------------------------
+// jev rerank branch (design §2 row 1) — hermetic: globalThis.fetch stubbed
+// (no network), JEV_ZEN_API_KEY set explicitly, and the decisions.jsonl
+// telemetry redirected to a temp $DSH_TOPICS_HOME (the env is re-read on
+// every append, never frozen at import).
+// ---------------------------------------------------------------------------
+
+function decisionRows(home) {
+  try {
+    return readFileSync(join(home, 'meta', 'decisions.jsonl'), 'utf8')
+      .split('\n')
+      .filter((l) => l.trim() !== '')
+      .map((l) => JSON.parse(l))
+  } catch {
+    return []
+  }
+}
+
+/** Stub the systemone endpoint: per-candidate noul probabilities keyed by a
+ *  marker substring of the question instructions. */
+function jevFetchStub(probByMarker, opts = {}) {
+  const calls = []
+  const prev = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const body = JSON.parse(init.body)
+    calls.push({ url: String(url), body })
+    if (opts.status !== undefined) return new Response('mock backend down', { status: opts.status })
+    const answers = {}
+    for (const [qid, q] of Object.entries(body.questions)) {
+      const marker = Object.keys(probByMarker ?? {}).find((m) => q.instructions.includes(m))
+      answers[qid] = opts.badAnswers === true ? { noul: 'high' } : { noul: marker !== undefined ? probByMarker[marker] : 0.3 }
+    }
+    return new Response(JSON.stringify({ answers, usage: { input_tokens: 111, output_tokens: 22 } }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+  }
+  return { calls, restore: () => (globalThis.fetch = prev) }
+}
+
+/** Env + fetch stub + decisions.jsonl redirect, all undone at test end. */
+function withJev(t, probByMarker, opts = {}) {
+  const prevHome = process.env.DSH_TOPICS_HOME
+  const prevKey = process.env.JEV_ZEN_API_KEY
+  const home = mkdtempSync(join(tmpdir(), 'topics-quality-jev-'))
+  process.env.DSH_TOPICS_HOME = home
+  process.env.JEV_ZEN_API_KEY = 'test-zen-key'
+  const stub = jevFetchStub(probByMarker, opts)
+  t.after(() => {
+    stub.restore()
+    if (prevKey === undefined) delete process.env.JEV_ZEN_API_KEY
+    else process.env.JEV_ZEN_API_KEY = prevKey
+    if (prevHome === undefined) delete process.env.DSH_TOPICS_HOME
+    else process.env.DSH_TOPICS_HOME = prevHome
+    rmRetry(home)
+  })
+  return { calls: stub.calls, home, rows: () => decisionRows(home) }
+}
+
+const JEV_SEEDS = ['Alpha Marker AA11', 'Beta Marker BB22', 'Gamma Marker CC33']
+
+async function seedJevTopics(service) {
+  await service.store.ensure()
+  for (const title of JEV_SEEDS) {
+    await service.saveTopic({ title, conclusion: `The echo marker qx7qz note of ${title} exists.` })
+  }
+}
+
+test('jev rerank: adopt band gates the picks (top 2, probability desc); record band logs only', async (t) => {
+  const { service, cleanup } = tmpService({ qualityLane: 'always', jevEnabled: true })
+  t.after(cleanup)
+  await seedJevTopics(service)
+  const jev = withJev(t, { 'Alpha Marker': 0.9, 'Beta Marker': 0.7, 'Gamma Marker': 0.5 })
+  const lane = new SlowLane(service, fakeCaller())
+  lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3 })
+  await waitPending(lane, 's1')
+  const consumed = lane.consume('s1', 4)
+  assert.ok(consumed !== undefined && 'pending' in consumed)
+  // 0.9 / 0.7 are adopt (≥ 0.60); 0.5 is record-only and must NOT become a pick.
+  assert.deepEqual(consumed.pending.items, [
+    { slug: 'alpha-marker-aa11', why: 'jev 判定相关（p=0.90）' },
+    { slug: 'beta-marker-bb22', why: 'jev 判定相关（p=0.70）' },
+  ])
+  // One batched request; state carries the query + task frame, every question
+  // carries the candidate content and two-sided criteria.
+  assert.equal(jev.calls.length, 1)
+  const body = jev.calls[0].body
+  assert.match(body.state, /检索 query/)
+  assert.match(body.state, /任务背景/)
+  assert.equal(Object.keys(body.questions).length, 3)
+  for (const q of Object.values(body.questions)) {
+    assert.equal(q.type, 'noul')
+    assert.equal(typeof q.criteria.true, 'string')
+    assert.equal(typeof q.criteria.false, 'string')
+  }
+  // decisions.jsonl: one call row (fallback=true — the seam fail-opens) + one
+  // verdict row per candidate with the exact §6.2 field whitelist.
+  const rows = jev.rows()
+  const callRow = rows.find((r) => r.questionCount !== undefined)
+  assert.notEqual(callRow, undefined)
+  assert.equal(callRow.lane, 'slowlane-rerank')
+  assert.equal(callRow.outcome, 'ok')
+  assert.equal(callRow.questionCount, 3)
+  assert.equal(callRow.fallback, true)
+  assert.equal(callRow.backend, 'zen')
+  assert.equal(callRow.model, 'jev-1.13-free')
+  const verdicts = rows.filter((r) => r.digest !== undefined)
+  assert.equal(verdicts.length, 3)
+  for (const v of verdicts) {
+    assert.deepEqual(Object.keys(v).sort(), ['agree', 'at', 'band', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'])
+    assert.equal(v.lane, 'slowlane-rerank')
+    assert.equal(v.qtype, 'noul')
+    assert.equal(v.agree, 'n/a')
+    assert.match(v.digest, /^h1:/)
+  }
+  const bands = Object.fromEntries(verdicts.map((v) => [v.ref, v.band]))
+  assert.deepEqual(bands, {
+    'slug:alpha-marker-aa11': 'adopt',
+    'slug:beta-marker-bb22': 'adopt',
+    'slug:gamma-marker-cc33': 'record',
+  })
+})
+
+test('jev rerank: record/fallback bands veto — verdict rows still land, legacy rerank never runs', async (t) => {
+  const { service, cleanup } = tmpService({ qualityLane: 'always', jevEnabled: true })
+  t.after(cleanup)
+  await seedJevTopics(service)
+  // Alpha 0.05 → fallback (strong veto); Beta 0.3 / Gamma 0.4 → record-only.
+  const jev = withJev(t, { 'Alpha Marker': 0.05, 'Beta Marker': 0.3, 'Gamma Marker': 0.4 })
+  const lane = new SlowLane(service, fakeCaller()) // legacy rerank WOULD pick — its absence proves the veto
+  lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3 })
+  for (let i = 0; i < 150 && lane.hasInFlight('s1'); i += 1) await waitMs(20)
+  assert.equal(lane.hasInFlight('s1'), false, 'pipeline settled')
+  assert.equal(lane.hasPending('s1'), false, 'no adopt-band candidate → no picks, no pending')
+  const rows = jev.rows()
+  const verdicts = rows.filter((r) => r.digest !== undefined)
+  assert.equal(verdicts.length, 3, 'record/fallback candidates still land in decisions.jsonl')
+  const bands = Object.fromEntries(verdicts.map((v) => [v.ref, v.band]))
+  assert.deepEqual(bands, {
+    'slug:alpha-marker-aa11': 'fallback',
+    'slug:beta-marker-bb22': 'record',
+    'slug:gamma-marker-cc33': 'record',
+  })
+})
+
+test('jev rerank: fail-open on http 5xx → legacy LLM rerank path (call row marks fallback)', async (t) => {
+  const { service, cleanup } = tmpService({ qualityLane: 'always', jevEnabled: true })
+  t.after(cleanup)
+  await service.store.ensure()
+  await service.saveTopic({ title: 'Echo Marker QX7QZ', conclusion: 'The Echo Marker QX7QZ topic exists.' })
+  const jev = withJev(t, {}, { status: 503 })
+  const lane = new SlowLane(service, fakeCaller())
+  lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3 })
+  await waitPending(lane, 's1')
+  const consumed = lane.consume('s1', 4)
+  assert.ok(consumed !== undefined && 'pending' in consumed, 'jev failure → the legacy LLM rerank ran and produced picks')
+  assert.deepEqual(consumed.pending.items, [{ slug: 'echo-marker-qx7qz', why: '当前问题正需要这条结论' }])
+  const rows = jev.rows()
+  const callRow = rows.find((r) => r.questionCount !== undefined)
+  assert.notEqual(callRow, undefined)
+  assert.equal(callRow.outcome, 'http_5xx')
+  assert.equal(callRow.fallback, true, 'the fail-open is visible in the call layer')
+  assert.equal(rows.some((r) => r.digest !== undefined), false, 'no verdict rows for a failed batch')
+})
+
+test('jev rerank: fail-open on bad answers (unparseable noul) → legacy path', async (t) => {
+  const { service, cleanup } = tmpService({ qualityLane: 'always', jevEnabled: true })
+  t.after(cleanup)
+  await service.store.ensure()
+  await service.saveTopic({ title: 'Echo Marker QX7QZ', conclusion: 'The Echo Marker QX7QZ topic exists.' })
+  const jev = withJev(t, { 'Echo Marker': 0.9 }, { badAnswers: true })
+  const lane = new SlowLane(service, fakeCaller())
+  lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3 })
+  await waitPending(lane, 's1')
+  const consumed = lane.consume('s1', 4)
+  assert.ok(consumed !== undefined && 'pending' in consumed, '坏答案 → the whole batch fails open')
+  assert.equal(consumed.pending.items[0].slug, 'echo-marker-qx7qz')
+  const rows = jev.rows()
+  assert.equal(rows.find((r) => r.questionCount !== undefined).outcome, 'ok', 'the call itself succeeded')
+  assert.equal(rows.some((r) => r.digest !== undefined), false, 'no verdict rows when any answer is unparseable')
+})
+
+test('jevEnabled off → the jev branch never runs (no request, no telemetry, legacy path)', async (t) => {
+  const { service, cleanup } = tmpService({ qualityLane: 'always' })
+  t.after(cleanup)
+  await service.store.ensure()
+  await service.saveTopic({ title: 'Echo Marker QX7QZ', conclusion: 'The Echo Marker QX7QZ topic exists.' })
+  const jev = withJev(t, { 'Echo Marker': 0.9 }) // stub armed, but nothing may call it
+  const lane = new SlowLane(service, fakeCaller())
+  lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3 })
+  await waitPending(lane, 's1')
+  assert.equal(jev.calls.length, 0, 'zero remote decision calls with the master switch off')
+  assert.equal(jev.rows().length, 0, 'zero decisions.jsonl rows with the master switch off')
+  const consumed = lane.consume('s1', 4)
+  assert.ok(consumed !== undefined && 'pending' in consumed, 'legacy LLM rerank produced the pending exactly as before')
 })
