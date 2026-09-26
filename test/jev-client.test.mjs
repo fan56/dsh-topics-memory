@@ -285,6 +285,11 @@ test('client: missing key → missing_key without any request (native probes not
 })
 
 test('client: timeout — stub honors the abort signal, maps to timeout, no retry', async () => {
+  // AbortSignal.timeout's timer is UNREF'd: with a never-settling stub the
+  // only pending work is that unref'd timer, so the event loop can drain
+  // before the abort fires and node:test cancels the remaining file (seen on
+  // node 22 CI). Keep the loop ref'd until the abort actually lands.
+  const keepAlive = setInterval(() => {}, 5)
   const s = stubFetch((_calls, init) => {
     return new Promise((_resolve, reject) => {
       init.signal.addEventListener('abort', () => {
@@ -302,6 +307,7 @@ test('client: timeout — stub honors the abort signal, maps to timeout, no retr
     assert.equal(s.calls.length, 1, 'NO retry — one attempt only')
     assert.equal(lastDecisionRow().outcome, 'timeout')
   } finally {
+    clearInterval(keepAlive)
     s.restore()
     delete process.env.JEV_ZEN_API_KEY
   }
