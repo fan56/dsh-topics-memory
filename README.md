@@ -190,6 +190,20 @@ Adopt / record / fallback bands (calibrated offline on a 383-case gold corpus; t
 
 Every call and verdict lands in `~/.dsh/topics/meta/decisions.jsonl` — local-only and redacted: slugs, pair hashes, question types, probabilities, latency and token counts; never conversation text or conclusion bodies. It has no config key (it stops together with `jevEnabled: false`); `/topics status` shows a 30-day summary line.
 
+
+### Latency benchmarks (measured 2026-09-26, Apple M5, typesafe `native` backend, jev-1.13.0)
+
+Real-payload benchmarks and in-sandbox runs — use them to pick `jevTimeoutMs`. Sources vary in shape and load; all are the same 8-candidate shadow batch unless noted:
+
+| Source | Shape | p50 | p90 | max | n |
+|---|---|---|---|---|---|
+| Idle benchmark (sequential) | 8-question batch | 742 ms | 1290 ms | 1461 ms | 10 |
+| Idle benchmark (sequential) | 1-question | 367 ms | — | 925 ms | 5 |
+| Threshold-sweep runs (Sept 25) | 20-question batch | 1760 ms avg | — | 8470 ms | 16 |
+| Live headless turns | 8-question batch, **concurrent with the main model streaming** | 327–5698 ms | — | 10619 ms | 3 |
+
+Readings that matter: the idle path sits comfortably under the 3000 ms default (≈2× headroom at p90), but a live turn's shadow call shares the network with the main model's streaming response — the 10.6 s outlier above was observed exactly there. A timeout is fail-open: the batch is dropped (slow-lane rerank falls back to the old LLM path), so a tight timeout costs shadow data, never correctness. Keep the 3000 ms default unless `decisions.jsonl` shows a persistent `timeout` share above ~5% (the 30-day summary in `/topics status` surfaces it); weak-network users can raise `jevTimeoutMs` freely. `zen` and `openrouter` are unmeasured here — after enabling, your own decisions.jsonl latency column is the ground truth for your network.
+
 ## Acknowledgements
 
 This project's shape is directly inspired and supported by:

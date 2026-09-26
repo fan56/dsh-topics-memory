@@ -181,6 +181,20 @@ dsh 会清洗插件环境里匹配 `KEY|PASSWORD|SECRET|TOKEN` 的 ambient 变�
 
 绝对线绑定批量协议（换协议必须重扫）。三缝失败回退行为见 ADR 0018。判定与调用明细落 `meta/decisions.jsonl`（本地 only，脱敏——绝不存 state 原文）。
 
+
+### 延迟基准（2026-09-26 实测，Apple M5，typesafe `native` 后端，jev-1.13.0）
+
+真实负载基准 + 沙箱实跑——用来选 `jevTimeoutMs`。各 source 形状与负载不同，除注明外均为同一 8 候选 shadow 批量：
+
+| 来源 | 形状 | p50 | p90 | max | n |
+|---|---|---|---|---|---|
+| 空载基准（顺序发） | 8 问批量 | 742 ms | 1290 ms | 1461 ms | 10 |
+| 空载基准（顺序发） | 单问 | 367 ms | — | 925 ms | 5 |
+| 阈值扫描（09-25） | 20 问批量 | 均值 1760 ms | — | 8470 ms | 16 |
+| 真机 headless 轮 | 8 问批量，**与主模型流式并发** | 327–5698 ms | — | 10619 ms | 3 |
+
+关键读数：空载路径远低于 3000 ms 默认线（p90 约 2× 余量）；但真机轮的 shadow 调用与主模型的流式响应共享网络——上表 10.6 s 离群值正是在这个位置观测到的。超时即 fail-open：该批数据丢弃（慢车道回退旧 LLM rerank），**紧超时损失的是 shadow 数据，不是正确性**。默认 3000 保持不变；除非 `decisions.jsonl` 显示 `timeout` 占比持续 >5%（`/topics status` 的 30 天摘要会露出），弱网用户可自行上调 `jevTimeoutMs`。`zen` 与 `openrouter` 本次未实测——开启后你自己 decisions.jsonl 的 latency 列就是你网络的真值。
+
 ## Acknowledgements
 
 本项目的形态直接受以下项目的启发与支撑：
