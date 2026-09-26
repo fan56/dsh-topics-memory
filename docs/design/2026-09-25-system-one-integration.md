@@ -125,7 +125,7 @@ key 传递：dsh 清洗 ambient `KEY|PASSWORD|SECRET|TOKEN` 变量——key 必�
  "fallback":true|false}
 ```
 
-`fallback=true` 即 fail-open 触发——**回退率本身就是健康度指标**（持续 >5% 说明 timeout/后端要调）。
+`fallback=true` 即 fail-open 触发——**回退率本身就是健康度指标**（持续 >5% 说明 timeout/后端要调）。实现注（09-26）：jevAsk 落行时调用方还不知道结果，故调用层行恒写 `fallback:false`；两 lane 的回退是确定性的（ADR 0018），**fail-open 发生 = 该行 `outcome !== 'ok'`**，回退率按此口径统计。
 
 **判定层**（每问一条，批量请求展开）：
 

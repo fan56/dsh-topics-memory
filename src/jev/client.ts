@@ -217,7 +217,7 @@ export async function jevAsk(args: JevAskArgs): Promise<JevAskResult> {
   const backend = resolveBackend(args.config.jevBackend)
   // '' is the sentinel; undefined (bare harnesses) resolves to the default too
   const model = args.config.jevModel ? args.config.jevModel : backend.defaultModel
-  const fallback = args.fallback === true
+  const fallback = args.fallback === true // absent => false: the column is call-time-invariant (fail-open = outcome !== ok)
   const state = typeof args.state === 'string' ? args.state : ''
   const started = Date.now()
 

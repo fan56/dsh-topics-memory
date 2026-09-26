@@ -549,7 +549,11 @@ export class SlowLane {
       questions,
       config: jevConfigOf(this.service.cfg),
       lane: 'slowlane-rerank',
-      fallback: true, // any failure falls open to the legacy LLM rerank (§6.2)
+      fallback: false,
+      // fallback stays FALSE here: jevAsk writes the row before the caller
+      // knows the outcome, so a constant true would poison the rollback-rate
+      // stat. Fail-open occurrence = outcome !== 'ok' (this lane's fallback
+      // to the legacy LLM rerank is deterministic per ADR 0018).
     })
     if (!result.ok) return undefined
     const scored: { qid: string; slug: string; instructions: string; probability: number; band: JevBand }[] = []

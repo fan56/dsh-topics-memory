@@ -583,7 +583,7 @@ test('jev rerank: adopt band gates the picks (top 2, probability desc); record b
     assert.equal(typeof q.criteria.true, 'string')
     assert.equal(typeof q.criteria.false, 'string')
   }
-  // decisions.jsonl: one call row (fallback=true — the seam fail-opens) + one
+  // decisions.jsonl: one call row (outcome marks the fail-open, fallback stays false at call time) + one
   // verdict row per candidate with the exact §6.2 field whitelist.
   const rows = jev.rows()
   const callRow = rows.find((r) => r.questionCount !== undefined)
@@ -591,7 +591,7 @@ test('jev rerank: adopt band gates the picks (top 2, probability desc); record b
   assert.equal(callRow.lane, 'slowlane-rerank')
   assert.equal(callRow.outcome, 'ok')
   assert.equal(callRow.questionCount, 3)
-  assert.equal(callRow.fallback, true)
+  assert.equal(callRow.fallback, false)
   assert.equal(callRow.backend, 'zen')
   assert.equal(callRow.model, 'jev-1.13-free')
   const verdicts = rows.filter((r) => r.digest !== undefined)
@@ -649,7 +649,8 @@ test('jev rerank: fail-open on http 5xx → legacy LLM rerank path (call row mar
   const callRow = rows.find((r) => r.questionCount !== undefined)
   assert.notEqual(callRow, undefined)
   assert.equal(callRow.outcome, 'http_5xx')
-  assert.equal(callRow.fallback, true, 'the fail-open is visible in the call layer')
+  assert.equal(callRow.fallback, false)
+  assert.notEqual(callRow.outcome, 'ok', 'the fail-open is visible via the outcome column')
   assert.equal(rows.some((r) => r.digest !== undefined), false, 'no verdict rows for a failed batch')
 })
 

@@ -613,7 +613,7 @@ export class Consolidator {
    * cluster-level 「值得动吗」 rides along (固定 band='record', never gates).
    * Gate: ≥1 pair in the adopt band → the cluster goes to the LLM; all pairs
    * below → skipped (省调用). Any jev failure proceeds fail-open — the
-   * call-layer telemetry row (fallback=true) was already written by jevAsk
+   * call-layer telemetry row (outcome !== 'ok' marks the fail-open) was already written by jevAsk
    * itself; only the verdict layer is ours here (agree='n/a', nothing lexical
    * to reconcile against on this lane).
    */
@@ -653,7 +653,10 @@ export class Consolidator {
       questions,
       config: jev,
       lane: 'consolidate-prefilter',
-      fallback: true, // fail-open is the wiring: on failure the cluster goes to the LLM as today
+      fallback: false,
+      // fallback stays FALSE at call time (jevAsk writes before the outcome
+      // is known); fail-open occurrence = outcome !== 'ok' — this lane's
+      // "cluster goes to the LLM as today" is deterministic per ADR 0018.
     })
     if (!r.ok) return { proceed: true, failOpen: true }
     const at = new Date().toISOString()

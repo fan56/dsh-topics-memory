@@ -535,7 +535,7 @@ test('prefilter: pair adopt → cluster goes to the LLM; sweep-aligned batch sha
       assert.equal(h.calls.length, 1)
       const args = jevCalls[0]
       assert.equal(args.lane, 'consolidate-prefilter')
-      assert.equal(args.fallback, true, 'fail-open is wired into the call')
+      assert.equal(args.fallback, false, 'fallback column is call-time-invariant; fail-open = outcome != ok')
       // ≤6 问/簇: 1 pair + 1 record-only cluster question here.
       const qIds = Object.keys(args.questions)
       assert.equal(qIds.length, 2)
