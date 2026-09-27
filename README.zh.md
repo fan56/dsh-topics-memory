@@ -197,6 +197,12 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `jevLayaUrl` | `http://127.0.0.1:8000/v1/systemone` | 陪跑用的 laya-serve 端点 |
 | `jevDebug` | 关 | 诊断日志开关（走宿主 logger，默认静默） |
 
+### laya 本地陪跑（实验，默认关）
+
+`jevLayaFallback: true` 且本地跑着 [laya](https://github.com/NandhaKishorM/laya) serve 时，每次 jev 调用并发一路本地 laya 请求：主路答案驱动决策，laya 答案并排落账——一组永久运行的 laya vs jev 同题对照。laya 是**纯遥测**（真实负载实测批内排序与主路一致率 0/14、绝对分不可用），主路失败照旧回退旧路径；laya 没起 = 毫秒级连接拒绝。
+
+**laya 安装配置**：随包 skill `dsh-topics-memory-laya` 完整覆盖安装（venv / 国内镜像加速 / checkpoint 下载）、启动 laya-serve、配置 `jevLayaFallback`、用 decisions.jsonl 验证生效。对 agent 说 laya 即可触发，或直接读 `skills/dsh-topics-memory-laya/SKILL.md`。
+
 ## Acknowledgements
 
 本项目的形态直接受以下项目的启发与支撑：
