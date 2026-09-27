@@ -91,6 +91,14 @@ export const TopicsConfig = z.object({
   /** External secret list for the outbound secret gate (JEV_SECRET_FILE
    *  semantics, design §3.3); swapping the path hot reloads the list. */
   jevSecretFile: z.string().default('').volatile(),
+  /** Local laya pace-maker (design §3.4, 09-27): fire a parallel laya call on
+   *  every jev request; its verdict is logged for comparison and takes over
+   *  ONLY when the primary backend fails (degraded). Default off — zero
+   *  behavior change, and laya-serve not running costs a refused connection. */
+  jevLayaFallback: z.boolean().default(false).volatile(),
+  /** laya-serve systemone endpoint for the pace-maker (default: the local
+   *  laya-serve bind from the laya repo's serve mode). */
+  jevLayaUrl: z.string().default('http://127.0.0.1:8000/v1/systemone').volatile(),
 })
 
 export type TopicsConfigValue = {
@@ -129,6 +137,8 @@ export type TopicsConfigValue = {
   jevModel?: string
   jevTimeoutMs?: number
   jevSecretFile?: string
+  jevLayaFallback?: boolean
+  jevLayaUrl?: string
 }
 
 export const CONFIG_KEYS = [
@@ -163,6 +173,8 @@ export const CONFIG_KEYS = [
   'jevModel',
   'jevTimeoutMs',
   'jevSecretFile',
+  'jevLayaFallback',
+  'jevLayaUrl',
 ] as const
 
 export type ConfigKey = (typeof CONFIG_KEYS)[number]
@@ -235,6 +247,12 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'distillModel':
     case 'jevModel':
     case 'jevSecretFile':
+    case 'jevLayaUrl':
       return raw
+    case 'jevLayaFallback': {
+      if (raw === 'on' || raw === 'true') return true
+      if (raw === 'off' || raw === 'false') return false
+      return { error: 'jev-laya-fallback 取值 on|off' }
+    }
   }
 }

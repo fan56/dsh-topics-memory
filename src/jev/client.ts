@@ -51,6 +51,10 @@ export interface JevAskArgs {
   fallback?: boolean
   /** Host logger (optional, warn-only, best-effort). */
   logger?: GateLogger
+  /** Dual-run pace-maker hook (jev/dual.ts): target this endpoint/model with
+   *  no auth header and tag the call-layer row backend='laya'. Never set by
+   *  user config — internal to the dual wrapper. */
+  overrides?: { endpoint: string; model: string }
 }
 
 export type JevAnswer = Record<string, unknown>
@@ -214,9 +218,22 @@ export function normalizeQuestions(questions: Record<string, JevQuestion>, famil
  *  resolves to a structured failure (never throws) so the calling lane can
  *  fail open. Writes the decisions.jsonl call-layer row on EVERY path. */
 export async function jevAsk(args: JevAskArgs): Promise<JevAskResult> {
-  const backend = resolveBackend(args.config.jevBackend)
+  // Pace-maker override: a synthetic laya backend (no key — the auth header
+  // carries a placeholder the local server ignores; the secret gate and the
+  // call-layer row still run, tagged backend='laya').
+  const backend = args.overrides
+    ? ({
+        name: 'laya',
+        family: 'systemone',
+        endpoint: args.overrides.endpoint,
+        defaultModel: args.overrides.model,
+        keyEnv: '',
+        keychainService: '',
+        keychainByDefault: false,
+      } as unknown as ReturnType<typeof resolveBackend>)
+    : resolveBackend(args.config.jevBackend)
   // '' is the sentinel; undefined (bare harnesses) resolves to the default too
-  const model = args.config.jevModel ? args.config.jevModel : backend.defaultModel
+  const model = args.overrides ? args.overrides.model : args.config.jevModel ? args.config.jevModel : backend.defaultModel
   const fallback = args.fallback === true // absent => false: the column is call-time-invariant (fail-open = outcome !== ok)
   const state = typeof args.state === 'string' ? args.state : ''
   const started = Date.now()
@@ -259,8 +276,9 @@ export async function jevAsk(args: JevAskArgs): Promise<JevAskResult> {
     )
   }
 
-  // 3. API key — absent key fails before any network activity.
-  const key = await resolveApiKey(backend)
+  // 3. API key — absent key fails before any network activity. The laya
+  //    pace-maker skips resolution entirely (local, no auth).
+  const key = args.overrides ? 'laya-local' : await resolveApiKey(backend)
   if (key === '') {
     const hint =
       backend.keychainByDefault

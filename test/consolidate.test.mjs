@@ -559,7 +559,7 @@ test('prefilter: pair adopt → cluster goes to the LLM; sweep-aligned batch sha
       for (const row of rows) {
         assert.deepEqual(
           Object.keys(row).sort(),
-          ['agree', 'at', 'band', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'],
+          ['agree', 'at', 'backend', 'band', 'degraded', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'],
         )
         assert.equal(row.lane, 'consolidate-prefilter')
         assert.equal(row.qtype, 'noul')

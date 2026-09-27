@@ -28,8 +28,9 @@ import { searchTopics } from './retrieval.ts'
 import type { RingEntry } from './observer.ts'
 import type { QueryBuildShape } from './ilog.ts'
 import type { TopicsConfigValue } from './config.ts'
-import { jevAsk } from './jev/client.ts'
-import type { JevAskConfig, JevQuestion } from './jev/client.ts'
+import { jevAskDual } from './jev/dual.ts'
+import type { JevQuestion } from './jev/client.ts'
+import type { JevDualConfig, JevDualResult } from './jev/dual.ts'
 import { band as jevBand } from './jev/thresholds.ts'
 import type { JevBand } from './jev/thresholds.ts'
 import { digestFor, logVerdicts } from './jev/log.ts'
@@ -127,12 +128,14 @@ function noulProbability(answer: unknown): number | undefined {
 
 /** The config slice jevAsk needs, tolerating bare harnesses (§4: consumers
  *  treat undefined as the documented default). */
-function jevConfigOf(cfg: TopicsConfigValue): JevAskConfig {
+function jevConfigOf(cfg: TopicsConfigValue): JevDualConfig {
   return {
     jevBackend: cfg.jevBackend ?? 'zen',
     jevModel: cfg.jevModel ?? '',
     jevTimeoutMs: typeof cfg.jevTimeoutMs === 'number' && cfg.jevTimeoutMs > 0 ? cfg.jevTimeoutMs : 3000,
     jevSecretFile: cfg.jevSecretFile ?? '',
+    jevLayaFallback: cfg.jevLayaFallback === true,
+    jevLayaUrl: cfg.jevLayaUrl ?? 'http://127.0.0.1:8000/v1/systemone',
   }
 }
 
@@ -320,35 +323,47 @@ export class SlowLane {
       metas.push({ qid, slug: cand.slug, instructions, disposition: cand.disposition })
     }
     if (metas.length === 0) return
-    const result = await jevAsk({
+    const dual = await jevAskDual({
       state,
       questions,
       config: jevConfigOf(this.service.cfg),
       lane: 'fastgate-shadow',
       fallback: false, // pure shadow — no behavior to fall back
     })
-    if (!result.ok) return
     const at = new Date().toISOString()
+    // Verdict rows for BOTH sources when they answered: the primary row set
+    // (backend omitted = 'primary') and the laya pace-maker comparison set
+    // (backend='laya', degraded — excluded from ECE, §6.2). On a primary
+    // failure with a live pace-maker the laya set IS the recorded verdict.
+    const sources: { answers: Record<string, unknown> | undefined; backend: string; degraded: boolean }[] = []
+    if (dual.ok) sources.push({ answers: dual.answers, backend: dual.source, degraded: dual.source === 'laya' })
+    if (dual.layaResult?.ok && dual.source === 'primary') {
+      sources.push({ answers: dual.layaResult.answers, backend: 'laya', degraded: false })
+    }
     const recs: JevVerdictRecord[] = []
-    for (const m of metas) {
-      const probability = noulProbability(result.answers[m.qid])
-      if (probability === undefined) continue // unparseable answer: no fabricated row
-      const b = jevBand(probability, 'rerank')
-      // agree reconciliation (§6.2): the ilog disposition, with wouldBlock for
-      // the reverse disagreement (lexical let it through, jev lands in the veto
-      // band — the other half of the calibration goldmine).
-      const agree: JevVerdictRecord['agree'] = m.disposition === 'hit' && b === 'fallback' ? 'wouldBlock' : m.disposition
-      recs.push({
-        at,
-        lane: 'fastgate-shadow',
-        questionId: m.qid,
-        qtype: 'noul',
-        ref: `slug:${m.slug}`,
-        digest: digestFor(state, m.qid, m.instructions),
-        probability,
-        band: b,
-        agree,
-      })
+    for (const src of sources) {
+      for (const m of metas) {
+        const probability = noulProbability(src.answers?.[m.qid])
+        if (probability === undefined) continue // unparseable answer: no fabricated row
+        const b = jevBand(probability, 'rerank')
+        // agree reconciliation (§6.2): the ilog disposition, with wouldBlock for
+        // the reverse disagreement (lexical let it through, jev lands in the veto
+        // band — the other half of the calibration goldmine).
+        const agree: JevVerdictRecord['agree'] = m.disposition === 'hit' && b === 'fallback' ? 'wouldBlock' : m.disposition
+        recs.push({
+          at,
+          lane: 'fastgate-shadow',
+          questionId: m.qid,
+          qtype: 'noul',
+          ref: `slug:${m.slug}`,
+          digest: digestFor(state, m.qid, m.instructions),
+          probability,
+          band: b,
+          agree,
+          backend: src.backend,
+          degraded: src.degraded,
+        })
+      }
     }
     await logVerdicts(recs)
   }
@@ -544,7 +559,7 @@ export class SlowLane {
       questions[qid] = { type: 'noul', instructions, criteria: candidateCriteria(c) }
       metas.push({ qid, slug: c.slug, instructions })
     }
-    const result = await jevAsk({
+    const dual = await jevAskDual({
       state,
       questions,
       config: jevConfigOf(this.service.cfg),
@@ -555,32 +570,63 @@ export class SlowLane {
       // stat. Fail-open occurrence = outcome !== 'ok' (this lane's fallback
       // to the legacy LLM rerank is deterministic per ADR 0018).
     })
-    if (!result.ok) return undefined
+    // Degraded mode (design §3.4): the primary failed but the laya
+    // pace-maker answered — its ABSOLUTE scores must never meet the jev
+    // thresholds (its negatives sit in the same band as its positives), so
+    // this branch borrows only the RELATIVE ranking for the top-2 picks and
+    // flags every row degraded. A laya answer that fails to parse at all
+    // still falls open to the legacy LLM rerank below.
+    const degraded = dual.source === 'laya'
+    if (!dual.ok) return undefined
     const scored: { qid: string; slug: string; instructions: string; probability: number; band: JevBand }[] = []
     for (const m of metas) {
-      const probability = noulProbability(result.answers[m.qid])
+      const probability = noulProbability(dual.answers[m.qid])
       if (probability === undefined) return undefined // 坏答案 → fail-open (§1)
-      scored.push({ ...m, probability, band: jevBand(probability, 'rerank') })
+      scored.push({ ...m, probability, band: degraded ? 'record' : jevBand(probability, 'rerank') })
     }
     const at = new Date().toISOString()
-    await logVerdicts(
-      scored.map((m) => ({
-        at,
-        lane: 'slowlane-rerank' as const,
-        questionId: m.qid,
-        qtype: 'noul' as const,
-        ref: `slug:${m.slug}`,
-        digest: digestFor(state, m.qid, m.instructions),
-        probability: m.probability,
-        band: m.band,
-        agree: 'n/a' as const,
-      })),
-    )
+    const recs: JevVerdictRecord[] = scored.map((m) => ({
+      at,
+      lane: 'slowlane-rerank' as const,
+      questionId: m.qid,
+      qtype: 'noul' as const,
+      ref: `slug:${m.slug}`,
+      digest: digestFor(state, m.qid, m.instructions),
+      probability: m.probability,
+      band: m.band,
+      agree: 'n/a' as const,
+      backend: dual.source,
+      degraded,
+    }))
+    // Pace-maker comparison rows (design §3.4): when the primary drove and
+    // laya also answered, log laya's verdicts alongside — the permanently
+    // running laya-vs-jev comparison. band='record': laya's absolute scores
+    // never claim adopt.
+    if (dual.source === 'primary' && dual.layaResult?.ok) {
+      for (const m of metas) {
+        const probability = noulProbability(dual.layaResult.answers[m.qid])
+        if (probability === undefined) continue
+        recs.push({
+          at,
+          lane: 'slowlane-rerank',
+          questionId: m.qid,
+          qtype: 'noul',
+          ref: `slug:${m.slug}`,
+          digest: digestFor(state, m.qid, m.instructions),
+          probability,
+          band: 'record',
+          agree: 'n/a',
+          backend: 'laya',
+          degraded: false,
+        })
+      }
+    }
+    await logVerdicts(recs)
     return scored
-      .filter((m) => m.band === 'adopt')
+      .filter((m) => degraded || m.band === 'adopt')
       .sort((a, b) => b.probability - a.probability)
       .slice(0, 2)
-      .map((m) => ({ slug: m.slug, why: `jev 判定相关（p=${m.probability.toFixed(2)}）` }))
+      .map((m) => ({ slug: m.slug, why: degraded ? `laya 降级排序（p=${m.probability.toFixed(2)}）` : `jev 判定相关（p=${m.probability.toFixed(2)}）` }))
   }
 
   /**

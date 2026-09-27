@@ -116,7 +116,7 @@ test('log: verdict rows carry the §6.2 verdict-layer fields; empty batch writes
     assert.equal(rows.length, 2)
     assert.deepEqual(
       Object.keys(rows[0]).sort(),
-      ['agree', 'at', 'band', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'],
+      ['agree', 'at', 'backend', 'band', 'degraded', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'],
     )
     assert.equal(rows[1].agree, 'wouldBlock')
     assert.equal(rows[1].ref, 'pair:a1b')

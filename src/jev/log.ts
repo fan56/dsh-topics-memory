@@ -70,6 +70,14 @@ export interface JevVerdictRecord {
   probability: number
   band: JevBand
   agree: 'hit' | 'nearFloor' | 'gate-blocked' | 'wouldBlock' | 'n/a'
+  /** Which backend produced this verdict: 'primary' (default — the configured
+   *  backend) or 'laya' (the local pace-maker). Design §3.4. */
+  backend?: string
+  /** True when this row's source DROVE the decision because the primary
+   *  backend was unavailable (degraded mode). Comparison rows from the
+   *  pace-maker are degraded=false; laya rows are excluded from ECE either
+   *  way (uncalibrated probabilities). */
+  degraded?: boolean
 }
 
 const COMPACT_LIMIT = 512 * 1024 // ~512KB cap, same as the ilog sidecars
@@ -178,6 +186,8 @@ export async function logVerdicts(recs: readonly JevVerdictRecord[]): Promise<vo
         probability: rec.probability,
         band: rec.band,
         agree: rec.agree,
+        backend: rec.backend ?? 'primary',
+        degraded: rec.degraded === true,
       }),
     ),
   )

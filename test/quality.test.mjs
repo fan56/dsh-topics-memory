@@ -597,7 +597,7 @@ test('jev rerank: adopt band gates the picks (top 2, probability desc); record b
   const verdicts = rows.filter((r) => r.digest !== undefined)
   assert.equal(verdicts.length, 3)
   for (const v of verdicts) {
-    assert.deepEqual(Object.keys(v).sort(), ['agree', 'at', 'band', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'])
+    assert.deepEqual(Object.keys(v).sort(), ['agree', 'at', 'backend', 'band', 'degraded', 'digest', 'lane', 'probability', 'qtype', 'questionId', 'ref'])
     assert.equal(v.lane, 'slowlane-rerank')
     assert.equal(v.qtype, 'noul')
     assert.equal(v.agree, 'n/a')

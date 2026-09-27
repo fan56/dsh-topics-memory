@@ -94,6 +94,8 @@ Adopt / record / fallback bands (calibrated offline on a 383-case gold corpus; t
 | Consolidation prefilter | The cluster goes to the LLM in full, exactly as today | none |
 | Fast-lane shadow | Records the outcome only; zero behavior impact | none |
 
+**Local laya pace-maker (experimental, off by default).** With `jevLayaFallback: true` and a local [laya](https://github.com/NandhaKishorM/laya) serve running, every jev call fires a parallel local laya request: the primary answer drives the decision, and the laya answer is logged alongside it — a permanently running laya-vs-jev comparison on identical questions. When the primary fails (cold-start spike, timeout, 5xx), the already-resolved laya answer takes over instead of dropping the batch — but DEGRADED: laya's absolute scores never meet the jev-calibrated thresholds, so the rerank seam borrows only laya's relative ranking for its picks, and laya verdict rows are excluded from calibration stats. The consolidation prefilter deliberately does not ride the pace-maker (a wrong laya veto would silently skip real consolidation work). laya not running costs a refused connection in milliseconds.
+
 Every call and verdict lands in `~/.dsh/topics/meta/decisions.jsonl` — local-only and redacted: slugs, pair hashes, question types, probabilities, latency and token counts; never conversation text or conclusion bodies. It has no config key (it stops together with `jevEnabled: false`); `/topics status` shows a 30-day summary line.
 
 
@@ -203,6 +205,8 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `jevModel` | empty (per backend: `jev-1.13-free` / `jev-1.13.0` / `typesafe/jev-1.13`) | Version-pinned decision model; upgrading is an explicit action |
 | `jevTimeoutMs` | `3000` | Per-request decision timeout; single attempt, no retry |
 | `jevSecretFile` | none | External secret list for the outbound secret gate; re-read when hot-changed |
+| `jevLayaFallback` | `false` | Local laya pace-maker: fire a parallel laya call on every jev request; its answer takes over (degraded, relative-ranking only) when the primary fails |
+| `jevLayaUrl` | `http://127.0.0.1:8000/v1/systemone` | laya-serve endpoint for the pace-maker |
 
 ## Acknowledgements
 

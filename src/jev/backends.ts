@@ -10,6 +10,9 @@
  */
 
 export type JevBackendName = 'zen' | 'native' | 'openrouter'
+/** The local laya pace-maker writes its own call-layer rows; not a config
+ *  backend (no entry in BACKENDS) — it rides jevAsk's overrides hook. */
+export type JevPaceMakerName = 'laya'
 export type JevFamily = 'systemone' | 'decisions'
 
 export interface JevBackend {
