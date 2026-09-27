@@ -41,8 +41,10 @@ const ringEntry = (user, assistant) => ({ user, assistant, at: new Date().toISOS
 
 /** Fake ModelCaller answering the query-builder role; counts lane calls (the
  *  legacy rerank runs inside the same produce pipeline — a non-zero count
- *  AFTER a laya takeover would prove the fallback mis-fired). */
-function fakeCaller(counters = { build: 0, legacyRerank: 0 }) {
+ *  AFTER a laya takeover would prove the fallback mis-fired). The legacy
+ *  pick must be a LEGAL candidate slug (the rerank drops picks outside the
+ *  band, so an unknown slug would leave the lane with no pending at all). */
+function fakeCaller(counters = { build: 0, legacyRerank: 0 }, legacySlug = 'echo-marker-qx7qz') {
   return async (req) => {
     if (req.system.includes('检索查询构建器')) {
       counters.build += 1
@@ -50,7 +52,7 @@ function fakeCaller(counters = { build: 0, legacyRerank: 0 }) {
     }
     if (req.system.includes('注入门禁')) {
       counters.legacyRerank += 1
-      return JSON.stringify({ picks: [{ slug: 'echo-marker-qx7qz', why: 'legacy rerank fired' }] })
+      return JSON.stringify({ picks: [{ slug: legacySlug, why: 'legacy rerank fired' }] })
     }
     return JSON.stringify({ ops: [] })
   }
@@ -197,29 +199,30 @@ test('dual on, primary ok: primary drives, laya logged as comparison (degraded=f
   assert.equal(verdicts.every((v) => v.degraded === false), true, 'comparison rows are not degraded')
 })
 
-test('dual on, primary timeout → laya degraded takeover: picks by RELATIVE ranking, legacy rerank never runs', async (t) => {
+test('dual on, primary timeout → legacy LLM rerank fallback; laya comparison rows still land (REVISED 09-27: real-data top-1 agreement 0/14 killed the ranking takeover)', async (t) => {
   const { service, cleanup } = tmpService({ qualityLane: 'always', jevEnabled: true, jevLayaFallback: true, jevTimeoutMs: 30 })
   t.after(cleanup)
   await seedJevTopics(service)
-  // primary: every call hangs past the 30ms timeout; laya: answers, with the
-  // Gamma marker scoring HIGHEST — relative ranking must win over bands.
+  // primary: every call hangs past the 30ms timeout; laya answers — but per
+  // the 09-27 real-data evidence (within-batch top-1 agreement 0/14) its
+  // ranking is NOT trusted for picks: the legacy LLM rerank drives instead.
   const jev = withDual(t, { primaryProb: PRIMARY_PROB, layaProb: LAYA_PROB, primaryFail: 'timeout' })
   const counters = { build: 0, legacyRerank: 0 }
-  const lane = new SlowLane(service, fakeCaller(counters))
+  // the legacy pick must be one of the seeded candidates, else the rerank
+  // drops it (illegal slug) and the lane settles no pending at all.
+  const lane = new SlowLane(service, fakeCaller(counters, 'alpha-marker-aa11'))
   lane.dispatch('s1', { ring: [ringEntry('u', 'a')], turnId: 3 })
   await waitPending(lane, 's1')
   const consumed = lane.consume('s1', 4)
   assert.ok(consumed !== undefined && 'pending' in consumed)
-  // Laya probs 0.6/0.55/0.5 → top-2 alpha+beta by RELATIVE order, NOT gated
-  // by the jev 0.60 adopt line (all three laya scores are below it).
-  assert.deepEqual(consumed.pending.items.map((i) => i.slug), ['alpha-marker-aa11', 'beta-marker-bb22'])
-  assert.match(consumed.pending.items[0].why, /laya 降级排序/)
-  assert.equal(counters.legacyRerank, 0, 'degraded laya ranking replaces the legacy LLM rerank')
+  assert.equal(counters.legacyRerank, 1, 'fail-open falls to the legacy LLM rerank (ADR 0018)')
+  assert.deepEqual(consumed.pending.items, [
+    { slug: 'alpha-marker-aa11', why: 'legacy rerank fired' },
+  ])
   const rows = jev.rows()
   const layaVerdicts = rows.filter((r) => r.digest !== undefined && r.backend === 'laya')
-  assert.equal(layaVerdicts.length, 3)
-  assert.equal(layaVerdicts.every((v) => v.degraded === true), true, 'degraded takeover is flagged')
-  assert.equal(layaVerdicts.every((v) => v.band === 'record'), true, 'laya rows never claim adopt')
+  assert.equal(layaVerdicts.length, 3, 'laya comparison rows still land (telemetry only)')
+  assert.equal(layaVerdicts.every((v) => v.degraded === false), true, 'comparison rows are not degraded (nothing drove)')
 })
 
 test('dual on, primary AND laya fail → legacy LLM rerank fallback unchanged', async (t) => {

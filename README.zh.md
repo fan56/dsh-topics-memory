@@ -193,7 +193,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `jevModel` | 空（按 backend：`jev-1.13-free` / `jev-1.13.0` / `typesafe/jev-1.13`） | 版本钉定的决策模型；升级是显式动作 |
 | `jevTimeoutMs` | `3000` | 单次决策请求超时；单发不重试 |
 | `jevSecretFile` | 无 | 出网 secret gate 的外部清单路径；热更换路径即重读 |
-| `jevLayaFallback` | `false` | 本地 laya 陪跑：每次 jev 调用并发一路 laya 请求；主路失败时其结果接管（降级，仅相对排序） |
+| `jevLayaFallback` | `false` | 本地 laya 陪跑：每次 jev 调用并发一路 laya 请求；laya 为纯遥测对照（不接管决策，真实负载排序一致率 0/14） |
 | `jevLayaUrl` | `http://127.0.0.1:8000/v1/systemone` | 陪跑用的 laya-serve 端点 |
 | `jevDebug` | 关 | 诊断日志开关（走宿主 logger，默认静默） |
 

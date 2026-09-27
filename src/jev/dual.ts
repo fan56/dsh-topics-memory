@@ -6,11 +6,14 @@
  *  - the laya answer is always logged (its own call-layer row tagged
  *    backend='laya' plus verdict rows) — a free, permanently running
  *    laya-vs-jev comparison on identical questions;
- *  - when the primary FAILS (cold-start spike, timeout, 5xx…), the laya
- *    answer — by then already resolved — takes over as DEGRADED: the calling
- *    seam may only use laya's RELATIVE ranking, never its absolute scores
- *    against jev-calibrated thresholds (laya's negatives sit in the same band
- *    as its positives — the 4-way bench, 09-27);
+ *  - TELEMETRY-ONLY: laya NEVER drives a decision. On real data its
+ *    within-batch top-1 agreed with the primary 0/14 and its negatives sit in
+ *    the same band as its positives (0.63-0.76), so both its relative ranking
+ *    and its absolute scores are unusable (4-way bench, 09-27). A primary
+ *    FAILURE (cold-start spike, timeout, 5xx…) is therefore a failure even
+ *    when laya answered: the result stays ok:false and the caller fails open
+ *    (ADR 0018). `layaResult` still carries the comparison answers so the
+ *    caller can log the laya verdict rows;
  *  - laya not running = a refused connection in milliseconds — the switch
  *    can stay on unconditionally.
  *
@@ -41,8 +44,9 @@ export interface JevDualArgs extends Omit<JevAskArgs, 'config'> {
 export type JevDualSource = 'primary' | 'laya'
 
 export type JevDualResult = JevAskResult & {
-  /** Which answer DRIVES the decision. When 'laya', the calling seam must
-   *  only use RELATIVE ordering (degraded mode — see module doc). */
+  /** Which backend ANSWERED for the record: 'primary' when the primary
+   *  answered (the only case that may drive), 'laya' when it failed and the
+   *  pace-maker covered for telemetry only. */
   source: JevDualSource
   /** The pace-maker's own result when it ran (null when the switch is off),
    *  always logged by jevAsk via the overrides hook. */
@@ -61,8 +65,9 @@ export async function jevAskDual(args: JevDualArgs): Promise<JevDualResult> {
   }
   const [primary, laya] = await Promise.all([jevAsk(args as JevAskArgs), jevAsk(layaArgs)])
   if (primary.ok) return { ...primary, source: 'primary', layaResult: laya }
-  if (laya.ok) {
-    return { ok: true, answers: laya.answers, usage: laya.usage, latencyMs: laya.latencyMs, source: 'laya', layaResult: laya }
-  }
-  return { ...primary, source: 'primary', layaResult: laya }
+  // REVISED 09-27 (real-data evidence: within-batch top-1 agreement 0/14):
+  // a primary failure is a FAILURE even when the pace-maker answered — laya
+  // is telemetry-only. The caller fails open (ADR 0018); layaResult carries
+  // the comparison answers so the caller can still log laya verdict rows.
+  return { ok: false, outcome: primary.outcome, message: primary.message, latencyMs: primary.latencyMs, source: 'laya', layaResult: laya }
 }

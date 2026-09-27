@@ -71,7 +71,7 @@ key 传递：dsh 清洗 ambient `KEY|PASSWORD|SECRET|TOKEN` 变量——key 必�
 
 ### 3.4 本地 laya 陪跑（09-27 追加，默认关）
 
-`jevLayaFallback: true` 时每次 jev 调用并发一路本地 laya-serve 请求（`jevLayaUrl`，默认 `http://127.0.0.1:8000/v1/systemone`）：主路 ok 则 laya 结果仅作对照落账；主路失败则 laya 答案**降级接管**——重排缝只借相对排序出 picks（laya 绝对分数过不了 jev 校准阈值），影子对账的 laya 行标 `degraded` 且不计入 ECE。整理前置不陪跑（laya 误否决 = 错杀真实整理）。laya 没运行 = 毫秒级连接拒绝，故无独立开关；verdict 行新增 `backend`/`degraded` 两列。动机：4-way 基准实测两家托管源均有 ~6s 冷启动刺峰（zen 6.3s / typesafe 5.8s），3s 超时会让每个 session 首批判定固定 fail-open——陪跑让该批次不再作废。
+`jevLayaFallback: true` 时每次 jev 调用并发一路本地 laya-serve 请求（`jevLayaUrl`，默认 `http://127.0.0.1:8000/v1/systemone`）：主路 ok 则 laya 结果仅作对照落账；**主路失败照旧 fail-open 回退旧路径——laya 是纯遥测，不接管**。修订依据（09-27 真机 8 条真实 query、100 对同题判定）：laya 批内 top-1 与主路一致率 **0/14**、负例分 0.63-0.76 全挤高带、0.5 线方向一致率仅 17%——初版「降级接管」设计被实测推翻，陪跑的价值 = 永久运行的 laya-vs-jev 同题对照数据。整理前置不陪跑；verdict 行新增 `backend`/`degraded` 两列（laya 行不计入 ECE）。动机：4-way 基准实测两家托管源均有 ~6s 冷启动刺峰（zen 6.3s / typesafe 5.8s），3s 超时会让每个 session 首批判定固定 fail-open——陪跑保证该批次即使作废也有 laya 对照数据落账。
 
 ## 4. 配置面（四处接线：TopicsConfig / CONFIG_KEYS / parseConfigValue / DEFAULTS；全 volatile；键族名 09-26 用户定 `jev*`——原 decision* 有歧义已废）
 

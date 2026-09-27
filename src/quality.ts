@@ -126,6 +126,38 @@ function noulProbability(answer: unknown): number | undefined {
   return typeof p === 'number' && Number.isFinite(p) && p >= 0 && p <= 1 ? p : undefined
 }
 
+/** Pace-maker comparison rows for the slow rerank (design §3.4, REVISED
+ *  09-27): laya is TELEMETRY ONLY, so its rows are recorded band='record'
+ *  (its absolute scores never claim adopt) and degraded=false whether or not
+ *  the primary answered — landing them costs no behavior. An unparseable
+ *  answer gets no fabricated row. */
+function layaRerankRows(
+  at: string,
+  state: string,
+  metas: { qid: string; slug: string; instructions: string }[],
+  answers: Record<string, unknown> | undefined,
+): JevVerdictRecord[] {
+  const recs: JevVerdictRecord[] = []
+  for (const m of metas) {
+    const probability = noulProbability(answers?.[m.qid])
+    if (probability === undefined) continue
+    recs.push({
+      at,
+      lane: 'slowlane-rerank',
+      questionId: m.qid,
+      qtype: 'noul',
+      ref: `slug:${m.slug}`,
+      digest: digestFor(state, m.qid, m.instructions),
+      probability,
+      band: 'record',
+      agree: 'n/a',
+      backend: 'laya',
+      degraded: false,
+    })
+  }
+  return recs
+}
+
 /** The config slice jevAsk needs, tolerating bare harnesses (§4: consumers
  *  treat undefined as the documented default). */
 function jevConfigOf(cfg: TopicsConfigValue): JevDualConfig {
@@ -332,14 +364,12 @@ export class SlowLane {
     })
     const at = new Date().toISOString()
     // Verdict rows for BOTH sources when they answered: the primary row set
-    // (backend omitted = 'primary') and the laya pace-maker comparison set
-    // (backend='laya', degraded — excluded from ECE, §6.2). On a primary
-    // failure with a live pace-maker the laya set IS the recorded verdict.
+    // and the laya pace-maker comparison set (backend='laya', excluded from
+    // ECE, §6.2). Pure shadow — nothing gates here, so the laya rows land
+    // whenever laya answered, primary success or not.
     const sources: { answers: Record<string, unknown> | undefined; backend: string; degraded: boolean }[] = []
-    if (dual.ok) sources.push({ answers: dual.answers, backend: dual.source, degraded: dual.source === 'laya' })
-    if (dual.layaResult?.ok && dual.source === 'primary') {
-      sources.push({ answers: dual.layaResult.answers, backend: 'laya', degraded: false })
-    }
+    if (dual.ok) sources.push({ answers: dual.answers, backend: 'primary', degraded: false })
+    if (dual.layaResult?.ok) sources.push({ answers: dual.layaResult.answers, backend: 'laya', degraded: false })
     const recs: JevVerdictRecord[] = []
     for (const src of sources) {
       for (const m of metas) {
@@ -570,19 +600,24 @@ export class SlowLane {
       // stat. Fail-open occurrence = outcome !== 'ok' (this lane's fallback
       // to the legacy LLM rerank is deterministic per ADR 0018).
     })
-    // Degraded mode (design §3.4): the primary failed but the laya
-    // pace-maker answered — its ABSOLUTE scores must never meet the jev
-    // thresholds (its negatives sit in the same band as its positives), so
-    // this branch borrows only the RELATIVE ranking for the top-2 picks and
-    // flags every row degraded. A laya answer that fails to parse at all
-    // still falls open to the legacy LLM rerank below.
-    const degraded = dual.source === 'laya'
-    if (!dual.ok) return undefined
+    // REVISED 09-27 (real-data evidence): the laya pace-maker is TELEMETRY
+    // ONLY. Its within-batch top-1 agreed with the primary 0/14 on real
+    // queries (and its negatives sit at 0.63-0.76 — absolute scores unusable),
+    // so the earlier degraded-ranking takeover is REVERTED: on primary
+    // failure the lane falls open to the legacy LLM rerank exactly as
+    // ADR 0018 says. The pace-maker still answers, so its comparison rows
+    // land FIRST here (pure telemetry), then the legacy rerank takes over.
+    if (!dual.ok) {
+      if (dual.layaResult?.ok) {
+        await logVerdicts(layaRerankRows(new Date().toISOString(), state, metas, dual.layaResult.answers))
+      }
+      return undefined
+    }
     const scored: { qid: string; slug: string; instructions: string; probability: number; band: JevBand }[] = []
     for (const m of metas) {
       const probability = noulProbability(dual.answers[m.qid])
       if (probability === undefined) return undefined // 坏答案 → fail-open (§1)
-      scored.push({ ...m, probability, band: degraded ? 'record' : jevBand(probability, 'rerank') })
+      scored.push({ ...m, probability, band: jevBand(probability, 'rerank') })
     }
     const at = new Date().toISOString()
     const recs: JevVerdictRecord[] = scored.map((m) => ({
@@ -596,37 +631,19 @@ export class SlowLane {
       band: m.band,
       agree: 'n/a' as const,
       backend: dual.source,
-      degraded,
+      degraded: false,
     }))
     // Pace-maker comparison rows (design §3.4): when the primary drove and
     // laya also answered, log laya's verdicts alongside — the permanently
     // running laya-vs-jev comparison. band='record': laya's absolute scores
     // never claim adopt.
-    if (dual.source === 'primary' && dual.layaResult?.ok) {
-      for (const m of metas) {
-        const probability = noulProbability(dual.layaResult.answers[m.qid])
-        if (probability === undefined) continue
-        recs.push({
-          at,
-          lane: 'slowlane-rerank',
-          questionId: m.qid,
-          qtype: 'noul',
-          ref: `slug:${m.slug}`,
-          digest: digestFor(state, m.qid, m.instructions),
-          probability,
-          band: 'record',
-          agree: 'n/a',
-          backend: 'laya',
-          degraded: false,
-        })
-      }
-    }
+    if (dual.layaResult?.ok) recs.push(...layaRerankRows(at, state, metas, dual.layaResult.answers))
     await logVerdicts(recs)
     return scored
-      .filter((m) => degraded || m.band === 'adopt')
+      .filter((m) => m.band === 'adopt')
       .sort((a, b) => b.probability - a.probability)
       .slice(0, 2)
-      .map((m) => ({ slug: m.slug, why: degraded ? `laya 降级排序（p=${m.probability.toFixed(2)}）` : `jev 判定相关（p=${m.probability.toFixed(2)}）` }))
+      .map((m) => ({ slug: m.slug, why: `jev 判定相关（p=${m.probability.toFixed(2)}）` }))
   }
 
   /**
