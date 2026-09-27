@@ -94,6 +94,8 @@ Adopt / record / fallback bands (calibrated offline on a 383-case gold corpus; t
 | Consolidation prefilter | The cluster goes to the LLM in full, exactly as today | none |
 | Fast-lane shadow | Records the outcome only; zero behavior impact | none |
 
+**Setting up laya**: the bundled skill `dsh-topics-memory-laya` walks through install (venv, mirror acceleration for CN networks, checkpoint download), starting laya-serve, wiring `jevLayaFallback`, and verifying via decisions.jsonl. Ask the agent about laya, or read `skills/dsh-topics-memory-laya/SKILL.md` directly.
+
 **Local laya pace-maker (experimental, off by default).** With `jevLayaFallback: true` and a local [laya](https://github.com/NandhaKishorM/laya) serve running, every jev call fires a parallel local laya request: the primary answer drives the decision, and the laya answer is logged alongside it — a permanently running laya-vs-jev comparison on identical questions. laya is TELEMETRY ONLY: on real queries its within-batch ranking agreed with the primary 0/14 and its negative scores sit at 0.63-0.76 (absolute scores unusable), so a primary failure falls open to the legacy path exactly as without the pace-maker — the comparison rows are the value, not a degraded takeover. The consolidation prefilter deliberately does not ride the pace-maker. laya not running costs a refused connection in milliseconds.
 
 Every call and verdict lands in `~/.dsh/topics/meta/decisions.jsonl` — local-only and redacted: slugs, pair hashes, question types, probabilities, latency and token counts; never conversation text or conclusion bodies. It has no config key (it stops together with `jevEnabled: false`); `/topics status` shows a 30-day summary line.

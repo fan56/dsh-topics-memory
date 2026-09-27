@@ -62,7 +62,7 @@ test('apply registers the bundled skill provider on ctx.skills', async () => {
   assert.equal(provider.name, 'dsh-topics-memory-config')
 
   const candidates = await provider.list({})
-  assert.equal(candidates.length, 1)
+  assert.equal(candidates.length, 2, 'config + laya setup skills')
   const candidate = candidates[0]
   assert.equal(candidate.name, 'dsh-topics-memory-config')
   assert.equal(candidate.provider, 'dsh-topics-memory-config')
@@ -76,6 +76,19 @@ test('apply registers the bundled skill provider on ctx.skills', async () => {
   // The directory resource base must point at the packaged skills/ directory
   // (fileURLToPath keeps the trailing slash of the URL path).
   assert.equal(candidate.resourceBase.kind, 'directory')
+  // The laya setup skill rides the same provider as a second candidate.
+  const laya = candidates[1]
+  assert.equal(laya.name, 'dsh-topics-memory-laya')
+  assert.equal(laya.provider, 'dsh-topics-memory-config')
+  assert.ok(laya.description.length > 0 && laya.description.length <= 500, 'laya description within the 500-char routing budget')
+  assert.equal(laya.resourceBase.kind, 'directory')
+  assert.ok(
+    laya.resourceBase.path.replace(/\/$/, '').endsWith('skills/dsh-topics-memory-laya'),
+  )
+  const layaDef = await provider.get(laya)
+  assert.match(layaDef.content, /jevLayaFallback/)
+  assert.match(layaDef.content, /HF_HUB_DISABLE_XET/)
+  assert.ok(!layaDef.content.startsWith('---'), 'frontmatter stripped from the laya body')
   assert.ok(
     candidate.resourceBase.path.replace(/\/$/, '').endsWith('skills/dsh-topics-memory-config'),
     `unexpected resourceBase path: ${candidate.resourceBase.path}`,

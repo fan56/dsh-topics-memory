@@ -288,13 +288,18 @@ interface UserMessageData {
 /** Provider name under `ctx.skills`; doubles as the skill name. */
 const SKILL_PROVIDER_NAME = 'dsh-topics-memory-config'
 
-/** Packaged skill body; `../skills/` resolves to the package root from both lib/ and src/. */
+/** Packaged skill bodies; `../skills/` resolves to the package root from both lib/ and src/. */
 const SKILL_BODY_URL = new URL('../skills/dsh-topics-memory-config/SKILL.md', import.meta.url)
+const LAYA_SKILL_BODY_URL = new URL('../skills/dsh-topics-memory-laya/SKILL.md', import.meta.url)
 
-/** Resource base served with the skill so its relative links resolve. */
+/** Resource bases served with the skills so their relative links resolve. */
 const SKILL_RESOURCE_BASE = {
   kind: 'directory',
   path: fileURLToPath(new URL('../skills/dsh-topics-memory-config/', import.meta.url)),
+} as const
+const LAYA_SKILL_RESOURCE_BASE = {
+  kind: 'directory',
+  path: fileURLToPath(new URL('../skills/dsh-topics-memory-laya/', import.meta.url)),
 } as const
 
 const SKILL_INVOCATION = { modelInvocable: true, userInvocable: true } as const
@@ -313,18 +318,36 @@ const SKILL_CANDIDATE: SkillCandidate = {
   locator: SKILL_BODY_URL,
 }
 
+/** The laya setup skill rides the same provider: installing/configuring the
+ *  local pace-maker is part of operating this plugin's decision layer. */
+const LAYA_SKILL_NAME = 'dsh-topics-memory-laya'
+const LAYA_SKILL_DESCRIPTION = '为 dsh-topics-memory 的 jev 决策层安装并配置本地 laya 陪跑（laya-serve）。当用户要开启 jevLayaFallback、安装 laya、启动 laya-serve、配置 laya 端点、排查陪跑不生效或 decisions.jsonl 没有 laya 行时读本指南：venv 创建、国内三镜像加速（清华 PyPI / hf-mirror / 禁 Xet）、checkpoint 下载、laya-serve 启动、jevLayaFallback/jevLayaUrl 两键、真机验证（decisions.jsonl 出现 backend=laya 行）。触发词：laya、laya-serve、陪跑、本地决策、jevLaya、离线、8000 端口。'
+const LAYA_SKILL_CANDIDATE: SkillCandidate = {
+  name: LAYA_SKILL_NAME,
+  description: LAYA_SKILL_DESCRIPTION,
+  invocation: SKILL_INVOCATION,
+  provider: SKILL_PROVIDER_NAME,
+  source: 'bundled',
+  resourceBase: LAYA_SKILL_RESOURCE_BASE,
+  rank: BUNDLED_SKILL_RANK,
+  locator: LAYA_SKILL_BODY_URL,
+}
+
 const skillProvider: SkillProvider = {
   name: SKILL_PROVIDER_NAME,
-  list: () => Promise.resolve([SKILL_CANDIDATE]),
-  async get(_candidate): Promise<SkillDefinition> {
+  list: () => Promise.resolve([SKILL_CANDIDATE, LAYA_SKILL_CANDIDATE]),
+  async get(candidate): Promise<SkillDefinition> {
+    const isLaya = candidate.name === LAYA_SKILL_NAME
+    const bodyUrl = isLaya ? LAYA_SKILL_BODY_URL : SKILL_BODY_URL
+    const resourceBase = isLaya ? LAYA_SKILL_RESOURCE_BASE : SKILL_RESOURCE_BASE
     return {
-      name: SKILL_CANDIDATE.name,
-      description: SKILL_CANDIDATE.description,
-      invocation: SKILL_CANDIDATE.invocation,
-      provider: SKILL_CANDIDATE.provider,
-      source: SKILL_CANDIDATE.source,
-      resourceBase: SKILL_RESOURCE_BASE,
-      content: stripFrontmatter(await readFile(SKILL_BODY_URL, 'utf8')),
+      name: candidate.name,
+      description: candidate.description,
+      invocation: candidate.invocation,
+      provider: SKILL_PROVIDER_NAME,
+      source: candidate.source,
+      resourceBase,
+      content: stripFrontmatter(await readFile(bodyUrl, 'utf8')),
     }
   },
 }
