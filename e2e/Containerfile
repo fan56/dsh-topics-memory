@@ -13,13 +13,13 @@ ARG NODE_VERSION=22.23.2
 # --build-arg NODE_DIST_BASE=https://nodejs.org/dist
 ARG NODE_DIST_BASE=https://npmmirror.com/mirrors/node
 ARG PNPM_VERSION=10.33.0
-# The dsh CLI version is resolved at build time from the npm registry's
-# latest tag when not provided (no hand-pinned rc — the rc.8 lesson).
-# dsh version: pinned to 0.1.7-rc.1 — the line this repo's peerDependencies
-# target and the fixtures were validated against. NEVER resolve this bare:
-# `latest` is a vendor placeholder (moved 0.0.1-rc.3 → 0.1.5-rc.3, breaking
-# schemastery .volatile()) and rc.2 tightened replay fixture validation.
-# Bump deliberately with the next rc wave.
+# The dsh CLI version is normally passed by e2e/run-e2e.sh, which resolves
+# the newest of the `latest` (stable) and `next` (rc) dist-tags — the same
+# rule as ci.yml / release.yml and the dsh-cron/dsh-tui-pi runners. The
+# 0.1.7-rc.1 default below is only a bare-`podman build` fallback of last
+# resort: `latest` alone must not be resolved bare (vendor placeholder
+# history: 0.0.1-rc.3 → 0.1.5-rc.3 once broke schemastery .volatile()).
+# Bump the default deliberately with each rc wave.
 ARG DSH_VERSION=
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -44,12 +44,15 @@ RUN case "$(uname -m)" in \
 
 # pnpm + the dsh CLI (version resolved from the registry when the ARG is
 # empty). The global dsh install is what the scenarios boot against.
+# NB: the version print is cosmetic, but the install chain must hard-fail —
+# `... && dsh --version || true` masks the WHOLE chain (operator
+# precedence), silently committing dsh-less images (the 09-29 lesson).
 RUN DSH_VER="${DSH_VERSION:-$(echo 0.1.7-rc.1)}" \
  && echo "installing @deepseek-ai/dsh@${DSH_VER}" \
  && npm install -g --no-fund --no-audit \
       pnpm@${PNPM_VERSION} \
       "@deepseek-ai/dsh@${DSH_VER}" \
- && dsh --version || true
+ && (dsh --version || true)
 
 # Scenarios pin companion @deepseek-ai packages (dsh-headless, dsh-llm-replay)
 # to the SAME closure as the global CLI — their bare latest tags can point at
