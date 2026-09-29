@@ -2,6 +2,14 @@
 
 ## Unreleased（dsh 0.1.7-rc.1 迁移；随 wave 统一发版，不单独 tag）
 
+### dsh 0.2.0-rc.2（0.2.0 迁移波叠加，同随 wave 发版）
+
+raise dsh host floor to 0.2.0-rc.2（peer floors：dsh-tools / dsh-llm / dsh-settings / dsh-skill / dsh-commands / dsh-util-values `>=0.1.7-rc.1` → `>=0.2.0-rc.2`；devDeps 闭包十六包同步钉 0.2.0-rc.2；`package-lock.json` 同步重生成，`npm ci` 兼容）。
+
+- **cordis devDep 4.0.2 → 4.0.4（逼升）**：0.2.0-rc.2 全系 dsh 包 peer 声明 `~4.0.4`，4.0.2 满足不了（0.1.7 波 dsh-llm-net-retry 同款随动）；peer `^4.0.2` 上限不变仍兼容。schemastery 3.18.4 维持。
+- **`@deepseek-ai/dsh-sandbox` 钉保留并抬 0.2.0-rc.2（未按拍板删除）**：审计「src 零 import = 未用钉」的判定在 install-graph 层不成立——`dsh-tools@0.2.0-rc.2` 把 dsh-sandbox 声明为 peerDependency 且 `lib/index.js` 顶部无条件 `import { ESCALATION_TARGETS, … } from "@deepseek-ai/dsh-sandbox"`；本仓 `.npmrc` 明确 `auto-install-peers=false`（@deepseek-ai 靠 devDeps 手钉、pnpm 不自动装 peer 的仓规，同 dsh-vault / dsh-model-sync）。实测删钉后所有 import dsh-tools 的测试文件加载期 `ERR_MODULE_NOT_FOUND`（409 例全灭）；恢复钉即全绿。这正是 0.1.7 波加钉的原因（当时 CHANGELOG：「dsh-tools 0.1.7-rc.1 的模块图硬引入」）。
+- **测试**：409 例，408 过 / 0 红 / 1 skip（既有本地语料跳过：无 `~/.dsh/sessions` corpus）；真机 smoke 于 0.2.0-rc.2 宿主 scratch profile 装载/移除全通过。
+
 dsh 支持下限抬到 `>= 0.1.7-rc.1`（peer floors：dsh-tools / dsh-llm / dsh-settings / dsh-skill / dsh-commands / dsh-util-values；devDeps 闭包同步钉 0.1.7-rc.1，README 同步）。
 
 - **启动事件单监听**：0.1.7 的 creation transaction 只发一次串行 `agent/created`（payload `{ agent, source: 'startup'|'resume'|'clear'|'compact', signal? }`），`agent/session-start` 已删除且无 shim——0.16.1 的双名注册与 per-session 去重 Set 一并拆除（registry 保证每 entry 恰好一次 announce，`/clear`、compaction 重建的新 entry 合法地重跑启动链；teardown 无需再重新武装）。插件逻辑不依赖旧 source 语义，新枚举天然对齐。
