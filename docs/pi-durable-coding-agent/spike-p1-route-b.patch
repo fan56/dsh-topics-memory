@@ -1,0 +1,742 @@
+From 8cab8da33d8110289751a1410a77886cf3857937 Mon Sep 17 00:00:00 2001
+From: fliu56 <fan.liu@volvocars.com>
+Date: Thu, 8 Oct 2026 16:21:42 +0800
+Subject: [PATCH 1/3] feat(spike): durable AgentSession facade
+
+Wrap a real AgentSession (in-memory SessionManager, engine never runs) in a
+Proxy that reroutes prompt/steer/followUp/abort/compact/model mutation to the
+durable root Conversation, and feed watchEvents batches through the parent
+_handleAgentEvent so persistence, extensions, and TUI events run the
+production path. Wayfinder ticket 006, route B.
+---
+ .../durable-p1/durable-agent-session.ts       | 328 ++++++++++++++++++
+ .../experimental/durable-p1/event-adapter.ts  | 210 +++++++++++
+ .../durable-p1/session-location.ts            |  58 ++++
+ 3 files changed, 596 insertions(+)
+ create mode 100644 packages/coding-agent/src/experimental/durable-p1/durable-agent-session.ts
+ create mode 100644 packages/coding-agent/src/experimental/durable-p1/event-adapter.ts
+ create mode 100644 packages/coding-agent/src/experimental/durable-p1/session-location.ts
+
+diff --git a/packages/coding-agent/src/experimental/durable-p1/durable-agent-session.ts b/packages/coding-agent/src/experimental/durable-p1/durable-agent-session.ts
+new file mode 100644
+index 000000000..65847bb14
+--- /dev/null
++++ b/packages/coding-agent/src/experimental/durable-p1/durable-agent-session.ts
+@@ -0,0 +1,328 @@
++// durable-p1 spike (wayfinder ticket 006, route B): the stable interactive-mode
++// TUI running on the durable Harness. This facade wraps a REAL AgentSession
++// (built with an in-memory SessionManager, real services, and the pi default
++// model, but an engine that never runs) in a Proxy that reroutes the turn
++// surface — prompt/steer/followUp/abort/compact/model mutation — to the durable
++// root Conversation, and feeds durable watchEvents through the parent's own
++// `_handleAgentEvent` so persistence-to-memory, extension dispatch, and the
++// AgentSessionEvent fan-out to the TUI all run the production code path.
++
++import { BACKGROUND_CONTEXT } from "@earendil-works/chord/context";
++import type { AgentEvent, ThinkingLevel } from "@earendil-works/pi-agent-core";
++import type { Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
++import { clampThinkingLevel } from "@earendil-works/pi-ai";
++import type { Conversation, ModelRef } from "@earendil-works/pi-durable";
++import { Harness, watchEvents } from "@earendil-works/pi-durable";
++import { openNodeSqliteStorage } from "@earendil-works/pi-durable/storage/sqlite/node";
++import type {
++	AgentSession,
++	AgentSessionEvent,
++	ModelMutationOptions,
++	PromptOptions,
++	QueuedInputDisposition,
++} from "../../core/agent-session.ts";
++import {
++	type AgentSessionServices,
++	createAgentSessionFromServices,
++	createAgentSessionServices,
++} from "../../core/agent-session-services.ts";
++import type { CompactionResult } from "../../core/compaction/compaction.ts";
++import { SessionManager } from "../../core/session-manager.ts";
++import { sleep } from "../../utils/sleep.ts";
++import {
++	configureHarnessHttp,
++	createCodingRegistry,
++	createHarnessSettings,
++	ExecutionEnvs,
++	findInitialAgentModel,
++} from "../durable/harness-setup.ts";
++import { Subagent } from "../durable/subagent.ts";
++import { DurableEventAdapter } from "./event-adapter.ts";
++import { selectP1Session } from "./session-location.ts";
++
++/** Private AgentSession members the facade drives directly. */
++type SessionInternals = {
++	_handleAgentEvent: (event: AgentEvent) => Promise<void>;
++	_emit: (event: AgentSessionEvent) => void;
++	_steeringMessages: string[];
++	_followUpMessages: string[];
++	_emitQueueUpdate: () => void;
++};
++
++export interface DurableP1Session {
++	session: AgentSession;
++	services: AgentSessionServices;
++	modelFallbackMessage: string | undefined;
++	/** A factory that throws: /new, /resume, /fork, and import are out of scope. */
++	throwingRuntimeFactory: () => Promise<never>;
++	close(): Promise<void>;
++}
++
++export async function createDurableP1Session(continueSession: boolean): Promise<DurableP1Session> {
++	const context = BACKGROUND_CONTEXT;
++	const location = await selectP1Session(process.cwd(), continueSession);
++	let closed = false;
++	let target: AgentSession | undefined;
++	let harnessClose: (() => Promise<void>) | undefined;
++	let envsCleanup: (() => Promise<void>) | undefined;
++	try {
++		// The TUI-facing half: real services (settings, models, extensions, themes)
++		// and a real AgentSession whose in-process agent is never prompted.
++		const services = await createAgentSessionServices({ cwd: location.cwd });
++		const initial = await findInitialAgentModel(services.settingsManager, services.modelRuntime);
++		const model =
++			initial.model === undefined
++				? undefined
++				: services.modelRuntime.getModel(initial.model.provider, initial.model.modelId);
++		const created = await createAgentSessionFromServices({
++			services,
++			sessionManager: SessionManager.inMemory(location.cwd),
++			model,
++			thinkingLevel: initial.thinkingLevel as ThinkingLevel | undefined,
++		});
++		target = created.session;
++		const internals = target as unknown as SessionInternals;
++
++		// The engine half: the durable Harness with pi's coding tools and prompt.
++		const envs = new ExecutionEnvs(location.cwd);
++		envsCleanup = () => envs.cleanup(context);
++		configureHarnessHttp(services.settingsManager);
++		const registry = createCodingRegistry(services.settingsManager, location.cwd);
++		registry.install(Subagent);
++		const harness: Harness = await Harness.open(
++			await openNodeSqliteStorage(location.database),
++			{
++				models: services.modelRuntime,
++				registry,
++				settings: createHarnessSettings(services.settingsManager),
++				env: envs.env,
++				onReport: (error) => console.error("[durable-p1] harness:", error),
++			},
++			context,
++		);
++		harnessClose = () => harness.close(context);
++		const root: Conversation = await harness.root(context, {
++			agent: {
++				cwd: location.cwd,
++				...(initial.model === undefined ? {} : { model: initial.model }),
++				...(initial.thinkingLevel === undefined ? {} : { thinkingLevel: initial.thinkingLevel }),
++			},
++		});
++
++		// Facade state the overrides below share with the event ingest path.
++		let running = false;
++		let compacting = false;
++		let abortRequested = false;
++		let runStarts = 0;
++		const adapter = new DurableEventAdapter();
++		let chain: Promise<void> = Promise.resolve();
++		const stream = await watchEvents(harness, root.id, context);
++		stream.start((events, deliveryContext) => {
++			// Batches must be handled strictly in order; _handleAgentEvent awaits
++			// extension listeners, so a shared promise chain keeps them sequential.
++			const run = chain.then(async () => {
++				if (closed) return;
++				if (events.some((event) => event.type === "run_start")) {
++					running = true;
++					runStarts++;
++				}
++				const translated = adapter.translate(events);
++				for (const event of translated) await internals._handleAgentEvent(event);
++				if (translated.some((event) => event.type === "agent_end")) {
++					running = false;
++					internals._emit({ type: "agent_settled", aborted: abortRequested });
++					abortRequested = false;
++				}
++				// Retry and compaction events are AgentSessionEvent-only: the session
++				// layer owns them, so emit them straight to the listeners.
++				const retrySettings = services.settingsManager.getRetrySettings();
++				for (const event of events) {
++					if (event.type === "auto_retry_start") {
++						internals._emit({
++							type: "auto_retry_start",
++							attempt: event.attempt,
++							maxAttempts: retrySettings.maxRetries,
++							delayMs: Math.max(0, event.at - Date.now()),
++							errorMessage: event.errorMessage,
++						});
++					} else if (event.type === "auto_retry_end") {
++						internals._emit({ type: "auto_retry_end", success: true, attempt: event.attempt });
++					} else if (event.type === "compaction_start") {
++						internals._emit({ type: "compaction_start", reason: event.reason });
++					} else if (event.type === "compaction_end") {
++						// A real result would make the TUI rebuild from a session-manager
++						// compaction entry this facade never writes; keep it resultless.
++						internals._emit({
++							type: "compaction_end",
++							reason: event.reason,
++							result: undefined,
++							aborted: false,
++							willRetry: false,
++						});
++					}
++				}
++				void deliveryContext;
++			});
++			chain = run.catch((error) => console.error("[durable-p1] event ingestion failed:", error));
++			return chain;
++		});
++
++		const queueInput = async (text: string, behavior: "steer" | "followUp"): Promise<void> => {
++			// The parent's queue display: durable delivers the input as a user entry,
++			// whose message_start de-queues it again in _handleAgentEvent.
++			(behavior === "followUp" ? internals._followUpMessages : internals._steeringMessages).push(text);
++			internals._emitQueueUpdate();
++			const submission = await root.submit({ type: "input", content: text, whenBusy: behavior }, context);
++			await submission.wait(context);
++		};
++		const submitIdle = async (text: string): Promise<void> => {
++			running = true;
++			abortRequested = false;
++			const before = runStarts;
++			const submission = await root.submit({ type: "input", content: text, whenBusy: "steer" }, context);
++			await submission.wait(context);
++			// If no run ever started (input dropped before a run began), clear the busy
++			// flag here; otherwise the agent_end translation clears it.
++			if (runStarts === before) {
++				await sleep(200);
++				if (runStarts === before) running = false;
++			}
++		};
++
++		const session = target;
++		const overrides: Record<string, unknown> = {
++			prompt: async (text: string, options?: PromptOptions): Promise<void> => {
++				if (options?.images !== undefined && options.images.length > 0) {
++					throw new Error("durable-p1: images are not supported in this spike");
++				}
++				if (compacting) {
++					throw new Error(
++						"Cannot submit a prompt while compaction is in progress. Wait for compaction to finish and retry.",
++					);
++				}
++				if (running) {
++					if (options?.streamingBehavior === undefined) {
++						throw new Error(
++							"Agent is already processing. Specify streamingBehavior ('steer' or 'followUp') to queue the message.",
++						);
++					}
++					await queueInput(text, options.streamingBehavior);
++					return;
++				}
++				await submitIdle(text);
++			},
++			steer: async (text: string): Promise<QueuedInputDisposition> => {
++				if (running) await queueInput(text, "steer");
++				else await submitIdle(text);
++				return "queued";
++			},
++			followUp: async (text: string): Promise<QueuedInputDisposition> => {
++				if (running) await queueInput(text, "followUp");
++				else await submitIdle(text);
++				return "queued";
++			},
++			abort: async (): Promise<void> => {
++				if (!running && !compacting) return;
++				abortRequested = true;
++				await root.abort(context);
++			},
++			abortCompaction: (): void => {
++				// root.abort stops a conversation's work, manual compaction included.
++				void root.abort(context);
++			},
++			compact: async (customInstructions?: string): Promise<CompactionResult> => {
++				compacting = true;
++				try {
++					const taskId = await root.compact(customInstructions, context);
++					const receipt = await harness.waitForTask(taskId, context);
++					const outcome = receipt.state.outcome;
++					if (outcome.status === "aborted") throw new Error("Compaction cancelled");
++					if (outcome.status !== "completed") {
++						throw new Error(`durable-p1: compaction ${outcome.status}`);
++					}
++					return {
++						summary: "(durable compaction summary; chat re-render not wired in this spike)",
++						firstKeptEntryId: "",
++						tokensBefore: 0,
++					};
++				} finally {
++					compacting = false;
++				}
++			},
++			setModel: async (model: Model<never>, options?: ModelMutationOptions): Promise<void> => {
++				await session.setModel(model, options);
++				const thinking = (session.thinkingLevel ?? "off") as ModelThinkingLevel;
++				const ref: ModelRef = { provider: model.provider, modelId: model.id };
++				await root.configure({ model: ref, thinkingLevel: clampThinkingLevel(model, thinking) }, context);
++			},
++			setThinkingLevel: (level: ThinkingLevel, options?: ModelMutationOptions): void => {
++				session.setThinkingLevel(level, options);
++				void root.configure({ thinkingLevel: level as ModelThinkingLevel }, context).catch(() => {});
++			},
++			cycleThinkingLevel: (options?: ModelMutationOptions): ThinkingLevel | undefined => {
++				const level = session.cycleThinkingLevel(options);
++				if (level !== undefined) {
++					void root.configure({ thinkingLevel: level as ModelThinkingLevel }, context).catch(() => {});
++				}
++				return level;
++			},
++			waitForIdle: async (): Promise<void> => {
++				while (running || compacting) await sleep(100);
++			},
++			dispose: (): void => {
++				session.dispose();
++				void closeDurable();
++			},
++		};
++		const proxy = new Proxy(session, {
++			get: (t, prop) => {
++				if (prop === "isStreaming") return running;
++				if (prop === "isIdle") return !running && !compacting && t.isIdle;
++				if (prop === "isCompacting") return compacting || t.isCompacting;
++				if (prop in overrides) return overrides[prop as string];
++				const value = Reflect.get(t, prop, t);
++				return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(t) : value;
++			},
++		}) as unknown as AgentSession;
++
++		async function closeDurable(): Promise<void> {
++			if (closed) return;
++			closed = true;
++			for (const step of [
++				() => stream.stop(),
++				() => harness.close(context),
++				() => envs.cleanup(context),
++				() => location.release(),
++			]) {
++				try {
++					await step();
++				} catch (error) {
++					console.error("[durable-p1] close step failed:", error);
++				}
++			}
++		}
++
++		// Recovered work from an interrupted turn continues now.
++		harness.resume();
++		const throwingRuntimeFactory = async (): Promise<never> => {
++			throw new Error("durable-p1: /new, /resume, /fork, and import are not supported in this spike");
++		};
++		return {
++			session: proxy,
++			services,
++			modelFallbackMessage: initial.fallbackMessage,
++			throwingRuntimeFactory,
++			close: closeDurable,
++		};
++	} catch (error) {
++		// Best-effort teardown: a later step may have failed after the harness opened.
++		if (!closed) {
++			closed = true;
++			await target?.dispose();
++			await envsCleanup?.().catch(() => {});
++			await harnessClose?.().catch(() => {});
++			await location.release().catch(() => {});
++		}
++		throw error;
++	}
++}
+diff --git a/packages/coding-agent/src/experimental/durable-p1/event-adapter.ts b/packages/coding-agent/src/experimental/durable-p1/event-adapter.ts
+new file mode 100644
+index 000000000..318bb21b4
+--- /dev/null
++++ b/packages/coding-agent/src/experimental/durable-p1/event-adapter.ts
+@@ -0,0 +1,210 @@
++// durable-p1 spike: translates the durable agent event stream (packages/durable
++// src/harness/events.ts, spec §9.4) into pi-agent-core AgentEvents that
++// AgentSession._handleAgentEvent and the interactive TUI already understand.
++
++import type { AgentEvent, AgentMessage } from "@earendil-works/pi-agent-core";
++import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
++import type { ToolResultMessage } from "@earendil-works/pi-ai/compat";
++import type { AgentEvent as DurableEvent, EntryRecord, JsonObject, MessageChange } from "@earendil-works/pi-durable";
++
++type ContentBlock = AssistantMessage["content"][number];
++
++/** Translate one batch of durable events; stateful across batches of a run. */
++export class DurableEventAdapter {
++	private partial: AssistantMessage | undefined;
++	private readonly toolArgs = new Map<string, JsonObject>();
++	private readonly toolOutput = new Map<string, string>();
++	private runMessages: AgentMessage[] = [];
++	private turnMessage: AgentMessage | undefined;
++	private turnToolResults: ToolResultMessage[] = [];
++
++	/** Reset per-run tracking. Call when a run starts. */
++	startRun(): void {
++		this.runMessages = [];
++	}
++
++	translate(batch: readonly DurableEvent[]): AgentEvent[] {
++		const out: AgentEvent[] = [];
++		for (const event of batch) out.push(...this.translateOne(event));
++		return out;
++	}
++
++	private translateOne(event: DurableEvent): AgentEvent[] {
++		const out: AgentEvent[] = [];
++		switch (event.type) {
++			case "snapshot":
++			case "inbox_update":
++			case "submission":
++			case "agent_changed":
++			case "usage_changed":
++			case "task_failed":
++			case "deferred_poll":
++			case "entry_appended":
++				// Structural durable state with no AgentSession counterpart in this spike.
++				break;
++			case "run_start":
++				out.push({ type: "agent_start" });
++				break;
++			case "turn_start":
++				this.turnMessage = undefined;
++				this.turnToolResults = [];
++				out.push({ type: "turn_start" });
++				break;
++			case "message_start":
++				if (event.message.role === "assistant") {
++					// Stream our own copy; message_update deltas apply to it.
++					this.partial = cloneAssistant(event.message);
++					out.push({ type: "message_start", message: this.partial });
++				} else {
++					out.push({ type: "message_start", message: event.message as AgentMessage });
++				}
++				break;
++			case "message_update":
++				if (this.partial !== undefined) {
++					this.partial.usage = event.usage;
++					for (const change of event.changes) this.applyChange(this.partial, change);
++					out.push({
++						type: "message_update",
++						message: this.partial,
++						assistantMessageEvent: { type: "start", partial: this.partial },
++					});
++				}
++				break;
++			case "message_end": {
++				const message = entryMessage(event.entry);
++				if (message === undefined) break;
++				if (message.role === "assistant") {
++					// A streamed assistant already had its message_start from the partial;
++					// durable's translate emits message_start itself for the rest.
++					if (this.partial === undefined) out.push({ type: "message_start", message });
++					this.partial = undefined;
++					this.turnMessage = message;
++				} else if (message.role === "toolResult") {
++					this.turnToolResults.push(message);
++				}
++				out.push({ type: "message_end", message });
++				this.runMessages.push(message);
++				break;
++			}
++			case "tool_execution_start":
++				this.toolArgs.set(event.toolCallId, event.args);
++				out.push({
++					type: "tool_execution_start",
++					toolCallId: event.toolCallId,
++					toolName: event.toolName,
++					args: event.args,
++				});
++				break;
++			case "tool_execution_update": {
++				if (event.output === undefined) break;
++				let buffer = this.toolOutput.get(event.toolCallId) ?? "";
++				if ("set" in event.output) buffer = event.output.set;
++				else buffer = buffer.slice(event.output.trimStart ?? 0) + (event.output.append ?? "");
++				this.toolOutput.set(event.toolCallId, buffer);
++				out.push({
++					type: "tool_execution_update",
++					toolCallId: event.toolCallId,
++					toolName: event.toolName,
++					args: this.toolArgs.get(event.toolCallId) ?? {},
++					partialResult: { content: [{ type: "text", text: buffer }] },
++				});
++				break;
++			}
++			case "tool_execution_end": {
++				const message = event.entry === undefined ? undefined : entryMessage(event.entry);
++				const result = message?.role === "toolResult" ? message : undefined;
++				this.toolArgs.delete(event.toolCallId);
++				this.toolOutput.delete(event.toolCallId);
++				out.push({
++					type: "tool_execution_end",
++					toolCallId: event.toolCallId,
++					toolName: event.toolName,
++					result: { content: result?.content ?? [{ type: "text", text: "(no result entry)" }] },
++					isError: result?.isError === true,
++				});
++				break;
++			}
++			case "turn_end":
++				if (this.turnMessage !== undefined) {
++					out.push({ type: "turn_end", message: this.turnMessage, toolResults: this.turnToolResults });
++				}
++				break;
++			case "run_end":
++				out.push({ type: "agent_end", messages: this.runMessages });
++				break;
++			// auto_retry_* and compaction_* are AgentSessionEvent-only (the session
++			// layer emits them, not the agent); the facade emits them directly.
++			case "auto_retry_start":
++			case "auto_retry_end":
++			case "compaction_start":
++			case "compaction_end":
++				break;
++		}
++		return out;
++	}
++
++	private applyChange(message: AssistantMessage, change: MessageChange): void {
++		switch (change.type) {
++			case "text_start":
++			case "thinking_start":
++			case "toolcall_start":
++			case "block":
++				message.content[change.contentIndex] = { ...change.block } as ContentBlock;
++				break;
++			case "text_delta": {
++				const block = message.content[change.contentIndex];
++				if (block?.type === "text") block.text += change.delta;
++				break;
++			}
++			case "thinking_delta": {
++				const block = message.content[change.contentIndex];
++				if (block?.type === "thinking") block.thinking += change.delta;
++				break;
++			}
++			case "toolcall_delta": {
++				const block = message.content[change.contentIndex];
++				if (block?.type === "toolCall") applyToolcallDelta(block, change.path, change.delta);
++				break;
++			}
++			case "message":
++				message.content = [...change.message.content];
++				message.usage = change.message.usage;
++				message.stopReason = change.message.stopReason;
++				break;
++		}
++	}
++}
++
++function cloneAssistant(message: Message): AssistantMessage {
++	const assistant = message as AssistantMessage;
++	return { ...assistant, content: assistant.content.map((block) => ({ ...block })) };
++}
++
++function entryMessage(entry: EntryRecord): AgentMessage | undefined {
++	const message = entry.model?.[0];
++	return message === undefined ? undefined : (message as AgentMessage);
++}
++
++/** Append a streamed argument delta: onto the JSON string, or a field of a parsed object. */
++function applyToolcallDelta(
++	block: Extract<ContentBlock, { type: "toolCall" }>,
++	path: readonly (string | number)[],
++	delta: string,
++): void {
++	// While args stream they are a JSON string; the final parsed object replaces
++	// the block later (tool_execution_start args, then message_end).
++	const holder = block as unknown as { arguments: string | JsonObject };
++	if (typeof holder.arguments === "string") {
++		if (path.length === 0) holder.arguments += delta;
++		return;
++	}
++	if (holder.arguments === null || typeof holder.arguments !== "object" || path.length === 0) return;
++	let node: Record<string | number, unknown> = holder.arguments as Record<string | number, unknown>;
++	for (let i = 0; i < path.length - 1; i++) {
++		const next = node[path[i]];
++		if (typeof next !== "object" || next === null) return;
++		node = next as Record<string | number, unknown>;
++	}
++	const last = path[path.length - 1];
++	node[last] = `${node[last] ?? ""}${delta}`;
++}
+diff --git a/packages/coding-agent/src/experimental/durable-p1/session-location.ts b/packages/coding-agent/src/experimental/durable-p1/session-location.ts
+new file mode 100644
+index 000000000..17beba15f
+--- /dev/null
++++ b/packages/coding-agent/src/experimental/durable-p1/session-location.ts
+@@ -0,0 +1,58 @@
++// durable-p1 spike: session directory under an isolated prototype-marked root.
++// Same shape as ../durable/sessions.ts, but rooted at durable-p1-sessions.
++
++import { createHash, randomUUID } from "node:crypto";
++import { mkdir, readdir, realpath } from "node:fs/promises";
++import { basename, join, resolve } from "node:path";
++import lockfile from "proper-lockfile";
++import { getAgentDir } from "../../config.ts";
++
++/** One session directory holding `session.sqlite`, locked by this process. */
++export interface P1SessionLocation {
++	id: string;
++	directory: string;
++	database: string;
++	cwd: string;
++	created: boolean;
++	release(): Promise<void>;
++}
++
++/** A new session for `cwd`, or its newest one with `continueSession`. */
++export async function selectP1Session(cwdInput: string, continueSession: boolean): Promise<P1SessionLocation> {
++	const cwd = await realpath(resolve(cwdInput));
++	const root = join(
++		getAgentDir(),
++		"experimental",
++		"durable-p1-sessions",
++		createHash("sha256").update(cwd).digest("hex").slice(0, 24),
++	);
++	await mkdir(root, { recursive: true });
++
++	let directory: string;
++	let created = false;
++	if (continueSession) {
++		const entries = await readdir(root, { withFileTypes: true });
++		const newest = entries
++			.filter((entry) => entry.isDirectory() && /^\d{13}-[0-9a-f-]{36}$/u.test(entry.name))
++			.map((entry) => entry.name)
++			.sort()
++			.at(-1);
++		if (!newest) throw new Error(`No durable-p1 session exists for ${cwd}`);
++		directory = join(root, newest);
++	} else {
++		directory = join(root, `${String(Date.now()).padStart(13, "0")}-${randomUUID()}`);
++		await mkdir(directory);
++		created = true;
++	}
++
++	let release: () => Promise<void>;
++	try {
++		release = await lockfile.lock(directory, {
++			realpath: false,
++			retries: { retries: 12, minTimeout: 1000, maxTimeout: 1000 },
++		});
++	} catch (error) {
++		throw new Error(`Session is already open in another process: ${directory}`, { cause: error });
++	}
++	return { id: basename(directory), directory, database: join(directory, "session.sqlite"), cwd, created, release };
++}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 689415c070115f7dd1431b0f296f053b0c66f31b Mon Sep 17 00:00:00 2001
+From: fliu56 <fan.liu@volvocars.com>
+Date: Thu, 8 Oct 2026 16:21:46 +0800
+Subject: [PATCH 2/3] feat(spike): boot interactive mode on durable backend
+
+---
+ .../src/experimental/durable-p1/main.ts       | 27 +++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+ create mode 100644 packages/coding-agent/src/experimental/durable-p1/main.ts
+
+diff --git a/packages/coding-agent/src/experimental/durable-p1/main.ts b/packages/coding-agent/src/experimental/durable-p1/main.ts
+new file mode 100644
+index 000000000..34c418a98
+--- /dev/null
++++ b/packages/coding-agent/src/experimental/durable-p1/main.ts
+@@ -0,0 +1,27 @@
++#!/usr/bin/env node
++// durable-p1 spike entry: boot the STABLE interactive-mode TUI on the durable
++// Harness through the AgentSession facade. Wayfinder ticket 006, route B.
++
++import { setCapabilityOverrides } from "@earendil-works/pi-tui";
++import { AgentSessionRuntime } from "../../core/agent-session-runtime.ts";
++import { InteractiveMode } from "../../modes/interactive/interactive-mode.ts";
++import { initTheme, setThemeJsonValidator, stopThemeWatcher } from "../../modes/interactive/theme/theme.ts";
++import { validateThemeJson } from "../../modes/interactive/theme/theme-json.ts";
++import { createDurableP1Session } from "./durable-agent-session.ts";
++
++const p1 = await createDurableP1Session(process.argv.includes("--continue"));
++setThemeJsonValidator(validateThemeJson);
++initTheme(p1.services.settingsManager.getTheme(), true);
++setCapabilityOverrides(p1.services.settingsManager.getTerminalCapabilityOverrides());
++for (const diagnostic of p1.services.diagnostics) {
++	if (diagnostic.type !== "info") console.error(`[durable-p1] ${diagnostic.type}: ${diagnostic.message}`);
++}
++
++const runtime = new AgentSessionRuntime(p1.session, p1.services, p1.throwingRuntimeFactory);
++try {
++	const interactiveMode = new InteractiveMode(runtime, { modelFallbackMessage: p1.modelFallbackMessage });
++	await interactiveMode.run();
++} finally {
++	await p1.close();
++	stopThemeWatcher();
++}
+-- 
+2.54.0 (Apple Git-157)
+
+
+From 40fd98f369a796038b02c59e874849cb2d1b91fe Mon Sep 17 00:00:00 2001
+From: fliu56 <fan.liu@volvocars.com>
+Date: Thu, 8 Oct 2026 16:21:46 +0800
+Subject: [PATCH 3/3] docs(spike): run instructions
+
+---
+ .../src/experimental/durable-p1/README.md     | 39 +++++++++++++++++++
+ 1 file changed, 39 insertions(+)
+ create mode 100644 packages/coding-agent/src/experimental/durable-p1/README.md
+
+diff --git a/packages/coding-agent/src/experimental/durable-p1/README.md b/packages/coding-agent/src/experimental/durable-p1/README.md
+new file mode 100644
+index 000000000..b0bb286b2
+--- /dev/null
++++ b/packages/coding-agent/src/experimental/durable-p1/README.md
+@@ -0,0 +1,39 @@
++# durable-p1 (spike, wayfinder ticket 006 route B)
++
++**Throwaway prototype.** The stable interactive-mode TUI
++(`packages/coding-agent/src/modes/interactive/`) running unmodified on the
++durable backend (`@earendil-works/pi-durable` Harness + root Conversation),
++through an `AgentSession` facade. Answers: how much glue does route B take, and
++where does it hurt?
++
++## Run
++
++```bash
++cd /Users/fliu56/github/pi-durable-coding-agent
++node --import ./packages/coding-agent/src/experimental/source-resolver.ts packages/coding-agent/src/experimental/durable-p1/main.ts
++```
++
++- One turn end-to-end: input streams into the transcript, tool calls
++  (read/bash/edit/write) render, the final answer renders; Esc aborts.
++- Model: pi's default from `~/.pi/agent` settings. Credentials are shared with
++  pi; there is no login flow. Do not run `/login`.
++- Sessions live under `~/.pi/agent/experimental/durable-p1-sessions/`
++  (isolated, prototype-marked; each boot starts a fresh session; `--continue`
++  attaches the newest durable session but the transcript renders empty).
++- Exit: `/exit` or the usual TUI quit keys.
++
++## How it works
++
++| file | role |
++| --- | --- |
++| `main.ts` | entry: theme init, `AgentSessionRuntime`, `InteractiveMode` |
++| `durable-agent-session.ts` | the facade: a real `AgentSession` (in-memory SessionManager, real services, engine never runs) wrapped in a Proxy; prompt/steer/followUp/abort/compact/model mutation reroute to the durable root Conversation; durable `watchEvents` batches feed the parent's private `_handleAgentEvent` so persistence-to-memory, extension dispatch, and the `AgentSessionEvent` fan-out run the production path |
++| `event-adapter.ts` | durable `AgentEvent` (spec §9.4) → pi-agent-core `AgentEvent`: folds message deltas into a partial assistant message, tracks tool output buffers, rebuilds `turn_end`/`agent_end` payloads |
++| `session-location.ts` | session directory + `proper-lockfile` lock under `durable-p1-sessions` |
++
++## Not wired (throws or silently degrades)
++
++`/new`, `/resume`, `/fork`, import (the runtime factory throws); images;
++`/login`; transcript re-render on `--continue`; compaction chat re-render
++(status events map, the summary line does not); session name/info panels read
++the in-memory mirror, not the durable store.
+-- 
+2.54.0 (Apple Git-157)
+
