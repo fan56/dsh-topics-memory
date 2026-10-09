@@ -285,7 +285,7 @@ async function doDistill(service: TopicsService, invocation: CommandInvocation, 
 
 async function renderStats(service: TopicsService): Promise<string> {
   const records = await service.store.readInjectionRecords()
-  const stats = aggregateStats(records as never)
+  const stats = aggregateStats(records)
   if (records.length === 0) return '还没有注入记录 —— 用起来之后这里会有 hit rate / top-N / near-miss 分布。'
   const lines = [
     `注入统计（最近 ${records.length} 轮）：`,
@@ -312,11 +312,12 @@ async function renderStats(service: TopicsService): Promise<string> {
   }
   // Injection-vs-open metrics (v5): the denominator counts only pointers
   // that truly rendered (deduped/echoed/dropped all excluded, slow pointers
-  // included) and the numerator only counts opens inside the injection
-  // window — an old open log can no longer inflate a fresh window's rate.
+  // included) and the numerator only counts DISTINCT slugs from that
+  // rendered set opened inside the injection window — search opens and
+  // never-rendered slugs cannot inflate the rate.
   const opens = await service.store.readOpenRecords()
-  const panel = aggregateOpenPanel(records as never, opens)
-  lines.push(`| open rate | ${(panel.openRate * 100).toFixed(1)}%（${panel.opensInWindow} 次 topic_open / ${panel.pointerEntries} 条注入指针） |`)
+  const panel = aggregateOpenPanel(records, opens)
+  lines.push(`| open rate | ${(panel.openRate * 100).toFixed(1)}%（${panel.opensInWindow} 个被打开指针 / ${panel.pointerEntries} 条注入指针） |`)
   const echoedCount = records.reduce((acc, r) => acc + (r.echoed?.length ?? 0), 0)
   if (echoedCount > 0) {
     lines.push(`| 回声抑制 | ${echoedCount} 次（本会话蒸馏出的 topic 不回注） |`)

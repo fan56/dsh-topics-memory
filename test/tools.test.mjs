@@ -264,3 +264,34 @@ test('tool topic_open: attributes pointer/search/expired from the injection tail
   assert.equal(opens[3].sessionId, undefined)
   assert.equal(opens[3].source, 'search', 'no session id → plain search record')
 })
+
+test('tool topic_open: attribution follows true rendering (echoed→search, slow-only→pointer, deduped→pointer)', async (t) => {
+  const { service, cleanup } = tmpService()
+  t.after(cleanup)
+  await service.store.ensure()
+  const [save, open] = buildTopicTools(service)
+  await save.execute({ title: 'echoed topic E7', conclusion: '回声。' })
+  await save.execute({ title: 'slow topic S7', conclusion: '慢道。' })
+  await save.execute({ title: 'deduped topic D7', conclusion: '去重。' })
+  const hit = (slug, score) => ({ slug, score, reasons: [], viaGraph: false })
+  const base = { queryTokenCount: 3, rosterSize: 3, nearMisses: [], injected: true, sessionId: 's9' }
+  const at = (hoursAgo) => new Date(Date.now() - hoursAgo * HOUR).toISOString()
+  // One round: echoed fast hit (never rendered) + slow-only delivery (rendered)
+  // + deduped fast hit (rendered earlier this session).
+  await service.store.appendInjectionRecord({ ...base, at: at(1), hits: [hit('echoed-topic-e7', 0.9)], echoed: ['echoed-topic-e7'] })
+  await service.store.appendInjectionRecord({ ...base, at: at(1), hits: [], slow: [{ slug: 'slow-topic-s7', why: 'w' }] })
+  await service.store.appendInjectionRecord({ ...base, at: at(1), hits: [hit('deduped-topic-d7', 0.5)], deduped: ['deduped-topic-d7'] })
+
+  await open.execute({ slug: 'echoed-topic-e7' }, { agent: { id: 's9' } })
+  await open.execute({ slug: 'slow-topic-s7' }, { agent: { id: 's9' } })
+  await open.execute({ slug: 'deduped-topic-d7' }, { agent: { id: 's9' } })
+
+  const opens = await service.store.readOpenRecords()
+  assert.equal(opens.length, 3)
+  assert.equal(opens[0].source, 'search', 'echo-suppressed hit was never rendered')
+  assert.equal(opens[1].source, 'pointer', 'slow-only delivery rendered the pointer')
+  assert.ok(!('score' in opens[1]), 'slow pointers carry no lexical score')
+  assert.ok(opens[1].sinceInjectionMs >= HOUR - 5_000, `lag≈1h, got ${opens[1].sinceInjectionMs}`)
+  assert.equal(opens[2].source, 'pointer', 'deduped hit rendered earlier this session')
+  assert.equal(opens[2].score, 0.5)
+})

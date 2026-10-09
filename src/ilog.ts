@@ -223,10 +223,16 @@ export const OPEN_ATTRIBUTION_WINDOW_MS = 48 * 3_600_000
 /**
  * Cheap source attribution for one open event: scan the injection tail
  * (newest first) for a same-session record within the attribution window
- * whose RAW hits array contains the slug — deduped/echoed hits count too,
- * the model saw the pointer candidate either way. A match attributes
- * `pointer` with that hit's score and the open→injection lag; anything
- * else (no session id, other session, expired, never injected) is `search`.
+ * where the slug was truly delivered to the model's eyes. That is hits
+ * minus echoed/dropped (echo suppression and budget drops never rendered),
+ * PLUS slow-lane deliveries, PLUS deduped hits — dedup only blocks
+ * re-packing THIS round; the pointer rendered earlier in the same session
+ * and the model saw it (deliberately wider than renderedPointers: the panel
+ * denominator asks "did it render this round", attribution asks "did the
+ * model ever see it"). A fast-hit match carries that hit's score; a
+ * slow-only match carries none (slow pointers have no lexical score).
+ * Anything else (no session id, other session, expired, never rendered)
+ * is `search`.
  */
 export function attributeOpen(
   injections: readonly InjectionRecord[],
@@ -240,9 +246,11 @@ export function attributeOpen(
     if (record.sessionId !== sessionId) continue
     const atMs = Date.parse(record.at)
     if (!Number.isFinite(atMs) || nowMs - atMs > OPEN_ATTRIBUTION_WINDOW_MS) continue
-    const hit = record.hits.find((h) => h.slug === slug)
-    if (hit === undefined) continue
-    return { source: 'pointer', score: hit.score, sinceInjectionMs: Math.max(0, nowMs - atMs) }
+    const sinceInjectionMs = Math.max(0, nowMs - atMs)
+    const suppressed = new Set<string>([...(record.echoed ?? []), ...(record.dropped ?? []).map((d) => d.slug)])
+    const hit = record.hits.find((h) => h.slug === slug && !suppressed.has(h.slug))
+    if (hit !== undefined) return { source: 'pointer', score: hit.score, sinceInjectionMs }
+    if ((record.slow ?? []).some((s) => s.slug === slug)) return { source: 'pointer', sinceInjectionMs }
   }
   return { source: 'search' }
 }
@@ -347,7 +355,8 @@ export interface OpenBandRow {
 export interface OpenPanelStats {
   /** Rendered pointer entries across the window: hits − deduped − echoed − dropped, plus slow pointers (same-slug fast+slow pairs counted once). */
   pointerEntries: number
-  /** Opens with at ≥ the earliest round in the window (numerator/denominator alignment). */
+  /** DISTINCT slugs from the window's rendered set with an in-window open
+   *  (search-sourced and never-rendered slugs excluded; one per slug). */
   opensInWindow: number
   openRate: number
   topics: OpenTopicRow[]
@@ -364,12 +373,15 @@ export interface OpenPanelStats {
  * Aggregate the injection-vs-open panel from the two JSONL windows. The
  * per-topic/band denominators count only pointers that truly rendered
  * (deduped/echoed/dropped excluded — same exclusion family as
- * aggregateUsage); the header numerator only counts opens that fall inside
- * the injection window, so an old open log can no longer inflate the rate
- * against a fresh injection window. Opens per slug stay wide-scope (the
- * model may open a topic long after its last injection). The zero-open
- * list shares the decay's rule: rendered injections counted within the
- * rolling 30-day window (anchored at the newest round), opens wide-scope.
+ * aggregateUsage); the header numerator counts only DISTINCT slugs from
+ * that rendered set with an open inside the injection window — a search
+ * open or an open of a never-rendered slug cannot enter, and repeat opens
+ * of the same slug count once, so the rate can no longer be pinned at
+ * 100% by repeated or off-scope opens. Opens per slug stay wide-scope
+ * (the model may open a topic long after its last injection). The
+ * zero-open list shares the decay's rule: rendered injections counted
+ * within the rolling 30-day window (anchored at the newest round), opens
+ * wide-scope.
  */
 export function aggregateOpenPanel(
   injections: readonly InjectionRecord[],
@@ -377,7 +389,9 @@ export function aggregateOpenPanel(
 ): OpenPanelStats {
   // Numerator window: the earliest round represented in the denominator;
   // the zero-open anchor is the newest round — the panel describes the log
-  // window it was fed, so a stale log still shows its霸榜 evidence.
+  // window it was fed, so a stale log still shows the topics that
+  // dominated it. The rendered-slug set below shares that window: only
+  // opens of slugs this window rendered can enter the numerator.
   let windowStart = Number.POSITIVE_INFINITY
   let windowEnd = Number.NEGATIVE_INFINITY
   for (const r of injections) {
@@ -389,11 +403,13 @@ export function aggregateOpenPanel(
   const topicCounts = new Map<string, number>()
   const bandPointers = new Array<number>(SCORE_BANDS.length).fill(0)
   let pointerEntries = 0
+  const renderedSlugs = new Set<string>()
   for (const r of injections) {
     // renderedPointers keeps the entry/per-topic counts honest: excluded
     // slugs never counted, a fast+slow pair for the same slug counted once.
     for (const p of renderedPointers(r)) {
       pointerEntries += 1
+      renderedSlugs.add(p.slug)
       topicCounts.set(p.slug, (topicCounts.get(p.slug) ?? 0) + 1)
       const score = p.score
       if (score === undefined) continue
@@ -406,7 +422,11 @@ export function aggregateOpenPanel(
   let pointerOpens = 0
   let searchOpens = 0
   let hasSourceData = false
-  let opensInWindow = 0
+  // Numerator: DISTINCT slugs from the window's rendered set with an
+  // in-window open — search-sourced opens never count (the model found the
+  // topic by asking, not by following a rendered pointer), a never-rendered
+  // slug never counts, and repeat opens of the same slug count once.
+  const openedSlugsInWindow = new Set<string>()
   for (const o of opens) {
     opensBySlug.set(o.slug, (opensBySlug.get(o.slug) ?? 0) + 1)
     if (o.source === 'pointer' || o.source === 'search') hasSourceData = true
@@ -417,11 +437,16 @@ export function aggregateOpenPanel(
       const bi = SCORE_BANDS.findIndex((b) => score >= b.lo && score < b.hi)
       if (bi >= 0) bandOpens[bi] += 1
     }
+    if (o.source === 'search') continue
     const atMs = Date.parse(o.at)
     // An open joins the windowed numerator unless it is provably older than
-    // the window's earliest round (unparsable stamps cannot prove either way).
-    if (!(Number.isFinite(windowStart) && Number.isFinite(atMs) && atMs < windowStart)) opensInWindow += 1
+    // the window's earliest round (unparsable stamps cannot prove either
+    // way) — and only when the window actually rendered its slug.
+    if (Number.isFinite(windowStart) && Number.isFinite(atMs) && atMs < windowStart) continue
+    if (!renderedSlugs.has(o.slug)) continue
+    openedSlugsInWindow.add(o.slug)
   }
+  const opensInWindow = openedSlugsInWindow.size
   const rate = (num: number, den: number): number => (den === 0 ? 0 : Math.min(1, num / den))
   const topics: OpenTopicRow[] = [...topicCounts.entries()]
     .map(([slug, injections]) => {

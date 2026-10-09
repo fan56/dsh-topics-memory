@@ -211,8 +211,9 @@ test('command: stats injection-vs-open panel with enriched data', async () => {
     const r = await buildTopicsCommand(service, mutate).handler(inv('stats'))
     assert.equal(r.kind, 'success')
     // Denominator: 5 quiet + alpha + gamma + slow-alpha = 8 (dropped/deduped out).
-    // Numerator: 2 in-window opens (the day-old one excluded).
-    assert.match(r.text, /\| open rate \| 25\.0%（2 次 topic_open \/ 8 条注入指针） \|/)
+    // Numerator: distinct window-rendered slugs opened in-window — alpha only
+    // (was 2 before the S3 scope fix: beta's search open no longer counts).
+    assert.match(r.text, /\| open rate \| 12\.5%（1 个被打开指针 \/ 8 条注入指针） \|/)
     // Per-topic table: wide-scope opens (the day-old alpha open counts → 2).
     assert.match(r.text, /\| `quiet` \| 5 \| 0 \| 0\.0% \|/)
     assert.match(r.text, /\| `alpha` \| 2 \| 2 \| 100\.0% \|/)
@@ -241,7 +242,7 @@ test('command: stats open panel degrades to placeholders on legacy data', async 
     await service.store.appendOpenRecord({ slug: 'alpha-topic', at: new Date().toISOString() })
     const r = await buildTopicsCommand(service, mutate).handler(inv('stats'))
     assert.equal(r.kind, 'success')
-    assert.match(r.text, /\| open rate \| 100\.0%（1 次 topic_open \/ 1 条注入指针） \|/)
+    assert.match(r.text, /\| open rate \| 100\.0%（1 个被打开指针 \/ 1 条注入指针） \|/)
     assert.match(r.text, /打开来源：暂无来源数据/)
     assert.match(r.text, /\| \[1,2\) \| 1 \| 0\.0% \|/)
     assert.ok(!/零打开高频/.test(r.text), 'single injection is under the ≥5 threshold')
