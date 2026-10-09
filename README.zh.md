@@ -187,6 +187,7 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `consolidateCadence` | `daily` | 整理 lane 节拍：`daily`/`3d`/`7d`/`off`。会话启动时检查上次整理时间（`meta/consolidate-state.json`），到期即在后台自动跑 LLM 园丁（复用蒸馏模型路由）：本地词面聚类只送「长得像」的候选簇，四类动作 merge/promote/deprecate/refresh，越权 op 一律丢弃；模型调用失败不推进节拍，下次启动重试 |
 | `deprecatedTtlDays` | `15` | deprecated 条目超过 N 天在会话启动时自动删除（本地规则不依赖模型，逐条 git commit 可回溯找回）；`0` 关闭清扫 |
 | `usageBoost` | `0.15` | 使用加成（ADR 0015）：近 30 天被注入命中/点开过的 Topic 检索加分（计入门槛分、帽 0.2、零词面相关不加、结构门不豁免）；`0` 关闭 |
+| `zeroOpenDecay` | `false` | 零打开衰减：零打开高频 slug 的命中分在阈值裁剪前减半（见下方小节） |
 | `pushDebounceSeconds` | `45` | GitHub 模式去抖推送间隔 |
 | `jevEnabled` | `false` | System One 决策层总开关（实验）：`false` = 零行为变化——见上方「Jev 决策层」一节 |
 | `jevBackend` | `zen` | 决策端点：`zen`（免费）/ `native` / `openrouter` |
@@ -196,6 +197,10 @@ dsh plugin --profile <name> remove @aiwayds/dsh-topics-memory
 | `jevLayaFallback` | `false` | 本地 laya 陪跑：每次 jev 调用并发一路 laya 请求；laya 为纯遥测对照（不接管决策，真实负载排序一致率 0/14） |
 | `jevLayaUrl` | `http://127.0.0.1:8000/v1/systemone` | 陪跑用的 laya-serve 端点 |
 | `jevDebug` | 关 | 诊断日志开关（走宿主 logger，默认静默） |
+
+### 零打开衰减（默认关）
+
+`zeroOpenDecay: true` 时，命中分在 matchThreshold 裁剪前乘 0.5：滚动 30 天内被真正注入 ≥5 次、且 opens.jsonl 全期 0 次打开的 slug（即 `/topics stats` 的「零打开高频」清单——stats 面板与打分衰减共用同一条共享规则）不再霸榜；跌破阈值的候选自然落入 nearMisses 并带 `zero-open-decay` 标签，注入日志可见原因。动机：24 个「注入 ≥5 次、0 打开」的高频话题长期霸榜，而 score 与打开仅弱相关（阈值 0.3 不动）。默认 `false` 零行为变化；injections/opens 读取失败跳过衰减（fail-open）；`/topics set zero-open-decay on|off` 运行时切换。
 
 ### laya 本地陪跑（实验，默认关）
 

@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.22.0 - 2026-10-09
+
+注入 vs 打开行为度量三连：open 事件富化、stats 面板与口径修复、零打开衰减调参开关（默认关）。
+
+- **opens 富化（`feat(opens)`）**：`topic_open` 记录新增 `sessionId` / `source`（`pointer|search`）/ `score` / `sinceInjectionMs` —— 归因走廉价注入日志尾部扫描（同会话、48h 窗口内、raw hits 含该 slug 即算 pointer，deduped 也算），旧数据（仅 slug/at）照常读取；归因是遥测，读取失败不阻塞工具。
+- **stats 面板（`feat(stats)`）**：`/topics stats` 新增注入 vs 打开面板 —— 口径修复后的 open rate（分母只数真正渲染的指针：deduped/echoed/dropped 剔除、slow 计入、fast+slow 同 slug 每轮一次；分子只计注入窗口内的打开，旧 open 日志不再抬高新窗口的打开率）、per-topic Top-10 表、零打开高频清单、pointer/search 来源拆分、按命中分分桶（`[0.3,0.5)`…`[5,∞)`）的打开率。
+- **零打开衰减（`feat(retrieval)`，默认关、配置门控休眠上线）**：新增 `zeroOpenDecay` 键（默认 `false`，volatile 热更，`/topics set zero-open-decay on|off`）—— 滚动 30 天内真正注入 ≥5 次且 opens.jsonl 全期 0 次打开的 slug，命中分在 matchThreshold 裁剪前乘 0.5，reasons 追加 `zero-open-decay`；跌破阈值的候选自然落入 nearMisses 并带标签，日志可见原因。零打开规则抽成单一共享助手（`ilog.aggregateZeroOpen` + `renderedPointers`，stats 面板与打分衰减两消费方共用）；打分侧读 injections 尾部（`ZERO_OPEN_TAIL=500` 行，覆盖 30 天窗）+ opens 全量，mtime 缓存一轮至多读一次，读取失败 fail-open 跳过衰减。动机：24 个「注入 ≥5 次、0 打开」的高频话题长期霸榜，而 score 与打开仅弱相关（阈值 0.3 不动）。
+- **测试**：421 → 433（`aggregateZeroOpen`/`renderedPointers` 规则与 30 天窗口边界、面板窗口化零打开清单、`scoreTopic`/`searchTopics` 衰减与 nearMiss 降落、service e2e 默认关逐字节不变 / 开衰减 / 打开一次豁免 / <5 轮 / 窗外不计、config 键解析）；既有用例零改动保持绿。
+
 ## Unreleased（dsh 0.1.7-rc.1 迁移；随 wave 统一发版，不单独 tag）
 
 ### dsh 0.2.0-rc.2（0.2.0 迁移波叠加，同随 wave 发版）
