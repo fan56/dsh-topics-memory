@@ -25,22 +25,34 @@ interface CacheEntry {
   slug: string
 }
 
-/** Tolerant full-file JSONL read: torn tail lines skipped, unreadable file
- *  contributes nothing (fail open) — shared by the usage/zero-open caches. */
-function parseJsonlSync<T>(file: string): T[] {
-  const out: T[] = []
+/** Tolerant JSONL line read: undefined = unreadable file. Unlike an empty
+ *  array, undefined tells the caller to fail open AND skip caching — a
+ *  successful stat paired with a failed read must not freeze an empty
+ *  snapshot into the cache until the next append. */
+function readLogLinesSync(file: string): string[] | undefined {
   try {
-    for (const line of readFileSync(file, 'utf8').split('\n')) {
-      if (line.trim() === '') continue
-      try {
-        out.push(JSON.parse(line) as T)
-      } catch {
-        continue // torn tail line
-      }
-    }
+    return readFileSync(file, 'utf8').split('\n')
   } catch {
-    // unreadable log: contribute nothing
+    return undefined
   }
+}
+
+/** Parse already-split lines back-to-front, keeping the last `tail` parsed
+ *  records in order: blanks and torn JSON lines are skipped (and never
+ *  consume tail budget), so a torn tail line cannot crowd out a good one.
+ *  Shared by the usage/zero-open cache — one tail parse feeds both. */
+function parseJsonlLinesSync<T>(lines: readonly string[], tail = Number.POSITIVE_INFINITY): T[] {
+  const out: T[] = []
+  for (let i = lines.length - 1; i >= 0 && out.length < tail; i -= 1) {
+    const line = lines[i]
+    if (line.trim() === '') continue
+    try {
+      out.push(JSON.parse(line) as T)
+    } catch {
+      continue // torn tail line
+    }
+  }
+  out.reverse()
   return out
 }
 
@@ -69,21 +81,22 @@ export class TopicsService {
   private cache = new Map<string, CacheEntry>()
   /** mtime-keyed parse of the observations log, grouped by session. */
   private echoCache: { mtimeMs: number; size: number; bySession: Map<string, Set<string>> } | undefined
-  private usageCache: {
-    injMs: number
-    injSize: number
-    opensMs: number
-    opensSize: number
-    signals: Map<string, UsageSignal>
-  } | undefined
-  /** mtime-keyed cache for the zero-open slug set (zeroOpenDecay reads). */
-  private zeroOpenCache: {
-    injMs: number
-    injSize: number
-    opensMs: number
-    opensSize: number
-    slugs: ReadonlySet<string>
-  } | undefined
+  /** Single shared cache over the two feedback JSONL logs (S2): the key is
+   *  the (mtime,size) quartet of injections.jsonl + opens.jsonl, one read
+   *  and one tail parse feed BOTH aggregates — usageSignalsSync and
+   *  zeroOpenSlugsSync used to each keep a full-parse cache of their own.
+   *  Invalidation stays append-driven: the store only ever appends, so any
+   *  write moves mtime+size. Never populated when a read failed (N1). */
+  private logSignalsCache:
+    | {
+        injMs: number
+        injSize: number
+        opensMs: number
+        opensSize: number
+        signals: Map<string, UsageSignal>
+        zeroOpenSlugs: ReadonlySet<string>
+      }
+    | undefined
   readonly store: BundleStore
   private readonly getConfig: () => TopicsConfigValue
   readonly sync?: Sync
@@ -158,8 +171,7 @@ export class TopicsService {
   invalidate(): void {
     this.cache.clear()
     this.echoCache = undefined
-    this.usageCache = undefined
-    this.zeroOpenCache = undefined
+    this.logSignalsCache = undefined
   }
 
   /**
@@ -214,57 +226,36 @@ export class TopicsService {
    * Usage signals (ADR 0015): mtime-cached aggregate over the injection log
    * and the opens log, rolling USAGE_WINDOW_DAYS. Synchronous like
    * echoSlugsSync — the retrieval hot path is sync — and cheap when warm:
-   * a fresh cache costs two stat() calls. Unreadable logs fail open to an
+   * a fresh cache costs two stat() calls, one read of each log, and feeds
+   * the zero-open set from the same parse. Unreadable logs fail open to an
    * empty map (no boost), never an error.
    */
   usageSignalsSync(): Map<string, UsageSignal> {
-    const injFile = join(this.store.metaDir(), 'injections.jsonl')
-    const opensFile = join(this.store.metaDir(), 'opens.jsonl')
-    const statOf = (file: string): { mtimeMs: number; size: number } => {
-      try {
-        const st = statSync(file)
-        return { mtimeMs: st.mtimeMs, size: st.size }
-      } catch {
-        return { mtimeMs: 0, size: 0 }
-      }
-    }
-    const injSt = statOf(injFile)
-    const opensSt = statOf(opensFile)
-    const cached = this.usageCache
-    if (
-      cached !== undefined &&
-      cached.injMs === injSt.mtimeMs &&
-      cached.injSize === injSt.size &&
-      cached.opensMs === opensSt.mtimeMs &&
-      cached.opensSize === opensSt.size
-    ) {
-      return cached.signals
-    }
-    const signals = aggregateUsage(
-      parseJsonlSync<InjectionRecord>(injFile),
-      parseJsonlSync<OpenRecord>(opensFile),
-      USAGE_WINDOW_DAYS,
-      Date.now(),
-    )
-    this.usageCache = {
-      injMs: injSt.mtimeMs,
-      injSize: injSt.size,
-      opensMs: opensSt.mtimeMs,
-      opensSize: opensSt.size,
-      signals,
-    }
-    return signals
+    return this.logSignalsSync().signals
   }
 
   /**
    * Zero-open slug set for the decay (v5): the shared aggregateZeroOpen
-   * rule over the injection tail (ZERO_OPEN_TAIL rows — comfortably
-   * covers the rolling 30-day window) and the whole opens log (compacted,
-   * so a full read stays small). Sync + mtime-cached like usageSignalsSync
-   * — one read per round at most; unreadable logs fail open to an empty
-   * set (no decay), never an error. Only called when zeroOpenDecay is on.
+   * rule over the injection tail and the whole opens log (compacted, so a
+   * full read stays small). Shares one cache and one parse with
+   * usageSignalsSync; unreadable logs fail open to an empty set (no
+   * decay), never an error. Only called when zeroOpenDecay is on.
    */
   zeroOpenSlugsSync(): ReadonlySet<string> {
+    return this.logSignalsSync().zeroOpenSlugs
+  }
+
+  /**
+   * The one shared feedback-log read behind both signals: stat both files
+   * (mtime+size quartet key), parse the injections TAIL only
+   * (ZERO_OPEN_TAIL rounds comfortably cover both 30-day windows) and the
+   * opens log whole (the zero-open rule is whole-history), then feed the
+   * two pure aggregates from that single parse. A failed read still fails
+   * open to empty inputs but NEVER populates the cache (N1) — otherwise a
+   * stat-success/read-failure race would freeze an empty snapshot until
+   * the next append.
+   */
+  private logSignalsSync(): { signals: Map<string, UsageSignal>; zeroOpenSlugs: ReadonlySet<string> } {
     const injFile = join(this.store.metaDir(), 'injections.jsonl')
     const opensFile = join(this.store.metaDir(), 'opens.jsonl')
     const statOf = (file: string): { mtimeMs: number; size: number } => {
@@ -277,7 +268,7 @@ export class TopicsService {
     }
     const injSt = statOf(injFile)
     const opensSt = statOf(opensFile)
-    const cached = this.zeroOpenCache
+    const cached = this.logSignalsCache
     if (
       cached !== undefined &&
       cached.injMs === injSt.mtimeMs &&
@@ -285,21 +276,26 @@ export class TopicsService {
       cached.opensMs === opensSt.mtimeMs &&
       cached.opensSize === opensSt.size
     ) {
-      return cached.slugs
+      return cached
     }
-    const slugs = new Set(aggregateZeroOpen(
-      parseJsonlSync<InjectionRecord>(injFile).slice(-ZERO_OPEN_TAIL),
-      parseJsonlSync<OpenRecord>(opensFile),
-      Date.now(),
-    ).keys())
-    this.zeroOpenCache = {
-      injMs: injSt.mtimeMs,
-      injSize: injSt.size,
-      opensMs: opensSt.mtimeMs,
-      opensSize: opensSt.size,
-      slugs,
+    const injLines = readLogLinesSync(injFile)
+    const opensLines = readLogLinesSync(opensFile)
+    const injections = parseJsonlLinesSync<InjectionRecord>(injLines ?? [], ZERO_OPEN_TAIL)
+    const opens = parseJsonlLinesSync<OpenRecord>(opensLines ?? [])
+    const now = Date.now()
+    const signals = aggregateUsage(injections, opens, USAGE_WINDOW_DAYS, now)
+    const zeroOpenSlugs: ReadonlySet<string> = new Set(aggregateZeroOpen(injections, opens, now).keys())
+    if (injLines !== undefined && opensLines !== undefined) {
+      this.logSignalsCache = {
+        injMs: injSt.mtimeMs,
+        injSize: injSt.size,
+        opensMs: opensSt.mtimeMs,
+        opensSize: opensSt.size,
+        signals,
+        zeroOpenSlugs,
+      }
     }
-    return slugs
+    return { signals, zeroOpenSlugs }
   }
 
   /**
