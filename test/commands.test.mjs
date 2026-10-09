@@ -7,6 +7,8 @@ import { BundleStore } from '../lib/store.js'
 import { TopicsService } from '../lib/service.js'
 import { buildTopicsCommand, tuningHint, renderNearMissSparkline, HELP } from '../lib/commands.js'
 
+const HOUR_MS = 3_600_000
+
 /** Desensitized replay of a real session's near-miss distribution (see the
  *  fixture's note field) — drives the stats end-to-end test below. */
 const NEARMISS_FIXTURE = JSON.parse(
@@ -177,6 +179,72 @@ test('command: stats empty vs populated + list + show', async () => {
     assert.match(show.text, /title: alpha topic/)
     const showMissing = await cmd.handler(inv('show nope'))
     assert.equal(showMissing.kind, 'error')
+  } finally {
+    cleanup()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Injection-vs-open panel (v5): corrected open rate (dropped subtracted,
+// numerator window-aligned) + per-topic table, zero-open list, source split,
+// score bands. Two smokes: enriched data and legacy (no source field) data.
+// ---------------------------------------------------------------------------
+
+test('command: stats injection-vs-open panel with enriched data', async () => {
+  const { service, mutate, cleanup } = makeService()
+  try {
+    await service.store.ensure()
+    const T = Date.parse('2026-10-08T10:00:00Z')
+    const at = (ms) => new Date(T + ms).toISOString()
+    const hit = (slug, score) => ({ slug, score, reasons: [], viaGraph: false })
+    // 5 quiet rounds (quiet never opened) + mixed exclusions + slow pointer.
+    for (let i = 0; i < 5; i += 1) {
+      await service.store.appendInjectionRecord({ at: at(i * 60_000), queryTokenCount: 3, rosterSize: 9, hits: [hit('quiet', 0.35)], nearMisses: [], injected: true })
+    }
+    await service.store.appendInjectionRecord({ at: at(10 * 60_000), queryTokenCount: 3, rosterSize: 9, hits: [hit('alpha', 0.4), hit('dropped-one', 0.45)], nearMisses: [], injected: true, dropped: [{ slug: 'dropped-one', reason: 'budget' }] })
+    await service.store.appendInjectionRecord({ at: at(11 * 60_000), queryTokenCount: 3, rosterSize: 9, hits: [hit('beta', 1.5)], nearMisses: [], injected: false, deduped: ['beta'] })
+    await service.store.appendInjectionRecord({ at: at(12 * 60_000), queryTokenCount: 3, rosterSize: 9, hits: [hit('gamma', 2.5)], nearMisses: [], injected: true, slow: [{ slug: 'alpha', why: 'w' }] })
+    // Opens: two inside the window (one pointer, one search), one a day old.
+    await service.store.appendOpenRecord({ slug: 'alpha', at: at(2 * HOUR_MS), sessionId: 's1', source: 'pointer', score: 0.4, sinceInjectionMs: 5000 })
+    await service.store.appendOpenRecord({ slug: 'beta', at: at(3 * HOUR_MS), sessionId: 's1', source: 'search' })
+    await service.store.appendOpenRecord({ slug: 'alpha', at: new Date(T - 24 * HOUR_MS).toISOString() })
+    const r = await buildTopicsCommand(service, mutate).handler(inv('stats'))
+    assert.equal(r.kind, 'success')
+    // Denominator: 5 quiet + alpha + gamma + slow-alpha = 8 (dropped/deduped out).
+    // Numerator: 2 in-window opens (the day-old one excluded).
+    assert.match(r.text, /\| open rate \| 25\.0%（2 次 topic_open \/ 8 条注入指针） \|/)
+    // Per-topic table: wide-scope opens (the day-old alpha open counts → 2).
+    assert.match(r.text, /\| `quiet` \| 5 \| 0 \| 0\.0% \|/)
+    assert.match(r.text, /\| `alpha` \| 2 \| 2 \| 100\.0% \|/)
+    assert.match(r.text, /\| `gamma` \| 1 \| 0 \| 0\.0% \|/)
+    assert.ok(!/\| `beta` \|/.test(r.text), 'deduped-only slug has zero rendered pointers → no row')
+    // Zero-open list: quiet (5 injections, 0 opens).
+    assert.match(r.text, /零打开高频（注入 ≥5、打开 0）：`quiet`/)
+    // Source split.
+    assert.match(r.text, /打开来源：pointer 1 \/ search 1/)
+    // Bands: [0.3,0.5) has quiet×5 + alpha = 6 pointers, 1 pointer-open (16.7%).
+    assert.match(r.text, /\| \[0\.3,0\.5\) \| 6 \| 16\.7% \|/)
+    assert.match(r.text, /\| \[1,2\) \| 0 \| — \|/)
+    assert.match(r.text, /\| \[2,5\) \| 1 \| 0\.0% \|/)
+  } finally {
+    cleanup()
+  }
+})
+
+test('command: stats open panel degrades to placeholders on legacy data', async () => {
+  const { service, mutate, cleanup } = makeService()
+  try {
+    await service.store.ensure()
+    await service.saveTopic({ title: 'alpha topic', conclusion: '结论 A' })
+    await service.store.appendInjectionRecord({ at: 't', queryTokenCount: 3, rosterSize: 1, hits: [{ slug: 'alpha-topic', score: 1.2, reasons: [], viaGraph: false }], nearMisses: [], injected: true })
+    // Legacy open line: slug/at only, no source/score enrichment.
+    await service.store.appendOpenRecord({ slug: 'alpha-topic', at: new Date().toISOString() })
+    const r = await buildTopicsCommand(service, mutate).handler(inv('stats'))
+    assert.equal(r.kind, 'success')
+    assert.match(r.text, /\| open rate \| 100\.0%（1 次 topic_open \/ 1 条注入指针） \|/)
+    assert.match(r.text, /打开来源：暂无来源数据/)
+    assert.match(r.text, /\| \[1,2\) \| 1 \| 0\.0% \|/)
+    assert.ok(!/零打开高频/.test(r.text), 'single injection is under the ≥5 threshold')
   } finally {
     cleanup()
   }
