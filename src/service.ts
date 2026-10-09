@@ -14,7 +14,7 @@ import { searchTopics, scoreTopic, passesGate, tokenize, type RetrievableTopic, 
 import { assembleInjection, assemblePointer, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type SlowPointerInput } from './digest.ts'
 import type { BundleStore, Observation, SaveResult } from './store.ts'
 import type { TopicsConfigValue } from './config.ts'
-import { aggregateStats, querySample, aggregateUsage, USAGE_WINDOW_DAYS, type AggregateStats, type InjectionRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type UsageSignal } from './ilog.ts'
+import { aggregateStats, querySample, aggregateUsage, USAGE_WINDOW_DAYS, attributeOpen, OPEN_ATTRIBUTION_TAIL, type AggregateStats, type InjectionRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type UsageSignal } from './ilog.ts'
 import { fileHistory, fileAtRev } from './git.ts'
 import type { Sync } from './sync.ts'
 
@@ -532,9 +532,14 @@ export class TopicsService {
     const doc = slug === '' ? undefined : await this.store.readTopic(slug).catch(() => undefined)
     if (doc === undefined) return { found: false, slug }
     // Awaited (tool path, not hot): a settled write makes the pointer-open
-    // stat reliable; a failed log write must not fail the tool.
+    // stat reliable; a failed log write must not fail the tool. Source
+    // attribution rides the same write: a cheap injections-tail scan decides
+    // pointer vs search and, for pointers, carries the hit score and the
+    // open→injection lag (ilog.attributeOpen).
+    const at = new Date().toISOString()
+    const attribution = await this.attributeOpen(slug, sessionId, Date.parse(at))
     await this.store
-      .appendOpenRecord({ slug, at: new Date().toISOString(), ...(sessionId !== undefined ? { sessionId } : {}) })
+      .appendOpenRecord({ slug, at, ...(sessionId !== undefined ? { sessionId } : {}), ...attribution })
       .catch(() => undefined)
     // Optional fields are OMITTED, never present-as-undefined: the host's
     // tool-output validation rejects any object carrying an undefined-valued
@@ -562,6 +567,18 @@ export class TopicsService {
     }
     if (doc.fm.description !== undefined) found.description = doc.fm.description
     return found
+  }
+
+  /**
+   * Resolve the open's source attribution: the injections tail (bounded by
+   * OPEN_ATTRIBUTION_TAIL) scanned for a same-session hit within the
+   * attribution window. Read failures degrade to 'search' — attribution is
+   * telemetry, never a blocker.
+   */
+  private async attributeOpen(slug: string, sessionId: string | undefined, nowMs: number): Promise<{ source: 'pointer' | 'search'; score?: number; sinceInjectionMs?: number }> {
+    if (sessionId === undefined) return { source: 'search' }
+    const tail = await this.store.readInjectionRecords(OPEN_ATTRIBUTION_TAIL).catch(() => [])
+    return attributeOpen(tail, slug, sessionId, nowMs)
   }
 
   /** Sync roster read (same mtime cache as roster()). */

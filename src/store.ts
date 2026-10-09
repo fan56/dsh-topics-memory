@@ -26,7 +26,7 @@ import { randomUUID } from 'node:crypto'
 import * as okf from './okf.ts'
 import * as gitmod from './git.ts'
 import { actorFor } from './paths.ts'
-import type { InjectionRecord } from './ilog.ts'
+import type { InjectionRecord, OpenRecord } from './ilog.ts'
 
 export interface TopicMeta {
   slug: string
@@ -612,14 +612,15 @@ export class BundleStore {
 
   // ------------------------------------------------------------------
   // Pointer-open log (v4 §4.3) — one line per topic_open call; feeds the
-  // 「指针打开率」 stat. Features only (slug/time), never conversation text.
+  // 「指针打开率」 stat. Features only (slug/time + attribution), never
+  // conversation text.
   // ------------------------------------------------------------------
 
   private opensPath(): string {
     return join(this.metaDir(), 'opens.jsonl')
   }
 
-  async appendOpenRecord(record: { slug: string; at: string; sessionId?: string }): Promise<void> {
+  async appendOpenRecord(record: OpenRecord): Promise<void> {
     await mkdir(this.metaDir(), { recursive: true })
     await appendFile(this.opensPath(), `${JSON.stringify(record)}\n`, 'utf8')
     await this.compactOpensIfNeeded()
@@ -638,22 +639,27 @@ export class BundleStore {
     await atomicWrite(file, lines.slice(-Math.max(1, Math.floor(lines.length / 4))).map((l) => `${l}\n`).join(''))
   }
 
-  /** Opens in the recent window; tolerant of a torn tail like the other JSONLs. */
-  async readOpenRecords(limit = 2000): Promise<{ slug: string; at: string; sessionId?: string }[]> {
+  /** Opens in the recent window; tolerant of a torn tail like the other JSONLs.
+   *  Enrichment fields (sessionId/source/score/sinceInjectionMs) are optional:
+   *  pre-enrichment lines carry only slug/at and read back without them. */
+  async readOpenRecords(limit = 2000): Promise<OpenRecord[]> {
     let raw: string
     try {
       raw = await readFile(this.opensPath(), 'utf8')
     } catch {
       return []
     }
-    const out: { slug: string; at: string; sessionId?: string }[] = []
+    const out: OpenRecord[] = []
     for (const line of raw.split('\n')) {
       if (line.trim() === '') continue
       try {
-        const parsed = JSON.parse(line) as { slug?: unknown; at?: unknown; sessionId?: unknown }
+        const parsed = JSON.parse(line) as { slug?: unknown; at?: unknown; sessionId?: unknown; source?: unknown; score?: unknown; sinceInjectionMs?: unknown }
         if (typeof parsed.slug === 'string' && typeof parsed.at === 'string') {
-          const rec: { slug: string; at: string; sessionId?: string } = { slug: parsed.slug, at: parsed.at }
+          const rec: OpenRecord = { slug: parsed.slug, at: parsed.at }
           if (typeof parsed.sessionId === 'string') rec.sessionId = parsed.sessionId
+          if (parsed.source === 'pointer' || parsed.source === 'search') rec.source = parsed.source
+          if (typeof parsed.score === 'number') rec.score = parsed.score
+          if (typeof parsed.sinceInjectionMs === 'number') rec.sinceInjectionMs = parsed.sinceInjectionMs
           out.push(rec)
         }
       } catch {

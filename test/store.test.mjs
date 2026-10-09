@@ -97,7 +97,7 @@ test('store: broken topic file surfaces in brokenTopics, skipped in roster', asy
   }
 })
 
-import { writeFile } from 'node:fs/promises'
+import { writeFile, appendFile } from 'node:fs/promises'
 async function writeFileRaw(store, rel, content) {
   await writeFile(join(store.root, rel), content, 'utf8')
 }
@@ -256,6 +256,31 @@ test('store: recordUnconsumed never touches distilled observations', async () =>
     const all = await store.allObservations()
     assert.equal(all.length, 1)
     assert.equal(all[0].attempts, 1, 'the pre-consumption attempt is preserved; no new one accrues')
+  } finally {
+    cleanup()
+  }
+})
+
+test('store: open records enriched round-trip, legacy lines tolerated', async () => {
+  const { store, cleanup } = tmpStore()
+  try {
+    await store.ensure()
+    // Enriched record: every optional field survives the JSONL round-trip.
+    await store.appendOpenRecord({ slug: 'rich', at: '2026-10-08T10:00:00Z', sessionId: 's1', source: 'pointer', score: 0.42, sinceInjectionMs: 1234 })
+    // New-format record without enrichment.
+    await store.appendOpenRecord({ slug: 'bare', at: '2026-10-08T10:01:00Z', source: 'search' })
+    // Pre-enrichment legacy line (slug/at only) and a line carrying junk
+    // enrichment values — both written raw, both must read back cleanly.
+    await appendFile(join(store.root, 'meta', 'opens.jsonl'), `${JSON.stringify({ slug: 'legacy', at: '2026-01-01T00:00:00Z' })}\n`, 'utf8')
+    await appendFile(join(store.root, 'meta', 'opens.jsonl'), `${JSON.stringify({ slug: 'dirty', at: '2026-01-02T00:00:00Z', sessionId: 7, source: 'weird', score: 'nope', sinceInjectionMs: null })}\n`, 'utf8')
+    const opens = await store.readOpenRecords()
+    assert.equal(opens.length, 4)
+    assert.deepEqual(opens[0], { slug: 'rich', at: '2026-10-08T10:00:00Z', sessionId: 's1', source: 'pointer', score: 0.42, sinceInjectionMs: 1234 })
+    assert.deepEqual(opens[1], { slug: 'bare', at: '2026-10-08T10:01:00Z', source: 'search' })
+    // Legacy line: exactly the old shape, nothing invented.
+    assert.deepEqual(opens[2], { slug: 'legacy', at: '2026-01-01T00:00:00Z' })
+    // Junk-typed enrichment values are dropped; slug/at survive.
+    assert.deepEqual(opens[3], { slug: 'dirty', at: '2026-01-02T00:00:00Z' })
   } finally {
     cleanup()
   }
