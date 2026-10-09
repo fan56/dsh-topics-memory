@@ -49,11 +49,25 @@ export interface RetrievalConfig {
   usageBoost: number
   /** Usage signals per slug (hits/opens in the window); absent map = no boost. */
   usage?: ReadonlyMap<string, { hits: number; opens: number }>
+  /**
+   * Zero-open decay (v5, default off — config `zeroOpenDecay`): halve the
+   * score of slugs on the zero-open list (≥5 rendered injections in the
+   * rolling 30 days, zero opens ever) at score-finalization time, BEFORE
+   * the threshold cut — a decayed candidate that drops below the threshold
+   * lands in nearMisses with the `zero-open-decay` reason, so the log
+   * shows why it stopped injecting. Absent/off = zero behavior change.
+   */
+  zeroOpenDecay?: boolean
+  /** Zero-open slugs for this round (service-built from the ilog tail). */
+  zeroOpenSlugs?: ReadonlySet<string>
 }
 
 /** Hard cap for the usage bonus — below threshold 0.3 so usage can never
  *  carry a candidate across the gate on its own (ADR 0015). */
 export const USAGE_BOOST_CAP = 0.2
+
+/** Score multiplier for zero-open slugs when zeroOpenDecay is on (v5). */
+export const ZERO_OPEN_DECAY_FACTOR = 0.5
 
 export const DEFAULT_RETRIEVAL: RetrievalConfig = {
   threshold: 0.3,
@@ -223,6 +237,14 @@ export function scoreTopic(
   if (cfg.conflicts?.has(topic.slug) === true) {
     score *= 0.3
     reasons.push('conflicted-demoted')
+  }
+  // Zero-open decay (v5): same demotion family as conflicts — applied to
+  // the content score BEFORE gateScore is taken, so the threshold cut and
+  // the near-miss band both see the halved score; recency still rides
+  // outside it as the ranking tiebreaker.
+  if (cfg.zeroOpenDecay === true && cfg.zeroOpenSlugs?.has(topic.slug) === true) {
+    score *= ZERO_OPEN_DECAY_FACTOR
+    reasons.push('zero-open-decay')
   }
   const gateScore = score
   score += recencyBonus

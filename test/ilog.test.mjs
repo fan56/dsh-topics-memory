@@ -117,7 +117,7 @@ test('aggregateUsage: vote weights, window, exclusions', () => {
 })
 
 // ---- open-source attribution + injection-vs-open panel (v5) ----
-import { attributeOpen, aggregateOpenPanel, OPEN_ATTRIBUTION_WINDOW_MS } from '../lib/ilog.js'
+import { attributeOpen, aggregateOpenPanel, aggregateZeroOpen, renderedPointers, OPEN_ATTRIBUTION_WINDOW_MS, ZERO_OPEN_WINDOW_DAYS } from '../lib/ilog.js'
 
 const ATTR_NOW = Date.parse('2026-10-08T12:00:00Z')
 const h = (n) => 3_600_000 * n
@@ -270,4 +270,72 @@ test('aggregateOpenPanel: legacy opens only — placeholder signal, no crash', (
   assert.equal(panel.searchOpens, 0)
   assert.equal(panel.opensInWindow, 1)
   assert.equal(panel.openRate, 1)
+})
+
+// ---- renderedPointers / aggregateZeroOpen (v5 shared zero-open rule) ----
+
+const DAY_MS = 86_400_000
+
+function zorec(slug, atMs, over = {}) {
+  return arec({ at: new Date(atMs).toISOString(), sessionId: undefined, hits: [{ slug, score: 0.4, reasons: [], viaGraph: false }], ...over })
+}
+
+test('renderedPointers: exclusions out, fast+slow pair once, slow carries no score', () => {
+  const r = arec({
+    sessionId: undefined,
+    hits: [
+      { slug: 'a', score: 0.4, reasons: [], viaGraph: false },
+      { slug: 'b', score: 0.5, reasons: [], viaGraph: false },
+      { slug: 'c', score: 0.6, reasons: [], viaGraph: false },
+    ],
+    deduped: ['b'],
+    dropped: [{ slug: 'c', reason: 'budget' }],
+    slow: [{ slug: 'a', why: 'w' }, { slug: 'd', why: 'w' }],
+  })
+  assert.deepEqual(renderedPointers(r), [{ slug: 'a', score: 0.4 }, { slug: 'd' }])
+})
+
+test('aggregateZeroOpen: ≥5 windowed rendered injections with zero opens qualify', () => {
+  const five = []
+  for (let k = 0; k < 5; k += 1) five.push(zorec('hot', ATTR_NOW - k * 60_000))
+  assert.equal(aggregateZeroOpen(five, [], ATTR_NOW).get('hot'), 5)
+  // 4 rounds → below the threshold.
+  assert.equal(aggregateZeroOpen(five.slice(1), [], ATTR_NOW).has('hot'), false)
+  // Excluded rounds never count: 3 rendered + 2 deduped → 3.
+  const dedupedRound = zorec('hot', ATTR_NOW - 10 * 60_000, { deduped: ['hot'] })
+  assert.equal(aggregateZeroOpen([...five.slice(2), dedupedRound, { ...dedupedRound }], [], ATTR_NOW).has('hot'), false)
+  // One open ever (wide scope, even far outside the window) disqualifies.
+  const openedLongAgo = orec(new Date(ATTR_NOW - 40 * DAY_MS).toISOString(), 'hot')
+  assert.equal(aggregateZeroOpen(five, [openedLongAgo], ATTR_NOW).has('hot'), false)
+})
+
+test('aggregateZeroOpen: only injections inside the rolling 30-day window count', () => {
+  // 4 recent + 2 stale rounds = 6 whole-window, 4 windowed → not qualified.
+  const recent = [0, 1, 2, 3].map((k) => zorec('stale', ATTR_NOW - k * 60_000))
+  const old = [0, 1].map((k) => zorec('stale', ATTR_NOW - (ZERO_OPEN_WINDOW_DAYS + 1 + k) * DAY_MS))
+  assert.equal(aggregateZeroOpen([...recent, ...old], [], ATTR_NOW).has('stale'), false)
+  // 5 windowed (4 recent + 1 exactly at the cutoff edge) → qualified with 5.
+  const edge = zorec('stale', ATTR_NOW - ZERO_OPEN_WINDOW_DAYS * DAY_MS)
+  const justBefore = zorec('stale', ATTR_NOW - ZERO_OPEN_WINDOW_DAYS * DAY_MS - 1)
+  const withEdge = aggregateZeroOpen([...recent, edge, justBefore, ...old], [], ATTR_NOW)
+  assert.equal(withEdge.get('stale'), 5, 'cutoff edge is inclusive, 1ms older is not')
+  // Unparsable stamps cannot prove window membership → skipped.
+  const garbage = arec({ at: 't', sessionId: undefined, hits: [{ slug: 'hot', score: 0.4, reasons: [], viaGraph: false }] })
+  assert.equal(aggregateZeroOpen([garbage], [], ATTR_NOW).size, 0)
+})
+
+test('aggregateOpenPanel: zero-open list is window-scoped, per-topic table stays whole-window', () => {
+  // 'stale-hot': 6 rendered rounds total, but only 4 inside the 30-day
+  // window anchored at the newest round → off the zero-open list; its
+  // per-topic row keeps the whole-window count of 6.
+  const staleRecent = [0, 1, 2, 3].map((k) => zorec('stale-hot', ATTR_NOW - 2 * h(1) - k * 60_000))
+  const staleOld = [0, 1].map((k) => zorec('stale-hot', ATTR_NOW - (ZERO_OPEN_WINDOW_DAYS + 2 + k) * DAY_MS))
+  const fresh = [0, 1, 2, 3, 4].map((k) => zorec('fresh-hot', ATTR_NOW - k * 60_000))
+  const panel = aggregateOpenPanel([...staleRecent, ...staleOld, ...fresh], [])
+  assert.deepEqual(panel.zeroOpen.map((z) => z.slug), ['fresh-hot'])
+  assert.equal(panel.zeroOpen[0].injections, 5)
+  assert.equal(panel.zeroOpenTotal, 1)
+  const stale = panel.topics.find((t) => t.slug === 'stale-hot')
+  assert.equal(stale.injections, 6, 'per-topic row counts the whole fed window')
+  assert.equal(stale.opens, 0)
 })

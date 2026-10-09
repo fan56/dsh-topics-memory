@@ -258,6 +258,73 @@ export const SCORE_BANDS: readonly { label: string; lo: number; hi: number }[] =
 
 /** Zero-open listing threshold: injections at or above this with zero opens. */
 export const ZERO_OPEN_MIN_INJECTIONS = 5
+/** Rolling window of the zero-open rule: only rendered injections inside it count. */
+export const ZERO_OPEN_WINDOW_DAYS = 30
+/** Injection-tail rows the decay read scans — a bound comfortably covering
+ *  the 30-day window at observed round volumes. */
+export const ZERO_OPEN_TAIL = 500
+
+/**
+ * Slugs that truly rendered in one round, in delivery order: raw hits minus
+ * the round's exclusions (deduped/echoed/dropped were never assembled), plus
+ * delivered slow pointers; a slug the fast lane already delivered counts
+ * once even when the slow lane also reports it delivered ("not packed
+ * twice"). Scores ride along from the fast hit only — slow pointers carry
+ * no lexical score. Shared by the stats panel and the zero-open rule.
+ */
+export function renderedPointers(record: InjectionRecord): { slug: string; score?: number }[] {
+  const excluded = new Set<string>([
+    ...(record.deduped ?? []),
+    ...(record.echoed ?? []),
+    ...(record.dropped ?? []).map((d) => d.slug),
+  ])
+  const seen = new Set<string>()
+  const out: { slug: string; score?: number }[] = []
+  for (const h of record.hits) {
+    if (excluded.has(h.slug) || seen.has(h.slug)) continue
+    seen.add(h.slug)
+    out.push({ slug: h.slug, score: h.score })
+  }
+  for (const s of record.slow ?? []) {
+    if (seen.has(s.slug)) continue
+    seen.add(s.slug)
+    out.push({ slug: s.slug })
+  }
+  return out
+}
+
+/**
+ * Zero-open slug set — the single shared 零打开高频 rule (v5): slugs whose
+ * truly-rendered pointer count within the rolling ZERO_OPEN_WINDOW_DAYS
+ * reaches ZERO_OPEN_MIN_INJECTIONS while the WHOLE open log has never
+ * recorded an open (wide scope — an open long after the last injection
+ * still disqualifies). Returns slug → windowed rendered-pointer count for
+ * the qualifying slugs; `/topics stats` (the panel's zero-open list) and
+ * the retrieval decay (`zeroOpenDecay`) both consume this one
+ * implementation. Records with unparsable `at` cannot prove window
+ * membership and are skipped (same tolerance as aggregateUsage).
+ */
+export function aggregateZeroOpen(
+  injections: readonly InjectionRecord[],
+  opens: readonly { slug: string }[],
+  nowMs: number,
+): Map<string, number> {
+  const cutoff = nowMs - ZERO_OPEN_WINDOW_DAYS * 86_400_000
+  const counts = new Map<string, number>()
+  for (const record of injections) {
+    const at = Date.parse(record.at)
+    if (!Number.isFinite(at) || at < cutoff) continue
+    for (const p of renderedPointers(record)) {
+      counts.set(p.slug, (counts.get(p.slug) ?? 0) + 1)
+    }
+  }
+  const opened = new Set(opens.map((o) => o.slug))
+  const out = new Map<string, number>()
+  for (const [slug, n] of counts) {
+    if (n >= ZERO_OPEN_MIN_INJECTIONS && !opened.has(slug)) out.set(slug, n)
+  }
+  return out
+}
 
 export interface OpenTopicRow {
   slug: string
@@ -300,46 +367,39 @@ export interface OpenPanelStats {
  * aggregateUsage); the header numerator only counts opens that fall inside
  * the injection window, so an old open log can no longer inflate the rate
  * against a fresh injection window. Opens per slug stay wide-scope (the
- * model may open a topic long after its last injection).
+ * model may open a topic long after its last injection). The zero-open
+ * list shares the decay's rule: rendered injections counted within the
+ * rolling 30-day window (anchored at the newest round), opens wide-scope.
  */
 export function aggregateOpenPanel(
   injections: readonly InjectionRecord[],
   opens: readonly OpenRecord[],
 ): OpenPanelStats {
-  // Numerator window: the earliest round represented in the denominator.
+  // Numerator window: the earliest round represented in the denominator;
+  // the zero-open anchor is the newest round — the panel describes the log
+  // window it was fed, so a stale log still shows its霸榜 evidence.
   let windowStart = Number.POSITIVE_INFINITY
+  let windowEnd = Number.NEGATIVE_INFINITY
   for (const r of injections) {
     const atMs = Date.parse(r.at)
-    if (Number.isFinite(atMs) && atMs < windowStart) windowStart = atMs
+    if (!Number.isFinite(atMs)) continue
+    if (atMs < windowStart) windowStart = atMs
+    if (atMs > windowEnd) windowEnd = atMs
   }
   const topicCounts = new Map<string, number>()
   const bandPointers = new Array<number>(SCORE_BANDS.length).fill(0)
   let pointerEntries = 0
   for (const r of injections) {
-    const excluded = new Set<string>([
-      ...(r.deduped ?? []),
-      ...(r.echoed ?? []),
-      ...(r.dropped ?? []).map((d) => d.slug),
-    ])
-    // A slug the fast lane already delivered counts once even when the slow
-    // lane also reports it delivered ("not packed twice") — a per-round set
-    // keeps the entry count and per-topic counts honest.
-    const countedThisRound = new Set<string>()
-    const countPointer = (slug: string, score: number | undefined): void => {
-      if (!countedThisRound.has(slug)) {
-        countedThisRound.add(slug)
-        pointerEntries += 1
-        topicCounts.set(slug, (topicCounts.get(slug) ?? 0) + 1)
-      }
-      if (score === undefined) return
+    // renderedPointers keeps the entry/per-topic counts honest: excluded
+    // slugs never counted, a fast+slow pair for the same slug counted once.
+    for (const p of renderedPointers(r)) {
+      pointerEntries += 1
+      topicCounts.set(p.slug, (topicCounts.get(p.slug) ?? 0) + 1)
+      const score = p.score
+      if (score === undefined) continue
       const bi = SCORE_BANDS.findIndex((b) => score >= b.lo && score < b.hi)
       if (bi >= 0) bandPointers[bi] += 1
     }
-    for (const h of r.hits) {
-      if (excluded.has(h.slug)) continue
-      countPointer(h.slug, h.score)
-    }
-    for (const s of r.slow ?? []) countPointer(s.slug, undefined)
   }
   const opensBySlug = new Map<string, number>()
   const bandOpens = new Array<number>(SCORE_BANDS.length).fill(0)
@@ -369,7 +429,14 @@ export function aggregateOpenPanel(
       return { slug, injections, opens, openRate: rate(opens, injections) }
     })
     .sort((a, b) => b.injections - a.injections || a.slug.localeCompare(b.slug))
-  const zeroOpenAll = topics.filter((t) => t.injections >= ZERO_OPEN_MIN_INJECTIONS && t.opens === 0)
+  // Zero-open cut: the shared 30-day rule (aggregateZeroOpen), anchored at
+  // the newest round so window semantics match the decay's rolling window
+  // without growing a time-bomb dependency on the wall clock.
+  const zeroOpenCounts =
+    windowEnd === Number.NEGATIVE_INFINITY ? new Map<string, number>() : aggregateZeroOpen(injections, opens, windowEnd)
+  const zeroOpenAll = [...zeroOpenCounts.entries()]
+    .map(([slug, injections]) => ({ slug, injections }))
+    .sort((a, b) => b.injections - a.injections || a.slug.localeCompare(b.slug))
   return {
     pointerEntries,
     opensInWindow,

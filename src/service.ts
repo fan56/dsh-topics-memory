@@ -10,11 +10,11 @@ import { readFile, stat } from 'node:fs/promises'
 import { readdirSync, readFileSync, statSync } from 'node:fs'
 import { join } from 'node:path'
 import * as okf from './okf.ts'
-import { searchTopics, scoreTopic, passesGate, tokenize, type RetrievableTopic, type SearchOutcome } from './retrieval.ts'
+import { searchTopics, scoreTopic, passesGate, tokenize, type RetrievableTopic, type RetrievalConfig, type SearchOutcome } from './retrieval.ts'
 import { assembleInjection, assemblePointer, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type SlowPointerInput } from './digest.ts'
 import type { BundleStore, Observation, SaveResult } from './store.ts'
 import type { TopicsConfigValue } from './config.ts'
-import { aggregateStats, querySample, aggregateUsage, USAGE_WINDOW_DAYS, attributeOpen, OPEN_ATTRIBUTION_TAIL, type AggregateStats, type InjectionRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type UsageSignal } from './ilog.ts'
+import { aggregateStats, querySample, aggregateUsage, aggregateZeroOpen, ZERO_OPEN_TAIL, USAGE_WINDOW_DAYS, attributeOpen, OPEN_ATTRIBUTION_TAIL, type AggregateStats, type InjectionRecord, type OpenRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type UsageSignal } from './ilog.ts'
 import { fileHistory, fileAtRev } from './git.ts'
 import type { Sync } from './sync.ts'
 
@@ -23,6 +23,25 @@ interface CacheEntry {
   size: number
   doc: okf.TopicDoc
   slug: string
+}
+
+/** Tolerant full-file JSONL read: torn tail lines skipped, unreadable file
+ *  contributes nothing (fail open) — shared by the usage/zero-open caches. */
+function parseJsonlSync<T>(file: string): T[] {
+  const out: T[] = []
+  try {
+    for (const line of readFileSync(file, 'utf8').split('\n')) {
+      if (line.trim() === '') continue
+      try {
+        out.push(JSON.parse(line) as T)
+      } catch {
+        continue // torn tail line
+      }
+    }
+  } catch {
+    // unreadable log: contribute nothing
+  }
+  return out
 }
 
 export interface RetrieveOutcome {
@@ -56,6 +75,14 @@ export class TopicsService {
     opensMs: number
     opensSize: number
     signals: Map<string, UsageSignal>
+  } | undefined
+  /** mtime-keyed cache for the zero-open slug set (zeroOpenDecay reads). */
+  private zeroOpenCache: {
+    injMs: number
+    injSize: number
+    opensMs: number
+    opensSize: number
+    slugs: ReadonlySet<string>
   } | undefined
   readonly store: BundleStore
   private readonly getConfig: () => TopicsConfigValue
@@ -132,6 +159,7 @@ export class TopicsService {
     this.cache.clear()
     this.echoCache = undefined
     this.usageCache = undefined
+    this.zeroOpenCache = undefined
   }
 
   /**
@@ -212,25 +240,9 @@ export class TopicsService {
     ) {
       return cached.signals
     }
-    const parseLines = <T>(file: string): T[] => {
-      const out: T[] = []
-      try {
-        for (const line of readFileSync(file, 'utf8').split('\n')) {
-          if (line.trim() === '') continue
-          try {
-            out.push(JSON.parse(line) as T)
-          } catch {
-            continue // torn tail line
-          }
-        }
-      } catch {
-        // unreadable log: contribute nothing
-      }
-      return out
-    }
     const signals = aggregateUsage(
-      parseLines(injFile),
-      parseLines(opensFile),
+      parseJsonlSync<InjectionRecord>(injFile),
+      parseJsonlSync<OpenRecord>(opensFile),
       USAGE_WINDOW_DAYS,
       Date.now(),
     )
@@ -242,6 +254,64 @@ export class TopicsService {
       signals,
     }
     return signals
+  }
+
+  /**
+   * Zero-open slug set for the decay (v5): the shared aggregateZeroOpen
+   * rule over the injection tail (ZERO_OPEN_TAIL rows — comfortably
+   * covers the rolling 30-day window) and the whole opens log (compacted,
+   * so a full read stays small). Sync + mtime-cached like usageSignalsSync
+   * — one read per round at most; unreadable logs fail open to an empty
+   * set (no decay), never an error. Only called when zeroOpenDecay is on.
+   */
+  zeroOpenSlugsSync(): ReadonlySet<string> {
+    const injFile = join(this.store.metaDir(), 'injections.jsonl')
+    const opensFile = join(this.store.metaDir(), 'opens.jsonl')
+    const statOf = (file: string): { mtimeMs: number; size: number } => {
+      try {
+        const st = statSync(file)
+        return { mtimeMs: st.mtimeMs, size: st.size }
+      } catch {
+        return { mtimeMs: 0, size: 0 }
+      }
+    }
+    const injSt = statOf(injFile)
+    const opensSt = statOf(opensFile)
+    const cached = this.zeroOpenCache
+    if (
+      cached !== undefined &&
+      cached.injMs === injSt.mtimeMs &&
+      cached.injSize === injSt.size &&
+      cached.opensMs === opensSt.mtimeMs &&
+      cached.opensSize === opensSt.size
+    ) {
+      return cached.slugs
+    }
+    const slugs = new Set(aggregateZeroOpen(
+      parseJsonlSync<InjectionRecord>(injFile).slice(-ZERO_OPEN_TAIL),
+      parseJsonlSync<OpenRecord>(opensFile),
+      Date.now(),
+    ).keys())
+    this.zeroOpenCache = {
+      injMs: injSt.mtimeMs,
+      injSize: injSt.size,
+      opensMs: opensSt.mtimeMs,
+      opensSize: opensSt.size,
+      slugs,
+    }
+    return slugs
+  }
+
+  /**
+   * zeroOpenDecay fields for scoring calls: empty when the gate is off —
+   * no file reads, zero behavior change — and the shared mtime-cached set
+   * when on. Spread into every searchTopics/scoreTopic cfg that already
+   * carries the usage signals (injection paths + explicit topic_search;
+   * the slow lane's recall band stays untouched, mirroring usageBoost).
+   */
+  private zeroOpenCfg(): Pick<RetrievalConfig, 'zeroOpenDecay' | 'zeroOpenSlugs'> {
+    if (this.cfg.zeroOpenDecay !== true) return {}
+    return { zeroOpenDecay: true, zeroOpenSlugs: this.zeroOpenSlugsSync() }
   }
 
   /**
@@ -269,6 +339,7 @@ export class TopicsService {
       conflicts,
       usageBoost: cfg.usageBoost,
       usage: this.usageSignalsSync(),
+      ...this.zeroOpenCfg(),
     })
     const bySlug = new Map(roster.map((r) => [r.slug, r]))
     const entries: DigestInput[] = []
@@ -368,6 +439,7 @@ export class TopicsService {
       conflicts,
       usageBoost: cfg.usageBoost,
       usage: this.usageSignalsSync(),
+      ...this.zeroOpenCfg(),
     })
     const exclude = dedup?.exclude
     const echo = dedup?.echo
@@ -427,6 +499,7 @@ export class TopicsService {
           structuralGate: true,
           usageBoost: cfg.usageBoost,
           usage: this.usageSignalsSync(),
+          ...this.zeroOpenCfg(),
         })
         shadow.push({
           slug: item.slug,
@@ -723,6 +796,7 @@ export class TopicsService {
       conflicts: await this.store.getConflicts(),
       usageBoost: cfg.usageBoost,
       usage: this.usageSignalsSync(),
+      ...this.zeroOpenCfg(),
     })
   }
 
