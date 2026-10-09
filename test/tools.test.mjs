@@ -223,3 +223,75 @@ test('tool topic_history: entries stay lossless (conclusion omitted when absent)
   const { isJsonValue } = await import('@deepseek-ai/dsh-util-values')
   assert.equal(isJsonValue(out), true, 'history output is lossless JSON')
 })
+
+// ---------------------------------------------------------------------------
+// Open enrichment (v5): sessionId rides the run context's agent handle; the
+// open record gains source/score/sinceInjectionMs via cheap tail attribution.
+// ---------------------------------------------------------------------------
+
+const HOUR = 3_600_000
+
+test('tool topic_open: attributes pointer/search/expired from the injection tail', async (t) => {
+  const { service, cleanup } = tmpService()
+  t.after(cleanup)
+  await service.store.ensure()
+  const [save, open] = buildTopicTools(service)
+  await save.execute({ title: 'fresh topic A1', conclusion: '新鲜注入。' })
+  await save.execute({ title: 'stale topic B2', conclusion: '过期注入。' })
+  // sess-1: fresh hit 1h ago (attributable) + stale hit 49h ago (expired).
+  await service.store.appendInjectionRecord({ at: new Date(Date.now() - 1 * HOUR).toISOString(), sessionId: 'sess-1', queryTokenCount: 3, rosterSize: 1, hits: [{ slug: 'fresh-topic-a1', score: 0.44, reasons: [], viaGraph: false }], nearMisses: [], injected: true })
+  await service.store.appendInjectionRecord({ at: new Date(Date.now() - 49 * HOUR).toISOString(), sessionId: 'sess-1', queryTokenCount: 3, rosterSize: 1, hits: [{ slug: 'stale-topic-b2', score: 0.9, reasons: [], viaGraph: false }], nearMisses: [], injected: true })
+
+  // Pointer: same session, fresh injection → source + score + lag.
+  await open.execute({ slug: 'fresh-topic-a1' }, { agent: { id: 'sess-1' } })
+  // Expired: same session but the only injection is past the 48h window.
+  await open.execute({ slug: 'stale-topic-b2' }, { agent: { id: 'sess-1' } })
+  // Session mismatch → search.
+  await open.execute({ slug: 'fresh-topic-a1' }, { agent: { id: 'sess-2' } })
+  // No run context at all (bare test/host surface) → search, no sessionId.
+  await open.execute({ slug: 'fresh-topic-a1' })
+
+  const opens = await service.store.readOpenRecords()
+  assert.equal(opens.length, 4)
+  const pointer = opens[0]
+  assert.equal(pointer.sessionId, 'sess-1')
+  assert.equal(pointer.source, 'pointer')
+  assert.equal(pointer.score, 0.44)
+  assert.ok(pointer.sinceInjectionMs >= HOUR && pointer.sinceInjectionMs < HOUR + 10_000, `lag≈1h, got ${pointer.sinceInjectionMs}`)
+  assert.equal(opens[1].source, 'search', '49h-old injection no longer attributes')
+  assert.ok(!('score' in opens[1]))
+  assert.equal(opens[2].source, 'search', 'another session never attributes')
+  assert.equal(opens[3].sessionId, undefined)
+  assert.equal(opens[3].source, 'search', 'no session id → plain search record')
+})
+
+test('tool topic_open: attribution follows true rendering (echoed→search, slow-only→pointer, deduped→pointer)', async (t) => {
+  const { service, cleanup } = tmpService()
+  t.after(cleanup)
+  await service.store.ensure()
+  const [save, open] = buildTopicTools(service)
+  await save.execute({ title: 'echoed topic E7', conclusion: '回声。' })
+  await save.execute({ title: 'slow topic S7', conclusion: '慢道。' })
+  await save.execute({ title: 'deduped topic D7', conclusion: '去重。' })
+  const hit = (slug, score) => ({ slug, score, reasons: [], viaGraph: false })
+  const base = { queryTokenCount: 3, rosterSize: 3, nearMisses: [], injected: true, sessionId: 's9' }
+  const at = (hoursAgo) => new Date(Date.now() - hoursAgo * HOUR).toISOString()
+  // One round: echoed fast hit (never rendered) + slow-only delivery (rendered)
+  // + deduped fast hit (rendered earlier this session).
+  await service.store.appendInjectionRecord({ ...base, at: at(1), hits: [hit('echoed-topic-e7', 0.9)], echoed: ['echoed-topic-e7'] })
+  await service.store.appendInjectionRecord({ ...base, at: at(1), hits: [], slow: [{ slug: 'slow-topic-s7', why: 'w' }] })
+  await service.store.appendInjectionRecord({ ...base, at: at(1), hits: [hit('deduped-topic-d7', 0.5)], deduped: ['deduped-topic-d7'] })
+
+  await open.execute({ slug: 'echoed-topic-e7' }, { agent: { id: 's9' } })
+  await open.execute({ slug: 'slow-topic-s7' }, { agent: { id: 's9' } })
+  await open.execute({ slug: 'deduped-topic-d7' }, { agent: { id: 's9' } })
+
+  const opens = await service.store.readOpenRecords()
+  assert.equal(opens.length, 3)
+  assert.equal(opens[0].source, 'search', 'echo-suppressed hit was never rendered')
+  assert.equal(opens[1].source, 'pointer', 'slow-only delivery rendered the pointer')
+  assert.ok(!('score' in opens[1]), 'slow pointers carry no lexical score')
+  assert.ok(opens[1].sinceInjectionMs >= HOUR - 5_000, `lag≈1h, got ${opens[1].sinceInjectionMs}`)
+  assert.equal(opens[2].source, 'pointer', 'deduped hit rendered earlier this session')
+  assert.equal(opens[2].score, 0.5)
+})

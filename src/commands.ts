@@ -17,7 +17,7 @@ import { serializeTopicDoc, slugify, firstParagraph } from './okf.ts'
 import { buildGraph, renderGraphHtml } from './viz.ts'
 import { CONFIG_KEYS, displayKey, type ConfigKey, type TopicsConfigValue, parseConfigValue } from './config.ts'
 import { reloadSecrets } from './jev/gate.ts'
-import { aggregateStats } from './ilog.ts'
+import { aggregateStats, aggregateOpenPanel, ZERO_OPEN_MIN_INJECTIONS } from './ilog.ts'
 import {
   askDistillSingle,
   createOnboardHandler,
@@ -52,7 +52,7 @@ export const HELP = [
   '  /topics status              bundle 健康：topic 数、观察积压、冲突、同步状态',
   '  /topics distill             手动触发一次蒸馏（观察池 → Topic，输出 marked/created/updated/gc 摘要）',
   '  /topics consolidate         手动触发一次整理（合并重复/晋升 stable/废弃过时/刷新元数据，无视 cadence 立即跑）',
-  '  /topics stats               注入统计：hit rate、top-N、near-miss 分布与调参建议',
+  '  /topics stats               注入统计：hit rate、open rate、注入 vs 打开、near-miss 分布与调参建议',
   '  /topics list                列出全部 Topic',
   '  /topics show <slug>         查看一个 Topic 全文（含反向引用）',
   '  /topics history <slug>      一个 Topic 的结论变更史（git log）',
@@ -285,7 +285,7 @@ async function doDistill(service: TopicsService, invocation: CommandInvocation, 
 
 async function renderStats(service: TopicsService): Promise<string> {
   const records = await service.store.readInjectionRecords()
-  const stats = aggregateStats(records as never)
+  const stats = aggregateStats(records)
   if (records.length === 0) return '还没有注入记录 —— 用起来之后这里会有 hit rate / top-N / near-miss 分布。'
   const lines = [
     `注入统计（最近 ${records.length} 轮）：`,
@@ -310,20 +310,14 @@ async function renderStats(service: TopicsService): Promise<string> {
     }
     lines.push(`| 慢道参与轮 | ${slowRounds}（快 ${records.length - slowRounds} / 慢或混合 ${slowRounds}${medianLag}） |`)
   }
-  // Pointer open rate (v4 §4.3): topic_open calls vs pointer entries injected.
-  // Echoed hits ride the retrieval but never became pointers — excluded here.
+  // Injection-vs-open metrics (v5): the denominator counts only pointers
+  // that truly rendered (deduped/echoed/dropped all excluded, slow pointers
+  // included) and the numerator only counts DISTINCT slugs from that
+  // rendered set opened inside the injection window — search opens and
+  // never-rendered slugs cannot inflate the rate.
   const opens = await service.store.readOpenRecords()
-  if (opens.length > 0 || records.some((r) => r.lane !== undefined)) {
-    const entries = records.reduce(
-      (acc, r) =>
-        acc +
-        r.hits.filter((h) => !(r.deduped ?? []).includes(h.slug) && !(r.echoed ?? []).includes(h.slug)).length +
-        (r.slow?.length ?? 0),
-      0,
-    )
-    const rate = entries === 0 ? 0 : Math.min(1, opens.length / entries)
-    lines.push(`| 指针打开率 | ${(rate * 100).toFixed(1)}%（${opens.length} 次 topic_open / ${entries} 条注入指针） |`)
-  }
+  const panel = aggregateOpenPanel(records, opens)
+  lines.push(`| open rate | ${(panel.openRate * 100).toFixed(1)}%（${panel.opensInWindow} 个被打开指针 / ${panel.pointerEntries} 条注入指针） |`)
   const echoedCount = records.reduce((acc, r) => acc + (r.echoed?.length ?? 0), 0)
   if (echoedCount > 0) {
     lines.push(`| 回声抑制 | ${echoedCount} 次（本会话蒸馏出的 topic 不回注） |`)
@@ -331,6 +325,31 @@ async function renderStats(service: TopicsService): Promise<string> {
   if (stats.topTopics.length > 0) {
     lines.push('', 'Top-N 被注入 Topic：', '', '| Slug | 注入次数 |', '| --- | --- |')
     for (const t of stats.topTopics.slice(0, 5)) lines.push(`| \`${cell(t.slug)}\` | ${t.count} |`)
+  }
+  // ---- 注入 vs 打开 panel ----
+  // Per-topic cut: what the header's windowed rate cannot show — which
+  // topics the model actually bothers to open (wide-scope slug attribution).
+  if (panel.topics.length > 0) {
+    lines.push(
+      '',
+      '注入 vs 打开（Top-10，注入=真正渲染的指针；打开按 slug 归因，全窗口）：',
+      '',
+      '| Topic | 注入 | 打开 | 打开率 |',
+      '| --- | --- | --- | --- |',
+      ...panel.topics.map((t) => `| \`${cell(t.slug)}\` | ${t.injections} | ${t.opens} | ${(t.openRate * 100).toFixed(1)}% |`),
+    )
+  }
+  if (panel.zeroOpenTotal > 0) {
+    const shown = panel.zeroOpen.map((z) => `\`${cell(z.slug)}\``).join('、')
+    const more = panel.zeroOpenTotal > panel.zeroOpen.length ? `（共 ${panel.zeroOpenTotal} 个）` : ''
+    lines.push('', `零打开高频（注入 ≥${ZERO_OPEN_MIN_INJECTIONS}、打开 0）：${shown}${more}`)
+  }
+  lines.push('', panel.hasSourceData ? `打开来源：pointer ${panel.pointerOpens} / search ${panel.searchOpens}` : '打开来源：暂无来源数据（需新版本 open 记录）')
+  if (panel.pointerEntries > 0) {
+    lines.push('', '| 分桶 | 指针 | 打开率 |', '| --- | --- | --- |')
+    for (const b of panel.bands) {
+      lines.push(`| ${b.label} | ${b.pointers} | ${b.pointers === 0 ? '—' : `${(b.openRate * 100).toFixed(1)}%`} |`)
+    }
   }
   if (stats.nearMissHistogram.length > 0) {
     lines.push(

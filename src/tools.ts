@@ -116,8 +116,12 @@ export function buildTopicTools(service: TopicsService) {
         },
       ],
     },
-    async execute(args) {
-      return await service.openTopic(args.slug)
+    async execute(args, exec) {
+      // The agent handle on the run context IS the session (Agent.id is the
+      // session id — the same key the injection records use). Absent in
+      // bare test/host contexts: attribution then degrades to 'search'.
+      const sessionId = exec?.agent !== undefined ? String(exec.agent.id) : undefined
+      return await service.openTopic(args.slug, sessionId)
     },
   })
 

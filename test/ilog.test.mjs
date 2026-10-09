@@ -115,3 +115,261 @@ test('aggregateUsage: vote weights, window, exclusions', () => {
   assert.equal(usage.has('dropped-1'), false)
   assert.equal(usage.has('ghost'), false)
 })
+
+// ---- open-source attribution + injection-vs-open panel (v5) ----
+import { attributeOpen, aggregateOpenPanel, aggregateZeroOpen, renderedPointers, OPEN_ATTRIBUTION_WINDOW_MS, ZERO_OPEN_WINDOW_DAYS } from '../lib/ilog.js'
+
+const ATTR_NOW = Date.parse('2026-10-08T12:00:00Z')
+const h = (n) => 3_600_000 * n
+
+function arec(over = {}) {
+  return { at: new Date(ATTR_NOW - 3_600_000).toISOString(), sessionId: 's1', queryTokenCount: 3, rosterSize: 5, hits: [], nearMisses: [], injected: true, ...over }
+}
+
+test('attributeOpen: pointer branch — same session, in window, rendered hits (deduped still counts)', () => {
+  const records = [
+    arec({ at: new Date(ATTR_NOW - 2 * h(1)).toISOString(), hits: [{ slug: 'alpha', score: 0.4, reasons: [], viaGraph: false }] }),
+    arec({ hits: [{ slug: 'alpha', score: 0.42, reasons: [], viaGraph: false }], deduped: ['alpha'] }),
+  ]
+  // Newest matching record wins; a deduped hit still attributes pointer
+  // (rendered earlier this session — the model saw it).
+  const r = attributeOpen(records, 'alpha', 's1', ATTR_NOW)
+  assert.equal(r.source, 'pointer')
+  assert.equal(r.score, 0.42)
+  assert.equal(r.sinceInjectionMs, 3_600_000)
+})
+
+test('attributeOpen: echoed hit never rendered → search (unless the slow lane delivered it)', () => {
+  const echoed = [arec({ hits: [{ slug: 'alpha', score: 0.4, reasons: [], viaGraph: false }], echoed: ['alpha'] })]
+  const r = attributeOpen(echoed, 'alpha', 's1', ATTR_NOW)
+  assert.equal(r.source, 'search', 'echo-suppressed hit was never rendered to the model')
+  assert.equal('score' in r, false)
+  assert.equal('sinceInjectionMs' in r, false)
+  // Echo-suppressed fast hit BUT delivered by the slow lane → pointer, no score.
+  const viaSlow = [arec({ hits: [{ slug: 'alpha', score: 0.4, reasons: [], viaGraph: false }], echoed: ['alpha'], slow: [{ slug: 'alpha', why: 'w' }] })]
+  const r2 = attributeOpen(viaSlow, 'alpha', 's1', ATTR_NOW)
+  assert.equal(r2.source, 'pointer')
+  assert.equal('score' in r2, false, 'slow pointers carry no lexical score')
+  assert.equal(r2.sinceInjectionMs, 3_600_000)
+})
+
+test('attributeOpen: slow-only delivery → pointer without score; dropped hit → search', () => {
+  const slowOnly = [arec({ hits: [{ slug: 'other', score: 0.9, reasons: [], viaGraph: false }], slow: [{ slug: 'alpha', why: 'w' }] })]
+  const r = attributeOpen(slowOnly, 'alpha', 's1', ATTR_NOW)
+  assert.equal(r.source, 'pointer')
+  assert.equal('score' in r, false)
+  assert.equal(r.sinceInjectionMs, 3_600_000)
+  const dropped = [arec({ hits: [{ slug: 'alpha', score: 0.4, reasons: [], viaGraph: false }], dropped: [{ slug: 'alpha', reason: 'budget' }] })]
+  assert.equal(attributeOpen(dropped, 'alpha', 's1', ATTR_NOW).source, 'search', 'budget-dropped hit never rendered')
+})
+
+test('attributeOpen: search branch — slug never injected for this session', () => {
+  const records = [arec({ hits: [{ slug: 'beta', score: 0.9, reasons: [], viaGraph: false }] })]
+  const r = attributeOpen(records, 'alpha', 's1', ATTR_NOW)
+  assert.equal(r.source, 'search')
+  assert.equal('score' in r, false)
+  assert.equal('sinceInjectionMs' in r, false)
+  // Other session's injection never attributes either.
+  assert.equal(attributeOpen(records, 'beta', 's2', ATTR_NOW).source, 'search')
+  // No session id → nothing to correlate against.
+  assert.equal(attributeOpen(records, 'beta', undefined, ATTR_NOW).source, 'search')
+})
+
+test('attributeOpen: 48h window boundary — inclusive edge, expired falls back to search', () => {
+  const edge = [arec({ at: new Date(ATTR_NOW - OPEN_ATTRIBUTION_WINDOW_MS).toISOString(), hits: [{ slug: 'alpha', score: 0.5, reasons: [], viaGraph: false }] })]
+  assert.equal(attributeOpen(edge, 'alpha', 's1', ATTR_NOW).source, 'pointer', 'exactly 48h is still attributable')
+  const expired = [arec({ at: new Date(ATTR_NOW - OPEN_ATTRIBUTION_WINDOW_MS - 1).toISOString(), hits: [{ slug: 'alpha', score: 0.5, reasons: [], viaGraph: false }] })]
+  assert.equal(attributeOpen(expired, 'alpha', 's1', ATTR_NOW).source, 'search', 'past 48h expires')
+  // Unparsable stamps never attribute (torn/garbage tail lines).
+  const garbage = [arec({ at: 't', hits: [{ slug: 'alpha', score: 1, reasons: [], viaGraph: false }] })]
+  assert.equal(attributeOpen(garbage, 'alpha', 's1', ATTR_NOW).source, 'search')
+})
+
+function orec(at, slug, extra = {}) {
+  return { slug, at, ...extra }
+}
+
+test('aggregateOpenPanel: denominator excludes dropped/deduped/echoed, counts slow, dedups fast+slow pairs', () => {
+  const injections = [
+    arec({ at: '2026-10-08T10:00:00Z', sessionId: undefined, hits: [
+      { slug: 'alpha', score: 0.4, reasons: [], viaGraph: false },
+      { slug: 'dropped-one', score: 0.45, reasons: [], viaGraph: false },
+      { slug: 'deduped-one', score: 0.5, reasons: [], viaGraph: false },
+      { slug: 'echoed-one', score: 0.6, reasons: [], viaGraph: false },
+    ], dropped: [{ slug: 'dropped-one', reason: 'budget' }], deduped: ['deduped-one'], echoed: ['echoed-one'], slow: [{ slug: 'alpha', why: 'w' }] }),
+    arec({ at: '2026-10-08T10:01:00Z', sessionId: undefined, hits: [{ slug: 'gamma', score: 2.5, reasons: [], viaGraph: false }], slow: [{ slug: 'alpha', why: 'w' }] }),
+  ]
+  const panel = aggregateOpenPanel(injections, [])
+  // Round 1: alpha (hit AND slow — one pointer), dropped/deduped/echoed excluded.
+  // Round 2: gamma + alpha-slow. Entries = 1 + 2 = 3; alpha counted per round.
+  assert.equal(panel.pointerEntries, 3)
+  const bySlug = new Map(panel.topics.map((t) => [t.slug, t]))
+  assert.equal(bySlug.get('alpha').injections, 2)
+  assert.equal(bySlug.get('gamma').injections, 1)
+  assert.equal(bySlug.has('dropped-one'), false)
+  assert.equal(bySlug.has('deduped-one'), false)
+  assert.equal(bySlug.has('echoed-one'), false)
+})
+
+test('aggregateOpenPanel: numerator = distinct in-window opens of window-rendered slugs', () => {
+  const hit = (slug) => ({ slug, score: 0.4, reasons: [], viaGraph: false })
+  const injections = [
+    arec({ at: '2026-10-08T10:00:00Z', sessionId: undefined, hits: [hit('alpha')] }),
+    arec({ at: '2026-10-08T11:00:00Z', sessionId: undefined, hits: [hit('beta')] }),
+  ]
+  const opens = [
+    orec('2026-10-07T10:00:00Z', 'alpha', { source: 'pointer', score: 0.4 }),   // a day before the window → excluded
+    orec('2026-10-08T09:59:59.999Z', 'alpha', { source: 'pointer', score: 0.4 }), // 1ms before → excluded
+    orec('2026-10-08T10:00:00Z', 'alpha', { source: 'pointer', score: 0.4 }),   // exactly the window edge → included
+    orec('2026-10-08T12:00:00Z', 'alpha', { source: 'pointer', score: 0.4 }),   // inside, same slug again → still one
+    orec('t', 'alpha', { source: 'pointer', score: 0.4 }),                      // unparsable — cannot prove outside → included
+    orec('2026-10-08T12:00:00Z', 'beta', { source: 'search' }),                 // search open never counts
+    orec('2026-10-08T12:00:00Z', 'ghost'),                                     // slug never rendered → excluded
+  ]
+  const panel = aggregateOpenPanel(injections, opens)
+  assert.equal(panel.pointerEntries, 2)
+  assert.equal(panel.opensInWindow, 1, 'alpha counted once despite repeated opens')
+  assert.equal(panel.openRate, 0.5)
+  // Wide-scope slug attribution keeps every open for the per-topic rows.
+  const bySlug = new Map(panel.topics.map((t) => [t.slug, t]))
+  assert.equal(bySlug.get('alpha').opens, 5)
+  assert.equal(bySlug.get('beta').opens, 1)
+  assert.equal(bySlug.has('ghost'), false, 'never-rendered slug gets no row')
+})
+
+test('aggregateOpenPanel: per-topic rows, zero-open list capped at 10 with total', () => {
+  // 12 topics injected 5..16 times, none ever opened.
+  const injections = []
+  for (let i = 0; i < 12; i += 1) {
+    for (let k = 0; k < 5 + i; k += 1) {
+      injections.push(arec({ at: new Date(ATTR_NOW - h(1) - k * 1000).toISOString(), sessionId: undefined, hits: [{ slug: `t${String(i).padStart(2, '0')}`, score: 0.4, reasons: [], viaGraph: false }] }))
+    }
+  }
+  // A frequently injected topic WITH an open must not appear in zero-open.
+  for (let k = 0; k < 20; k += 1) {
+    injections.push(arec({ at: new Date(ATTR_NOW - k * 1000).toISOString(), sessionId: undefined, hits: [{ slug: 'opened-lot', score: 0.4, reasons: [], viaGraph: false }] }))
+  }
+  const panel = aggregateOpenPanel(injections, [orec(new Date(ATTR_NOW).toISOString(), 'opened-lot')])
+  assert.equal(panel.zeroOpen.length, 10)
+  assert.equal(panel.zeroOpenTotal, 12)
+  // Top of both lists is the most-injected zero-open topic (t11, 16 injections).
+  assert.equal(panel.zeroOpen[0].slug, 't11')
+  assert.equal(panel.zeroOpen[0].injections, 16)
+  // Per-topic table caps at 10 rows, sorted by injections desc.
+  assert.equal(panel.topics.length, 10)
+  assert.equal(panel.topics[0].slug, 'opened-lot')
+  assert.equal(panel.topics[0].injections, 20)
+  assert.equal(panel.topics[0].opens, 1)
+})
+
+test('aggregateOpenPanel: source split + score bands', () => {
+  const injections = [
+    arec({ at: '2026-10-08T10:00:00Z', sessionId: undefined, hits: [
+      { slug: 'a', score: 0.3, reasons: [], viaGraph: false },   // band 0 lower edge
+      { slug: 'b', score: 0.5, reasons: [], viaGraph: false },   // band 1 lower edge
+      { slug: 'c', score: 0.99, reasons: [], viaGraph: false },  // band 1 upper edge
+      { slug: 'd', score: 1.0, reasons: [], viaGraph: false },   // band 2 lower edge
+      { slug: 'e', score: 4.99, reasons: [], viaGraph: false },  // band 3 upper edge
+      { slug: 'f', score: 5, reasons: [], viaGraph: false },     // band 4 lower edge
+      { slug: 'g', score: 7, reasons: [], viaGraph: false },     // band 4
+      { slug: 'h', score: 0.25, reasons: [], viaGraph: false },  // below every band (still a pointer)
+    ] }),
+  ]
+  const opens = [
+    orec('2026-10-08T11:00:00Z', 'a', { source: 'pointer', score: 0.3 }),
+    orec('2026-10-08T11:01:00Z', 'a', { source: 'pointer', score: 0.3 }),
+    orec('2026-10-08T11:02:00Z', 'b', { source: 'search' }),
+    orec('2026-10-08T11:03:00Z', 'c'), // legacy: no source field
+  ]
+  const panel = aggregateOpenPanel(injections, opens)
+  assert.equal(panel.pointerEntries, 8)
+  assert.equal(panel.hasSourceData, true)
+  assert.equal(panel.pointerOpens, 2)
+  assert.equal(panel.searchOpens, 1)
+  const byLabel = new Map(panel.bands.map((b) => [b.label, b]))
+  assert.deepEqual(panel.bands.map((b) => b.label), ['[0.3,0.5)', '[0.5,1)', '[1,2)', '[2,5)', '[5,∞)'])
+  assert.deepEqual(byLabel.get('[0.3,0.5)'), { label: '[0.3,0.5)', pointers: 1, opens: 2, openRate: 1 }, 'search/legacy opens do not enter band numerators; rate capped at 1')
+  assert.deepEqual(byLabel.get('[0.5,1)'), { label: '[0.5,1)', pointers: 2, opens: 0, openRate: 0 })
+  assert.deepEqual(byLabel.get('[1,2)'), { label: '[1,2)', pointers: 1, opens: 0, openRate: 0 })
+  assert.deepEqual(byLabel.get('[2,5)'), { label: '[2,5)', pointers: 1, opens: 0, openRate: 0 })
+  assert.deepEqual(byLabel.get('[5,∞)'), { label: '[5,∞)', pointers: 2, opens: 0, openRate: 0 })
+})
+
+test('aggregateOpenPanel: legacy opens only — placeholder signal, no crash', () => {
+  const injections = [arec({ at: '2026-10-08T10:00:00Z', sessionId: undefined, hits: [{ slug: 'a', score: 1.2, reasons: [], viaGraph: false }] })]
+  const opens = [orec('2026-10-08T10:05:00Z', 'a')]
+  const panel = aggregateOpenPanel(injections, opens)
+  assert.equal(panel.hasSourceData, false)
+  assert.equal(panel.pointerOpens, 0)
+  assert.equal(panel.searchOpens, 0)
+  assert.equal(panel.opensInWindow, 1)
+  assert.equal(panel.openRate, 1)
+})
+
+// ---- renderedPointers / aggregateZeroOpen (v5 shared zero-open rule) ----
+
+const DAY_MS = 86_400_000
+
+function zorec(slug, atMs, over = {}) {
+  return arec({ at: new Date(atMs).toISOString(), sessionId: undefined, hits: [{ slug, score: 0.4, reasons: [], viaGraph: false }], ...over })
+}
+
+test('renderedPointers: exclusions out, fast+slow pair once, slow carries no score', () => {
+  const r = arec({
+    sessionId: undefined,
+    hits: [
+      { slug: 'a', score: 0.4, reasons: [], viaGraph: false },
+      { slug: 'b', score: 0.5, reasons: [], viaGraph: false },
+      { slug: 'c', score: 0.6, reasons: [], viaGraph: false },
+    ],
+    deduped: ['b'],
+    dropped: [{ slug: 'c', reason: 'budget' }],
+    slow: [{ slug: 'a', why: 'w' }, { slug: 'd', why: 'w' }],
+  })
+  assert.deepEqual(renderedPointers(r), [{ slug: 'a', score: 0.4 }, { slug: 'd' }])
+})
+
+test('aggregateZeroOpen: ≥5 windowed rendered injections with zero opens qualify', () => {
+  const five = []
+  for (let k = 0; k < 5; k += 1) five.push(zorec('hot', ATTR_NOW - k * 60_000))
+  assert.equal(aggregateZeroOpen(five, [], ATTR_NOW).get('hot'), 5)
+  // 4 rounds → below the threshold.
+  assert.equal(aggregateZeroOpen(five.slice(1), [], ATTR_NOW).has('hot'), false)
+  // Excluded rounds never count: 3 rendered + 2 deduped → 3.
+  const dedupedRound = zorec('hot', ATTR_NOW - 10 * 60_000, { deduped: ['hot'] })
+  assert.equal(aggregateZeroOpen([...five.slice(2), dedupedRound, { ...dedupedRound }], [], ATTR_NOW).has('hot'), false)
+  // One open ever (wide scope, even far outside the window) disqualifies.
+  const openedLongAgo = orec(new Date(ATTR_NOW - 40 * DAY_MS).toISOString(), 'hot')
+  assert.equal(aggregateZeroOpen(five, [openedLongAgo], ATTR_NOW).has('hot'), false)
+})
+
+test('aggregateZeroOpen: only injections inside the rolling 30-day window count', () => {
+  // 4 recent + 2 stale rounds = 6 whole-window, 4 windowed → not qualified.
+  const recent = [0, 1, 2, 3].map((k) => zorec('stale', ATTR_NOW - k * 60_000))
+  const old = [0, 1].map((k) => zorec('stale', ATTR_NOW - (ZERO_OPEN_WINDOW_DAYS + 1 + k) * DAY_MS))
+  assert.equal(aggregateZeroOpen([...recent, ...old], [], ATTR_NOW).has('stale'), false)
+  // 5 windowed (4 recent + 1 exactly at the cutoff edge) → qualified with 5.
+  const edge = zorec('stale', ATTR_NOW - ZERO_OPEN_WINDOW_DAYS * DAY_MS)
+  const justBefore = zorec('stale', ATTR_NOW - ZERO_OPEN_WINDOW_DAYS * DAY_MS - 1)
+  const withEdge = aggregateZeroOpen([...recent, edge, justBefore, ...old], [], ATTR_NOW)
+  assert.equal(withEdge.get('stale'), 5, 'cutoff edge is inclusive, 1ms older is not')
+  // Unparsable stamps cannot prove window membership → skipped.
+  const garbage = arec({ at: 't', sessionId: undefined, hits: [{ slug: 'hot', score: 0.4, reasons: [], viaGraph: false }] })
+  assert.equal(aggregateZeroOpen([garbage], [], ATTR_NOW).size, 0)
+})
+
+test('aggregateOpenPanel: zero-open list is window-scoped, per-topic table stays whole-window', () => {
+  // 'stale-hot': 6 rendered rounds total, but only 4 inside the 30-day
+  // window anchored at the newest round → off the zero-open list; its
+  // per-topic row keeps the whole-window count of 6.
+  const staleRecent = [0, 1, 2, 3].map((k) => zorec('stale-hot', ATTR_NOW - 2 * h(1) - k * 60_000))
+  const staleOld = [0, 1].map((k) => zorec('stale-hot', ATTR_NOW - (ZERO_OPEN_WINDOW_DAYS + 2 + k) * DAY_MS))
+  const fresh = [0, 1, 2, 3, 4].map((k) => zorec('fresh-hot', ATTR_NOW - k * 60_000))
+  const panel = aggregateOpenPanel([...staleRecent, ...staleOld, ...fresh], [])
+  assert.deepEqual(panel.zeroOpen.map((z) => z.slug), ['fresh-hot'])
+  assert.equal(panel.zeroOpen[0].injections, 5)
+  assert.equal(panel.zeroOpenTotal, 1)
+  const stale = panel.topics.find((t) => t.slug === 'stale-hot')
+  assert.equal(stale.injections, 6, 'per-topic row counts the whole fed window')
+  assert.equal(stale.opens, 0)
+})

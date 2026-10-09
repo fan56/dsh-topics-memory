@@ -201,6 +201,7 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `consolidateCadence` | `daily` | Consolidation-lane cadence: `daily`/`3d`/`7d`/`off`. At session start the plugin checks the last consolidation time (`meta/consolidate-state.json`) and, when due, runs the LLM gardener in the background (reusing the distill model route): local lexical clustering only feeds near-look-alike candidate clusters; four op kinds merge/promote/deprecate/refresh, out-of-scope ops are dropped; a failed call never advances the stamp, so the next start retries |
 | `deprecatedTtlDays` | `15` | Deprecated topics older than N days are dropped at session start (local rule, no model; each drop is its own git commit — history stays recoverable); `0` disables the sweep |
 | `usageBoost` | `0.15` | Usage boost (ADR 0015): topics injected/opened in the last 30 days score higher at retrieval (gate-scoped, capped at 0.2, never granted to zero-lexical candidates, structural gate not waived); `0` disables |
+| `zeroOpenDecay` | `false` | Zero-open decay: halve the retrieval score of zero-open high-frequency slugs before the threshold cut (see the section below) |
 | `pushDebounceSeconds` | `45` | GitHub-mode debounced push interval |
 | `jevEnabled` | `false` | System One decision layer master switch (experimental): `false` = zero behavior change — see the Jev decision layer section above |
 | `jevBackend` | `zen` | Decision endpoint: `zen` (free) / `native` / `openrouter` |
@@ -209,6 +210,10 @@ First-time setup belongs to `/topics onboard`; day-to-day tuning is `/topics set
 | `jevSecretFile` | none | External secret list for the outbound secret gate; re-read when hot-changed |
 | `jevLayaFallback` | `false` | Local laya pace-maker: fire a parallel laya call on every jev request; its answer takes over (degraded, relative-ranking only) when the primary fails |
 | `jevLayaUrl` | `http://127.0.0.1:8000/v1/systemone` | laya-serve endpoint for the pace-maker |
+
+### Zero-open decay (default off)
+
+`zeroOpenDecay: true` halves the hit score of slugs the stats panel lists as 零打开高频 — truly rendered ≥5 injections in the rolling 30 days with zero `topic_open` events ever. The decay applies at score finalization, before the match threshold, so a decayed candidate that drops below it lands in nearMisses carrying the `zero-open-decay` reason — the injection log shows why it stopped ranking. Motivation: 24 high-frequency topics held the injection leaderboard with zero opens while score and opens proved only weakly correlated (the 0.3 threshold stays untouched). Default `false` means zero behavior change; unreadable injection/open logs skip the decay (fail-open). Toggle live with `/topics set zero-open-decay on|off`.
 
 ## Acknowledgements
 

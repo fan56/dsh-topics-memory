@@ -1,6 +1,6 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { tokenize, scoreTopic, searchTopics, DEFAULT_RETRIEVAL } from '../lib/retrieval.js'
+import { tokenize, scoreTopic, searchTopics, DEFAULT_RETRIEVAL, ZERO_OPEN_DECAY_FACTOR } from '../lib/retrieval.js'
 
 function topic(overrides = {}) {
   return {
@@ -240,4 +240,56 @@ test('usageBoost: capped at 0.2, zero-lexical never boosted, 0 disables', () => 
   const off = searchTopics(query, roster, { usageBoost: 0, structuralGate: true, usage: hugeUsage })
   const base = searchTopics(query, roster, { usageBoost: 0.15, structuralGate: true })
   assert.deepEqual(off.hits.map((h) => h.slug), base.hits.map((h) => h.slug))
+})
+
+// ---- Zero-open decay (v5, behind zeroOpenDecay config gate) ----
+
+test('zeroOpenDecay: halves the content score before the gate, tag in reasons', () => {
+  const t = topic()
+  const cfg = { ...DEFAULT_RETRIEVAL, now: new Date(), recencyWindowDays: 0 }
+  const query = new Set(tokenize('dsh cron 定时'))
+  const plain = scoreTopic(query, t, cfg)
+  const decayed = scoreTopic(query, t, { ...cfg, zeroOpenDecay: true, zeroOpenSlugs: new Set(['dsh-cron']) })
+  assert.ok(decayed.score < plain.score)
+  assert.ok(decayed.reasons.includes('zero-open-decay'))
+  assert.ok(Math.abs(decayed.gateScore - plain.gateScore * ZERO_OPEN_DECAY_FACTOR) < 0.01, `gateScore ${decayed.gateScore} vs halved ${plain.gateScore}`)
+  // Recency still rides OUTSIDE the decay as the ranking tiebreaker.
+  const withRecency = scoreTopic(query, t, { ...cfg, recencyWindowDays: 7, zeroOpenDecay: true, zeroOpenSlugs: new Set(['dsh-cron']) })
+  assert.ok(Math.abs(withRecency.score - (decayed.score + 0.2)) < 0.01)
+  // Default off: the set present but the gate absent → byte-identical score.
+  const off = scoreTopic(query, t, { ...cfg, zeroOpenSlugs: new Set(['dsh-cron']) })
+  assert.equal(off.score, plain.score)
+  assert.equal(off.reasons.includes('zero-open-decay'), false)
+  // Gate on but the slug not on the list → untouched.
+  const other = scoreTopic(query, t, { ...cfg, zeroOpenDecay: true, zeroOpenSlugs: new Set(['unrelated-slug']) })
+  assert.equal(other.score, plain.score)
+})
+
+test('zeroOpenDecay: decayed-below-threshold falls into nearMisses with the tag', () => {
+  // 9 query tokens: 'stays-hit' title-matches 3 → ×3 = 1.0 (≥0.6, halves to
+  // 0.5, still a hit); 'falls-near' description-matches 3 → ×1.2 = 0.4
+  // (halves to 0.2 < 0.3 → near-miss band [0.15, 0.3), tag rides along).
+  const query = '蒸馏 适配器 超时 回滚 折叠 语义 回放 命名'
+  const roster = [
+    { slug: 'stays-hit', title: '蒸馏适配器手册', tags: [], depends: [], generatedAt: '2026-09-01T00:00:00Z', conclusion: '无关内容。', status: 'stable' },
+    { slug: 'falls-near', title: '完全无关标题', tags: [], depends: [], generatedAt: '2026-09-01T00:00:00Z', description: '蒸馏 适配器', conclusion: '别的领域', status: 'draft' },
+  ]
+  const cfg = { threshold: 0.3, topK: 4, tagBoost: 0, graphDepth: 0, recencyWindowDays: 0, structuralGate: true }
+  const base = searchTopics(query, roster, cfg)
+  assert.deepEqual(base.hits.map((h) => h.slug).sort(), ['falls-near', 'stays-hit'], 'without decay both clear the threshold')
+
+  const decayed = searchTopics(query, roster, {
+    ...cfg,
+    zeroOpenDecay: true,
+    zeroOpenSlugs: new Set(['stays-hit', 'falls-near']),
+  })
+  const hit = decayed.hits.find((h) => h.slug === 'stays-hit')
+  assert.ok(hit, 'high scorer stays a hit at half score')
+  assert.ok(hit.reasons.includes('zero-open-decay'))
+  assert.ok(Math.abs(hit.score - 0.5) < 0.01, `half of 1.0, got ${hit.score}`)
+  assert.equal(decayed.hits.some((h) => h.slug === 'falls-near'), false, 'decayed below threshold → out of hits')
+  const miss = decayed.nearMisses.find((h) => h.slug === 'falls-near')
+  assert.ok(miss, 'lands in nearMisses where the log shows why it stopped injecting')
+  assert.ok(miss.reasons.includes('zero-open-decay'))
+  assert.ok(Math.abs(miss.score - 0.2) < 0.01, `half of 0.4, got ${miss.score}`)
 })

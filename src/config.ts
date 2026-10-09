@@ -72,6 +72,12 @@ export const TopicsConfig = z.object({
    *  granted to zero-lexical candidates; the structural gate still applies.
    *  0 = off. */
   usageBoost: z.number().default(0.15).volatile(),
+  /** Zero-open decay (v5, default off): halve the retrieval score of slugs
+   *  injected ≥5 times in the rolling 30 days with zero opens ever — the
+   *  零打开高频 leaderboard stops out-ranking topics the model actually
+   *  reads. false = zero behavior change; the reason tag `zero-open-decay`
+   *  rides the hit/near-miss reasons when on. */
+  zeroOpenDecay: z.boolean().default(false).volatile(),
   /** Debounced push delay in GitHub mode. */
   pushDebounceSeconds: z.number().default(45).volatile(),
   /** System One decision-model integration (design 2026-09-25), default-off
@@ -127,6 +133,10 @@ export type TopicsConfigValue = {
   consolidateCadence: string
   deprecatedTtlDays: number
   usageBoost: number
+  /** Zero-open decay (v5). Optional in this TS view only (same sentinel
+   *  pattern as the jev keys): bare-harness DEFAULTS predates it —
+   *  consumers must treat undefined as the documented default (false). */
+  zeroOpenDecay?: boolean
   pushDebounceSeconds: number
   /** System One integration keys (design 2026-09-25 §4). Optional in this TS
    *  view only: index.ts's bare-harness DEFAULTS literal predates them and
@@ -167,6 +177,7 @@ export const CONFIG_KEYS = [
   'consolidateCadence',
   'deprecatedTtlDays',
   'usageBoost',
+  'zeroOpenDecay',
   'pushDebounceSeconds',
   'jevEnabled',
   'jevBackend',
@@ -199,7 +210,8 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'autoObserve':
     case 'distillOnSessionEnd':
     case 'includeSubagents':
-    case 'jevEnabled': {
+    case 'jevEnabled':
+    case 'zeroOpenDecay': {
       if (raw === 'on' || raw === 'true') return true
       if (raw === 'off' || raw === 'false') return false
       return { error: `${key} 取值 on|off` }
