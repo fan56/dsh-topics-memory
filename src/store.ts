@@ -18,6 +18,7 @@ import {
   appendFile,
   access,
   rm,
+  copyFile,
 } from 'node:fs/promises'
 import { readFileSync } from 'node:fs'
 import { constants as FsConstants } from 'node:fs'
@@ -38,19 +39,34 @@ export interface TopicMeta {
   generatedAt: string
 }
 
-export type ObservationKind = 'decision' | 'finding' | 'constraint' | 'question' | 'turn'
+/** Bundle entry kinds (B2, spec §6.5 落点表: store kind 枚举). Canonical
+ *  model lives in okf.ts next to TopicStatus; re-exported here as the store
+ *  surface the spec anchors on. */
+export type TopicKind = okf.TopicKind
+export const topicKindOf = okf.topicKindOf
+
+export type ObservationKind = 'decision' | 'finding' | 'constraint' | 'question' | 'turn' | 'signal'
+
+/**
+ * Where an observation came from. `fed` marks entries that arrived through
+ * the feedObservations write seam (B-line dual-write, spec 卷二 §6.2) — the
+ * provenance marker the distill lane and audits key on.
+ */
+export type ObservationSource = 'model' | 'auto' | 'fed'
 
 export interface Observation {
   id: string
   at: string
   kind: ObservationKind
-  source: 'model' | 'auto'
+  source: ObservationSource
   text: string
   sessionId?: string
   distilled: boolean
   distilledInto?: string[]
   /** Failed distill attempts: fed to the model but consumed by no op (GC counter). */
   attempts?: number
+  /** Write-seam audit: the feedObservations caller identity (opts.actor). */
+  by?: string
 }
 
 export interface SaveResult {
@@ -418,6 +434,30 @@ export class BundleStore {
     })
   }
 
+  /**
+   * Lesson removal seam (B2/卷二 §6.2 MJ-B, spec 红线④): archive BEFORE the
+   * roster removal — the file is copied byte-exact to `archive/lessons/`
+   * inside the bundle and only then deleted from `topics/`, both landing in
+   * ONE git commit so `git revert` restores the lesson exactly (自动写资产
+   * 必须可回滚). Returns undefined when the slug doesn't exist (idempotent).
+   */
+  async archiveLesson(slug: string, opts: { message: string }): Promise<{ archivedTo: string; committed: boolean } | undefined> {
+    return this.enqueue(async () => {
+      const clean = okf.slugify(slug)
+      const file = this.topicPath(clean)
+      if (!(await existsSync(file))) return undefined
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-')
+      const archivedTo = `archive/lessons/${clean}-${stamp}.md`
+      const absTo = join(this.root, archivedTo)
+      await mkdir(dirname(absTo), { recursive: true })
+      await copyFile(file, absTo)
+      await rm(file)
+      await this.regenerateIndex()
+      const committed = await this.commit([archivedTo, `topics/${clean}.md`, 'index.md'], opts.message)
+      return { archivedTo, committed }
+    })
+  }
+
   private async regenerateIndex(): Promise<void> {    const metas = await this.listTopics()
     const entries: okf.IndexEntry[] = metas.map((m) => ({
       slug: m.slug,
@@ -483,9 +523,10 @@ export class BundleStore {
 
   async appendObservation(input: {
     kind: ObservationKind
-    source: 'model' | 'auto'
+    source: ObservationSource
     text: string
     sessionId?: string
+    by?: string
   }): Promise<Observation> {
     const obs: Observation = {
       id: `obs-${Date.now().toString(36)}-${randomUUID().slice(0, 8)}`,
@@ -496,6 +537,7 @@ export class BundleStore {
       distilled: false,
     }
     if (input.sessionId !== undefined) obs.sessionId = input.sessionId
+    if (input.by !== undefined) obs.by = input.by
     // Behind the store-wide queue: markDistilled / recordUnconsumed rewrite
     // the whole JSONL file — an unsynchronized append here could interleave
     // with a rewrite and lose either the new observation or the rewrite.

@@ -120,6 +120,13 @@ export const TopicsConfig = z.object({
    *  behavior change anywhere (byte-for-byte legacy); shadow = compute +
    *  bypass-ledger only, nothing lands in context; on = engage. */
   packageMode: z.string().default('off').volatile(),
+  /** Lesson injection gate (B2, spec §7 C1 MJ-4): off | shadow | on, default
+   *  off. off = established lessons neither inject nor shadow (zero injection-
+   *  side behavior); shadow = the lesson priority seat double-computes into
+   *  the bypass ledger (meta/lesson-shadow.jsonl), never lands in context;
+   *  on = established lessons inject. Only the injection side lives here —
+   *  the lesson loop (distill/approval) is the new repo's improveLoop gate. */
+  lessonInject: z.string().default('off').volatile(),
 })
 
 export type TopicsConfigValue = {
@@ -171,6 +178,9 @@ export type TopicsConfigValue = {
   embeddingProvider?: string
   embeddingModel?: string
   packageMode?: 'off' | 'shadow' | 'on'
+  /** Lesson injection gate (B2). Optional in this TS view only (sentinel
+   *  pattern as above) — consumers treat undefined as 'off'. */
+  lessonInject?: 'off' | 'shadow' | 'on'
 }
 
 export const CONFIG_KEYS = [
@@ -211,6 +221,7 @@ export const CONFIG_KEYS = [
   'embeddingProvider',
   'embeddingModel',
   'packageMode',
+  'lessonInject',
 ] as const
 
 export type ConfigKey = (typeof CONFIG_KEYS)[number]
@@ -294,6 +305,10 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     case 'packageMode': {
       if (raw === 'off' || raw === 'shadow' || raw === 'on') return raw
       return { error: 'package-mode 取值 off|shadow|on' }
+    }
+    case 'lessonInject': {
+      if (raw === 'off' || raw === 'shadow' || raw === 'on') return raw
+      return { error: 'lesson-inject 取值 off|shadow|on' }
     }
     case 'jevLayaFallback': {
       if (raw === 'on' || raw === 'true') return true
