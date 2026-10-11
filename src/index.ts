@@ -259,6 +259,14 @@ interface VolatileRef<T> {
  * on bare test harnesses — {@link readConfigValue} accepts both. */
 export type TopicsRuntimeConfig = Partial<{ [K in keyof TopicsConfigValue]: VolatileRef<TopicsConfigValue[K]> | TopicsConfigValue[K] }>
 
+/**
+ * B-line dual-write seam contract (卷二 §6.2) — shared types are exported by
+ * THIS repo (C1 决议 3: no shared lib until a third consumer appears). The
+ * new repo calls TopicsService.feedObservations / setLessonStatus through the
+ * host process; direct bundle writes are forbidden on its side.
+ */
+export type { StructuredObservation, FeedResult, StoreResult } from './service.ts'
+
 /** Snapshot one config slot: live ref → current value, plain value → itself. */
 function readConfigValue(slot: unknown): unknown {
   const ref = slot as { get?: unknown } | undefined
@@ -1164,6 +1172,7 @@ const DEFAULTS: TopicsConfigValue = {
   embeddingProvider: '',
   embeddingModel: '',
   packageMode: 'off',
+  lessonInject: 'off',
   usageBoost: 0.15,
   pushDebounceSeconds: 45,
 }

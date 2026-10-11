@@ -110,6 +110,8 @@ export interface AssembleResult {
   dropped: { slug: string; reason: string }[]
   /** Slow-lane pointers that entered the context (v4 §4.2). */
   slowIncluded?: string[]
+  /** Established lessons that entered the context (B2, spec 卷一 §6.3). */
+  lessonIncluded?: string[]
 }
 
 export interface AssembleConfig {
@@ -124,6 +126,36 @@ export interface SlowPointerInput {
   status: string
   description?: string
   why: string
+}
+
+/**
+ * One established-lesson pointer (B2, spec 卷一 §6.3): flat-mode normal-entry
+ * rendering with the machine-recognizable source marker (MJ-C combination
+ * matrix — lessonInject=on without the A3 package injects lessons as plain
+ * entries, tagged `lesson source:<kind>`).
+ */
+export interface LessonPointerInput {
+  slug: string
+  title: string
+  status: string
+  description?: string
+  score: number
+  source: string
+}
+
+/** The `(lesson source:x)` marker on lesson entries — flat AND package form. */
+export function lessonSourceTag(source: string): string {
+  return `lesson source:${source}`
+}
+
+/** One flat lesson entry: same two-line pointer shape + the source marker. */
+export function lessonEntryText(input: LessonPointerInput, budgetTokens: number): { text: string; usedTokens: number } {
+  const lines: string[] = []
+  lines.push(`### ${input.title} [${input.status}] (topics:${input.slug} score:${input.score.toFixed(2)}) (${lessonSourceTag(input.source)})`)
+  const one = (input.description ?? '').replace(/\s+/g, ' ').trim()
+  if (one !== '') lines.push(truncateToTokens(one, Math.max(16, budgetTokens - 32)).text)
+  const text = lines.join('\n')
+  return { text, usedTokens: estimateTokens(text) }
 }
 
 /**
@@ -153,8 +185,9 @@ function wrapBlocks(blocks: readonly string[]): string {
 
 /**
  * Shared greedy packing: fast entries first (score-ordered), then optional
- * slow-lane pointers, all under one total budget (v4 B2: shared 600 — the
- * slow lane spends whatever the fast lane leaves; 分账终值 is a P3 question).
+ * slow-lane pointers, then optional lesson entries (B2: flat-mode normal
+ * entry slots), all under one total budget (v4 B2: shared 600 — the slow lane
+ * spends whatever the fast lane leaves; 分账终值 is a P3 question).
  * Zero blocks → empty text (ADR 0006: 零命中零注入).
  */
 function packInjection(
@@ -162,12 +195,14 @@ function packInjection(
   cfg: AssembleConfig,
   render: (entry: DigestInput, budget: number) => { text: string; usedTokens: number },
   slow?: readonly SlowPointerInput[],
+  lessons?: readonly LessonPointerInput[],
 ): AssembleResult {
-  if (entries.length === 0 && (slow === undefined || slow.length === 0)) {
+  if (entries.length === 0 && (slow === undefined || slow.length === 0) && (lessons === undefined || lessons.length === 0)) {
     return { text: '', usedTokens: 0, included: [], dropped: [] }
   }
   const included: string[] = []
   const slowIncluded: string[] = []
+  const lessonIncluded: string[] = []
   const dropped: { slug: string; reason: string }[] = []
   const blocks: string[] = []
   let used = estimateTokens(`${WRAPPER_OPEN}\n${WRAPPER_INTRO}\n\n${WRAPPER_CLOSE}`)
@@ -201,35 +236,57 @@ function packInjection(
     slowIncluded.push(item.slug)
     used += block.usedTokens
   }
+  for (const item of lessons ?? []) {
+    const budget = Math.min(cfg.perTopicBudget, cfg.totalBudget - used)
+    if (budget < 24) {
+      dropped.push({ slug: item.slug, reason: 'lesson-budget' })
+      continue
+    }
+    const block = lessonEntryText(item, budget)
+    if (used + block.usedTokens > cfg.totalBudget) {
+      dropped.push({ slug: item.slug, reason: 'lesson-budget' })
+      continue
+    }
+    blocks.push(block.text)
+    lessonIncluded.push(item.slug)
+    used += block.usedTokens
+  }
   if (blocks.length === 0) return { text: '', usedTokens: 0, included: [], dropped }
   const text = wrapBlocks(blocks)
   const result: AssembleResult = { text, usedTokens: estimateTokens(text), included, dropped }
   if (slowIncluded.length > 0) result.slowIncluded = slowIncluded
+  if (lessonIncluded.length > 0) {
+    result.lessonIncluded = lessonIncluded
+    result.included = [...included, ...lessonIncluded]
+  }
   return result
 }
 
 /**
  * Greedily pack pointer entries (hits already score-ordered) under the total
- * budget. Zero hits → empty text (ADR 0006: 零命中零注入).
+ * budget. Zero hits → empty text (ADR 0006: 零命中零注入). `lessons` (B2)
+ * packs after the slow pointers as flat entries with the source marker.
  */
 export function assemblePointer(
   entries: readonly DigestInput[],
   cfg: AssembleConfig,
   slow?: readonly SlowPointerInput[],
+  lessons?: readonly LessonPointerInput[],
 ): AssembleResult {
-  return packInjection(entries, cfg, pointerEntry, slow)
+  return packInjection(entries, cfg, pointerEntry, slow, lessons)
 }
 
 /**
- * Greedily pack per-topic digests (hits already score-ordered) under the
- * total budget. Zero hits → empty text (ADR 0006: 零命中零注入).
+ * Greedily pack per-topic digests (hits already score-ordered) under the total
+ * budget. Zero hits → empty text (ADR 0006: 零命中零注入). `lessons` (B2).
  */
 export function assembleInjection(
   entries: readonly DigestInput[],
   cfg: AssembleConfig,
   slow?: readonly SlowPointerInput[],
+  lessons?: readonly LessonPointerInput[],
 ): AssembleResult {
-  return packInjection(entries, cfg, topicDigest, slow)
+  return packInjection(entries, cfg, topicDigest, slow, lessons)
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +310,15 @@ export interface PackageCandidate {
   reasons: string[]
   /** Edge/lane provenance: `depends:dN` | `slow-pick` | `semantic…` | raw. */
   via?: string
+  /**
+   * Lesson priority seat (B2, spec 卷一 §6.3): sorts FIRST in the direct
+   * layer and is exempt from the ≤2 direct-seat cap (still budget-bound) —
+   * 「主层 ≤2 席中命中 lesson 至少 1 席」. Absent on every topic candidate.
+   */
+  prioritySeat?: boolean
+  /** Rendered as a `(${sourceTag})` suffix on the entry head — lesson source
+   *  marker (`lesson source:correction`), MJ-C. */
+  sourceTag?: string
 }
 
 export interface PackageInput {
@@ -401,11 +467,16 @@ function isTrivialQuery(query: string, queryTokens: readonly string[]): boolean 
   return stripped.length > 0 && stripped.length <= PACKAGE_TRIVIAL_QUERY_CHARS
 }
 
-/** Stable within-layer order: score desc, then usage, then input order. */
+/** Stable within-layer order: prioritySeat first (lesson 优先席), then score
+ *  desc, then usage, then input order. */
 function rankStable(list: readonly PackageCandidate[], usage: Map<string, number> | undefined): PackageCandidate[] {
   return list
     .map((c, i) => ({ c, i, u: usage?.get(c.slug) ?? 0 }))
-    .sort((a, b) => b.c.score - a.c.score || b.u - a.u || a.i - b.i)
+    .sort((a, b) =>
+      (b.c.prioritySeat === true ? 1 : 0) - (a.c.prioritySeat === true ? 1 : 0) ||
+      b.c.score - a.c.score ||
+      b.u - a.u ||
+      a.i - b.i)
     .map((x) => x.c)
 }
 
@@ -452,7 +523,7 @@ function directEntryText(
   queryTokens: readonly string[],
   budget: number,
 ): { text: string; usedTokens: number } {
-  const head = `### ${c.title} [${c.status}]`
+  const head = `### ${c.title} [${c.status}]${c.sourceTag !== undefined && c.sourceTag !== '' ? ` (${c.sourceTag})` : ''}`
   const why = packageWhyLine(c, queryTokens)
   const warn = c.reasons.includes('conflicted-demoted') ? '⚠ 此条存在未合并冲突，结论可能过期。' : null
   const openBase = `细节: topic_open "${c.slug}"`
@@ -568,7 +639,9 @@ export function assemblePackage(input: PackageInput, opts?: PackageOpts): Packag
   const layers: PackageResult['layers'] = { direct: [], neighborhood: [], weak: [] }
   const directBlocks: string[] = []
   for (const c of direct) {
-    if (directBlocks.length >= PACKAGE_DIRECT_MAX && !isEntityAnchored(input.queryTokens, c)) {
+    // prioritySeat (lesson 优先席) is exempt from the direct-seat cap — the
+    // budget is the only thing that can still cut it.
+    if (directBlocks.length >= PACKAGE_DIRECT_MAX && !isEntityAnchored(input.queryTokens, c) && c.prioritySeat !== true) {
       dropped.push({ slug: c.slug, reason: 'direct-cap' })
       continue
     }
