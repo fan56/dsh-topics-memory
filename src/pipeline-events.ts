@@ -23,8 +23,11 @@ import { metaDir } from './paths.ts'
  *  the slow lane's per-run disposition row (quality.ts); the distill/link
  *  kinds are the A2/A6 producers' contract — they import this module. The
  *  two `seam-*` kinds are the B-line dual-write audit trail (卷二 §6.2:
- *  caller-identity audit — opts.actor — rides every seam call). */
-export type PipelineEventKind = 'slow-lane-outcome' | 'distill-op-invalid' | 'distill-op-retry-exhausted' | 'link-ref-rejected' | 'seam-observations-fed' | 'seam-lesson-status'
+ *  caller-identity audit — opts.actor — rides every seam call).
+ *  `lesson-conflict-flagged` is the lesson distill branch's conflict
+ *  self-check flag (B2 决议 5): informational for the B4 approval surface —
+ *  the draft still lands as hint, no lifecycle state changes on this event. */
+export type PipelineEventKind = 'slow-lane-outcome' | 'distill-op-invalid' | 'distill-op-retry-exhausted' | 'link-ref-rejected' | 'seam-observations-fed' | 'seam-lesson-status' | 'lesson-conflict-flagged'
 
 /** File NAME inside the bundle's meta dir (path via pipelineEventsFile). */
 export const PIPELINE_EVENTS_FILE = 'pipeline-events.jsonl'
@@ -51,6 +54,7 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<string>([
   'link-ref-rejected',
   'seam-observations-fed',
   'seam-lesson-status',
+  'lesson-conflict-flagged',
 ])
 
 export function pipelineEventsFile(bundleDir: string): string {
