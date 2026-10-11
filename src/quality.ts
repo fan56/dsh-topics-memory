@@ -15,8 +15,11 @@
  * Picks rest in a per-session pending slot and inject at the NEXT spliced
  * (steer message), then the slot is gone (消费即清). Hard bounds: per-call
  * 20s, pipeline 45s, pending TTL 10min, turn-lag ≤2. Every failure is
- * contained and silent — I3 (可丢弃性): async products may be missing, never
- * blocking. The lexical re-gate at consumption is SHADOW-ONLY (v4 B3): it
+ * contained — async products may be missing, never blocking (I3 可丢弃性) —
+ * but no longer SILENT (A4 决议 3): each run lands a `slow-lane-outcome`
+ * disposition (SlowOutcome) on the session and in the pipeline-events
+ * ledger, so 「没跑」and 「跑了全败」are distinguishable in the log. The
+ * lexical re-gate at consumption is SHADOW-ONLY (v4 B3): it
  * records verdicts into ilog and never blocks a pick.
  *
  * @module quality
@@ -26,7 +29,7 @@ import type { TopicsService } from './service.ts'
 import type { ModelCaller } from './distill.ts'
 import { searchTopics } from './retrieval.ts'
 import type { RingEntry } from './observer.ts'
-import type { QueryBuildShape } from './ilog.ts'
+import type { QueryBuildShape, SlowOutcome } from './ilog.ts'
 import type { TopicsConfigValue } from './config.ts'
 import { jevAskDual } from './jev/dual.ts'
 import type { JevQuestion } from './jev/client.ts'
@@ -35,6 +38,11 @@ import { band as jevBand } from './jev/thresholds.ts'
 import type { JevBand } from './jev/thresholds.ts'
 import { digestFor, logVerdicts } from './jev/log.ts'
 import type { JevVerdictRecord } from './jev/log.ts'
+import { recordPipelineEvent } from './pipeline-events.ts'
+
+/** Re-exported for the ilog writers (spec §8.2): the service layer takes a
+ *  pending's `outcome` (or lastOutcomeOf) as the record's `slowOutcome`. */
+export type { SlowOutcome }
 
 export const PENDING_TTL_MS = 10 * 60_000
 /** Hard drift bound: a pending older than this many turn-ends expires. */
@@ -197,6 +205,13 @@ export interface PendingInjection {
   queryBuild: QueryBuildShape
   model: string
   ms: number
+  /**
+   * The producing run's disposition (A4 决议 3, spec §8.2) — always
+   * 'delivered' here (a pending only exists after a settled run). The
+   * service layer copies it into the ilog record's `slowOutcome` at
+   * consumption; expiry surfaces as `expired` via ConsumeResult instead.
+   */
+  outcome: SlowOutcome
 }
 
 export type ConsumeResult = { pending: PendingInjection } | { expired: 'ttl' | 'turn-lag' } | undefined
@@ -270,11 +285,32 @@ export function parseJsonObject(raw: string): Record<string, unknown> {
   throw new Error('unbalanced JSON in output')
 }
 
+/** The closed outcome for an error that escaped the produce body: our own
+ *  withTimeout rejections and the pipeline-deadline abort are `timeout`,
+ *  everything else (model error, bad transport, unexpected throw) is
+ *  `llm-error`. Raw error text never enters the ledger (jev/log redaction
+ *  envelope — the outcome class is the observable, not the message). */
+function classifySlowError(e: unknown, controller: AbortController): SlowOutcome {
+  if (e !== null && typeof e === 'object') {
+    const msg = (e as { message?: unknown }).message
+    if (typeof msg === 'string' && msg.startsWith('slow-lane call timeout')) return 'timeout'
+  }
+  if (controller.signal.aborted) return 'timeout'
+  return 'llm-error'
+}
+
 export class SlowLane {
   private pending = new Map<string, PendingInjection>()
   private inFlight = new Map<string, Promise<void>>()
   /** Same-session shadow serialization — a second trigger never overlaps. */
   private shadowInFlight = new Map<string, Promise<void>>()
+  /**
+   * The session's most recent slow-lane disposition (A4 决议 3): what a
+   * spliced with NO pending reports as its `slowOutcome` — without it a
+   * consumed-undefined round cannot say whether the lane never ran or ran
+   * and failed. One slot per session, overwritten by every trigger.
+   */
+  private outcomeBySession = new Map<string, SlowOutcome>()
   private readonly service: TopicsService
   private readonly caller: ModelCaller | undefined
   /**
@@ -302,10 +338,40 @@ export class SlowLane {
     return this.inFlight.has(sessionId)
   }
 
+  /**
+   * The session's most recent slow-lane disposition (A4 §3.2): a round whose
+   * consume() came up empty writes THIS as its ilog `slowOutcome` (spec §8.2
+   * — 「spliced 收到但未 produce 也留痕」). Undefined when the lane never
+   * triggered for the session.
+   */
+  lastOutcomeOf(sessionId: string): SlowOutcome | undefined {
+    return this.outcomeBySession.get(sessionId)
+  }
+
+  /**
+   * One disposition, two sinks (A4 决议 3): the per-session slot above and a
+   * `slow-lane-outcome` row in the pipeline-events ledger. Metadata only
+   * (outcome/reason/session/turn/timing — never ring or query text). Never
+   * throws, never rejects: traceability must not become a failure source.
+   */
+  private traceOutcome(sessionId: string, turnId: number, outcome: SlowOutcome, reason: string, extra: Record<string, string | number | boolean> = {}): void {
+    try {
+      this.outcomeBySession.set(sessionId, outcome)
+      void recordPipelineEvent(this.service.store.root, {
+        at: new Date().toISOString(),
+        kind: 'slow-lane-outcome',
+        detail: { outcome, reason, sessionId, turnId, ...extra },
+      })
+    } catch {
+      // contained — the ledger is best-effort by design
+    }
+  }
+
   /** Drop the pending slot (session teardown, restore boundary). */
   clear(sessionId: string): void {
     this.pending.delete(sessionId)
     this.shadowInFlight.delete(sessionId)
+    this.outcomeBySession.delete(sessionId)
   }
 
   /**
@@ -400,17 +466,36 @@ export class SlowLane {
 
   /**
    * Produce a pending slot for the session's next steer message. Fire-and-
-   * forget; every guard failure is silent. Policy gates live here (config,
-   * sampling, in-flight); host gates (delegation, distill yield) live with
-   * the caller, which owns those services.
+   * forget; every guard failure is contained (never breaks the event
+   * handler) and QUALIFIED (A4 决议 3): a skipped trigger lands a `no-run`
+   * outcome naming the guard, so a later spliced can report why there was
+   * nothing to consume. Policy gates live here (config, sampling, in-flight);
+   * host gates (delegation, distill yield) live with the caller, which owns
+   * those services.
    */
   dispatch(sessionId: string, input: DispatchInput): void {
     try {
       const cfg = this.service.cfg
-      if (cfg.qualityLane !== 'sampled' && cfg.qualityLane !== 'always') return
-      if (cfg.qualityLane === 'sampled' && input.turnId % SAMPLED_EVERY !== 0) return
-      if (this.caller === undefined || this.inFlight.has(sessionId)) return
-      if (input.ring.length === 0) return
+      if (cfg.qualityLane !== 'sampled' && cfg.qualityLane !== 'always') {
+        this.traceOutcome(sessionId, input.turnId, 'no-run', 'lane-off')
+        return
+      }
+      if (cfg.qualityLane === 'sampled' && input.turnId % SAMPLED_EVERY !== 0) {
+        this.traceOutcome(sessionId, input.turnId, 'no-run', 'cadence')
+        return
+      }
+      if (this.caller === undefined) {
+        this.traceOutcome(sessionId, input.turnId, 'no-run', 'no-caller')
+        return
+      }
+      if (this.inFlight.has(sessionId)) {
+        this.traceOutcome(sessionId, input.turnId, 'no-run', 'in-flight')
+        return
+      }
+      if (input.ring.length === 0) {
+        this.traceOutcome(sessionId, input.turnId, 'no-run', 'empty-ring')
+        return
+      }
       const run = this.produce(sessionId, input).finally(() => {
         this.inFlight.delete(sessionId)
         this.onSettle(sessionId)
@@ -424,11 +509,15 @@ export class SlowLane {
 
   private async produce(sessionId: string, input: DispatchInput): Promise<void> {
     const caller = this.caller
-    if (caller === undefined) return
+    if (caller === undefined) return // unreachable — dispatch gated it, already traced
     const started = Date.now()
     const controller = new AbortController()
     const deadline = setTimeout(() => controller.abort(), PIPELINE_TIMEOUT_MS)
     deadline.unref?.()
+    // A4 决议 3: every exit qualifies — outcome on the session + the ledger.
+    const trace = (outcome: SlowOutcome, reason: string): void => {
+      this.traceOutcome(sessionId, input.turnId, outcome, reason, { ms: Date.now() - started })
+    }
     try {
       const cfg = this.service.cfg
       const ringText = input.ring
@@ -453,9 +542,13 @@ export class SlowLane {
       try {
         built = parseJsonObject(buildRaw)
       } catch {
-        return // unparseable build → no pending, nothing logged, next turn retries
+        trace('llm-error', 'build-bad-json') // unparseable build → no pending, next turn retries
+        return
       }
-      if (built.needs !== true || typeof built.query !== 'string' || built.query.trim() === '') return
+      if (built.needs !== true || typeof built.query !== 'string' || built.query.trim() === '') {
+        trace('no-claim', 'build-no-need') // the query builder claimed no background need
+        return
+      }
       const query = built.query.trim()
       const stripped = Array.isArray(built.ignore)
         ? built.ignore.filter((s): s is string => typeof s === 'string' && s.trim() !== '').slice(0, 5)
@@ -463,7 +556,10 @@ export class SlowLane {
       const queryBuild: QueryBuildShape = { rawChars: ringText.length, keptChars: query.length, stripped }
 
       const roster = await this.service.roster().catch(() => [])
-      if (roster.length === 0) return
+      if (roster.length === 0) {
+        trace('no-candidates', 'roster-empty')
+        return
+      }
       // Recall-oriented band: gate OFF (the rerank IS this lane's gate);
       // candidates = threshold passers + the near-miss band beneath them.
       const band = searchTopics(query, roster, {
@@ -478,7 +574,10 @@ export class SlowLane {
       const candidates = [...band.hits, ...band.nearMisses]
         .filter((c) => !exclude?.has(c.slug))
         .slice(0, CANDIDATE_LIMIT)
-      if (candidates.length === 0) return
+      if (candidates.length === 0) {
+        trace('no-candidates', 'band-empty')
+        return
+      }
       const bySlug = new Map(roster.map((r) => [r.slug, r]))
       const payload = candidates.flatMap((c) => {
         const meta = bySlug.get(c.slug)
@@ -494,7 +593,10 @@ export class SlowLane {
           },
         ]
       })
-      if (payload.length === 0) return
+      if (payload.length === 0) {
+        trace('no-candidates', 'payload-empty')
+        return
+      }
       // ---- jev batch rerank (design §2 row 1) — replaces the LLM rerank ----
       // One batched noul request over the whole band; the calibrated bands
       // decide the picks. A settled jev round is FINAL here (picks or none) —
@@ -503,9 +605,15 @@ export class SlowLane {
       if (this.service.cfg.jevEnabled === true) {
         const jevItems = await this.jevRerank(query, payload)
         if (jevItems !== undefined) {
-          if (jevItems.length > 0) this.settlePending(sessionId, input, jevItems, queryBuild, started)
+          if (jevItems.length > 0) {
+            this.settlePending(sessionId, input, jevItems, queryBuild, started)
+            trace('delivered', 'jev-picks')
+          } else {
+            trace('no-candidates', 'jev-zero-picks')
+          }
           return
         }
+        // jev failure → the legacy rerank below owns the final trace.
       }
       const rerankRaw = await withTimeout(
         caller({
@@ -528,6 +636,7 @@ export class SlowLane {
       try {
         reranked = parseJsonObject(rerankRaw)
       } catch {
+        trace('llm-error', 'rerank-bad-json')
         return
       }
       const legal = new Set(payload.map((p) => p.slug))
@@ -545,16 +654,28 @@ export class SlowLane {
         items.push({ slug, why: why.trim().slice(0, 200) })
         if (items.length >= 2) break
       }
-      if (items.length === 0) return
+      if (items.length === 0) {
+        trace('no-candidates', 'rerank-zero-picks') // ran fine, gate picked nothing worth injecting
+        return
+      }
       this.settlePending(sessionId, input, items, queryBuild, started)
-    } catch {
-      // timeouts, aborts, model errors — I3: the async product is simply absent
+      trace('delivered', 'rerank-picks')
+    } catch (e) {
+      // RED LINE, A4 决议 3 (revising the old silent catch): the fast lane's
+      // fail-silently principle only covers the SYNCHRONOUS seam — this is an
+      // async lane, so the failure must be observable while still never
+      // rethrowing at the caller (I3 可丢弃性: the async product is absent,
+      // but its absence is now qualified, not mute).
+      trace(classifySlowError(e, controller), 'call-failed')
     } finally {
       clearTimeout(deadline)
     }
   }
 
-  /** One pending slot per settled pipeline (the 0-2 picks + lane metadata). */
+  /** One pending slot per settled pipeline (the 0-2 picks + lane metadata).
+   *  The pending carries its producing run's disposition (A4 §3.2) so the
+   *  ilog writer can copy it verbatim — a pending only exists when the run
+   *  delivered, hence the constant. */
   private settlePending(sessionId: string, input: DispatchInput, items: { slug: string; why: string }[], queryBuild: QueryBuildShape, started: number): void {
     const route = this.service.cfg
     this.pending.set(sessionId, {
@@ -564,6 +685,7 @@ export class SlowLane {
       queryBuild,
       model: `${route.distillProvider}/${route.distillModel}`,
       ms: Date.now() - started,
+      outcome: 'delivered',
     })
   }
 
@@ -657,10 +779,12 @@ export class SlowLane {
     const produced = Date.parse(pending.computedAt)
     if (!Number.isNaN(produced) && Date.now() - produced > PENDING_TTL_MS) {
       this.pending.delete(sessionId)
+      this.traceOutcome(sessionId, turnId, 'expired', 'ttl', { ageMs: Date.now() - produced })
       return { expired: 'ttl' }
     }
     if (turnId - pending.turnId > TURN_LAG_LIMIT) {
       this.pending.delete(sessionId)
+      this.traceOutcome(sessionId, turnId, 'expired', 'turn-lag', { producedTurnId: pending.turnId })
       return { expired: 'turn-lag' }
     }
     this.pending.delete(sessionId)

@@ -93,6 +93,15 @@ function sameStrings(a: readonly string[], b: readonly string[]): boolean {
   return a.length === b.length && a.every((v, i) => v === b[i])
 }
 
+/**
+ * Body heading for caller-supplied semantic links (A2). Links are rendered as
+ * `[[wikilinks]]` under this section so the EXISTING link-edge machinery
+ * (okf.bodyLinkSlugs → computeBacklinks → retrieval graph walk) indexes them
+ * as `via: 'link'` edges — the edge representation gains no new type; the
+ * body landing spot is what makes them first-class links for free.
+ */
+const LINKS_HEADING = 'Links'
+
 export interface BundleStoreOptions {
   /** Override the stamped actor (tests). Defaults to `agent:dsh-topics-memory@<host>`. */
   actor?: string
@@ -348,9 +357,17 @@ export class BundleStore {
    * Write a topic (atomic), regenerate the index, and commit both — one
    * commit per conclusion change (ADR 0003). `slug` in the doc's depends is
    * NOT normalized here; callers pass bundle-relative paths.
+   *
+   * `links` (A2, optional): whitelist-surviving semantic targets from the
+   * distill lane. Applied INSIDE this one write transaction — the topic and
+   * its edges land together (先落 topic 再建边); the Links section lands as
+   * body wikilinks and the index/backlinks regeneration below (same
+   * transaction) recomputes the edge index over them. Normalized and
+   * self/dedup-guarded here too, so any caller benefits from the same guard
+   * the distill lane already ran.
    */
   async saveTopic(
-    input: { slug: string; doc: okf.TopicDoc },
+    input: { slug: string; doc: okf.TopicDoc; links?: readonly string[] },
     opts: { message: string; actor?: string; created?: boolean },
   ): Promise<SaveResult> {
     return this.enqueue(async () => {
@@ -358,9 +375,22 @@ export class BundleStore {
       const file = this.topicPath(slug)
       const created = opts.created ?? !(await existsSync(file))
       const now = new Date().toISOString()
+      let body = input.doc.body
+      if (input.links !== undefined && input.links.length > 0) {
+        const targets: string[] = []
+        for (const raw of input.links) {
+          if (typeof raw !== 'string') continue
+          const target = okf.normalizeLinkTarget(raw)
+          if (target === undefined || target === slug || targets.includes(target)) continue
+          targets.push(target)
+        }
+        if (targets.length > 0) {
+          body = okf.setSection(body, LINKS_HEADING, targets.map((t) => `- [[${t}]]`).join('\n'))
+        }
+      }
       const doc: okf.TopicDoc = {
         fm: { ...input.doc.fm, generated: { by: opts.actor ?? this.actor, at: now } },
-        body: input.doc.body,
+        body,
       }
       const raw = okf.serializeTopicDoc(doc)
       await atomicWrite(file, raw)

@@ -501,8 +501,9 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
       if (cfg.autoInject) {
         const consumed = slowLane.consume(sessionId, observer.turnCountOf(sessionId))
         if (consumed !== undefined) {
-          if ('pending' in consumed) slow = consumed.pending
-          else slowExpired = consumed.expired
+          if ('pending' in consumed) {
+            slow = { ...consumed.pending, outcome: consumed.pending.outcome }
+          } else slowExpired = consumed.expired
         }
       }
       const r = service.retrieveSync(query, sessionId, seen === undefined && echo === undefined ? undefined : { exclude: seen, echo }, slow, slowExpired)
@@ -951,6 +952,9 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
               })
               .catch(() => undefined)
           }
+          // Embedding index maintenance (A4/A6, spec §3): boot-time freshness
+          // check + incremental rebuild — provider '' / packageMode off = no-op.
+          void service.refreshEmbeddingIndex().catch(() => undefined)
         })
         .catch((error: unknown) => {
           warn(`dsh-topics-memory 启动链失败（不影响会话启动）：${error instanceof Error ? error.message : String(error)}`)
@@ -1146,6 +1150,9 @@ const DEFAULTS: TopicsConfigValue = {
   distillMaxModelCalls: 8,
   consolidateCadence: 'daily',
   deprecatedTtlDays: 15,
+  embeddingProvider: '',
+  embeddingModel: '',
+  packageMode: 'off',
   usageBoost: 0.15,
   pushDebounceSeconds: 45,
 }

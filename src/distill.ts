@@ -12,6 +12,7 @@
 
 import * as okf from './okf.ts'
 import type { TopicsService } from './service.ts'
+import { recordPipelineEvent } from './pipeline-events.ts'
 
 // dsh 0.1.7 removed the shared catch-all 'plugin' message-source kind:
 // MessageSourceMap is now a merge-extensible sum type and every producer
@@ -48,6 +49,8 @@ export interface DistillOp {
   depends?: string[]
   open_questions?: string[]
   impact?: string[]
+  /** Semantic-association targets (A2): existing slugs or same-batch op slugs. */
+  links?: string[]
   conclusion?: string
   recommendations?: string
   status?: string
@@ -70,12 +73,13 @@ export const SYSTEM_PROMPT = [
   '任务：把观察沉淀成 Topic 操作。只输出一个 JSON 对象，不要任何其他文字、Markdown 代码块或解释。',
   '输出格式：{"ops": [...]}，每个元素：',
   '  {"op":"create","title":"主题名","description":"一句话","tags":["小写标签"],"triggers":["应想起本条的触发词"],"depends":["前置topic的slug"],',
-  '   "open_questions":["未决问题"],"impact":["影响面"],"conclusion":"当前结论(自含散文)","recommendations":"可执行建议","status":"draft",',
+  '   "open_questions":["未决问题"],"impact":["影响面"],"links":["关联topic的slug"],"conclusion":"当前结论(自含散文)","recommendations":"可执行建议","status":"draft",',
   '   "observed_ids":["obs-..."]}',
-  '  {"op":"update","slug":"已有slug","conclusion":"修订后的完整结论","open_questions":[...],"observed_ids":["obs-..."]}',
+  '  {"op":"update","slug":"已有slug","conclusion":"修订后的完整结论","open_questions":[...],"links":["关联topic的slug"],"observed_ids":["obs-..."]}',
   '规则：',
   '- 硬性要求：每个 op 必须带 observed_ids 字段，值只能从本次输入「未蒸馏观察」里列出的 id 中逐字复制（形如 "obs-..."）；create 填它所综合依据的观察 id，update 填促使本次修订的观察 id。含列表之外 id 的条目会被过滤；observed_ids 缺失、为空或过滤后不剩任何有效 id 的 op 会被整体丢弃。',
-  '- create 建议带 triggers：3-8 个「什么输入出现时应该想起这条记忆」的短语，写具体名词/术语，禁止 dsh、配置、错误 之类的泛词。',
+  '- 硬性要求：每个 create 必须带 description（一句话概括）与 triggers（恰好 3-8 个「什么输入出现时应该想起这条记忆」的短语，写具体名词/术语，禁止 dsh、配置、错误 之类的泛词）；缺失或数量不符的 create 会被补问一次，补全后仍不合规的 op 会被丢弃并落账。',
+  '- links（可选输出，不给不惩罚）：只建真实语义关联（依赖/同项目/同主题链），宁缺勿滥；每项只能是已存在 topic 的 slug 或本批其他 op 的 slug，列表之外的引用会被剔除并落账。没有真实关联就不要给 links。',
   '- conclusion 必须自含（不依赖观察原文也能读懂），写「目前有效的结论」，不是流水账。',
   '- 同一主题只允许一个 create；已有相近 topic 时用 update 修订它的 conclusion。',
   '- 观察里有价值就沉淀，没价值就跳过该观察（被跳过观察的 id 不要出现在任何 op 里）；没有可沉淀内容时输出 {"ops":[]}。',
@@ -113,6 +117,10 @@ interface BatchOutcome {
   fatalReason?: 'model-error' | 'invalid-output'
   /** Batch ids an op actually consumed — the GC's consumed set for this batch. */
   consumedIds?: string[]
+  /** create ops dropped by the schema gate (A6 §5.1) this batch. */
+  invalidOps?: number
+  /** links stripped by the whitelist (A2) this batch. */
+  rejectedLinks?: number
   detail?: string
   /**
    * Specific zero-consumption explanation for the stalled stop (undefined =
@@ -135,6 +143,48 @@ interface AppliedOps {
    * observed_ids matched the batch — the corrective-retry trigger.
    */
   droppedForIds: number
+  /** links stripped by the whitelist (A2) while applying this batch. */
+  rejectedLinks: number
+}
+
+// ---------------------------------------------------------------------
+// A6 §5.1 op schema gate + A2 links whitelist (always on, no config key:
+// the distill quality contract is not a behavior switch — failures are
+// ledgered via pipeline-events, never swallowed silently).
+// ---------------------------------------------------------------------
+
+/** create-op trigger bounds (the recall design's 3-8 strong-field contract). */
+const TRIGGERS_MIN = 3
+const TRIGGERS_MAX = 8
+
+/** A create op dropped by the schema gate, with the ledger kind it earned. */
+interface SchemaDrop {
+  /** Stable op key (slugified title / slug) for the ledger row. */
+  key: string
+  kind: 'distill-op-invalid' | 'distill-op-retry-exhausted'
+  missing: string
+}
+
+/** Stable identity for matching an op against its schema-retry re-emission. */
+function opKey(op: DistillOp): string {
+  if (op.op === 'update') return typeof op.slug === 'string' ? okf.slugify(op.slug) : ''
+  return typeof op.title === 'string' ? okf.slugify(op.title) : ''
+}
+
+/**
+ * The A6 §5.1 schema check for create ops: description 必填 + triggers 3-8
+ * 条. Update ops keep their narrower contract (slug) — the prompt never
+ * required metadata fields on a conclusion revision, and gating those would
+ * drop every revision op.
+ */
+function checkCreateSchema(op: DistillOp): { valid: boolean; missing: string } {
+  const problems: string[] = []
+  if (typeof op.description !== 'string' || op.description.trim() === '') problems.push('description')
+  const triggers = Array.isArray(op.triggers) ? op.triggers.filter((t): t is string => typeof t === 'string' && t.trim() !== '') : []
+  if (triggers.length < TRIGGERS_MIN || triggers.length > TRIGGERS_MAX) {
+    problems.push(`triggers(实际 ${triggers.length}，需 ${TRIGGERS_MIN}-${TRIGGERS_MAX})`)
+  }
+  return { valid: problems.length === 0, missing: problems.join('、') }
 }
 
 export class Distiller {
@@ -275,6 +325,8 @@ export class Distiller {
     let failureDetail: string | undefined
     let firstFetch = true
     let filteredTotal = 0
+    let invalidTotal = 0
+    let rejectedTotal = 0
     let stallDetail: string | undefined
     // GC bookkeeping (store.recordUnconsumed): every id the model EVALUATED
     // this run (parseable answer, however useless) minus the ids an op
@@ -305,6 +357,8 @@ export class Distiller {
       calls += Math.max(1, outcome.callsUsed ?? 1)
       for (const id of outcome.consumedIds ?? []) consumedRunIds.add(id)
       filteredTotal += outcome.filteredIds ?? 0
+      invalidTotal += outcome.invalidOps ?? 0
+      rejectedTotal += outcome.rejectedLinks ?? 0
       created.push(...outcome.created)
       updated.push(...outcome.updated)
       marked += outcome.marked
@@ -383,6 +437,9 @@ export class Distiller {
                   ? `后续批次未消费任何观察，本轮停止${stallDetail !== undefined ? `：${stallDetail}` : ''}`
                   : undefined
       const filteredNote = filteredTotal > 0 ? `；filtered ${filteredTotal} invalid observed_ids` : ''
+      const schemaNote = invalidTotal > 0 ? `；schema-dropped ${invalidTotal} create op(s)` : ''
+      const linkNote = rejectedTotal > 0 ? `；rejected ${rejectedTotal} invalid link ref(s)` : ''
+      const notes = `${filteredNote}${schemaNote}${linkNote}`
       const base = head === undefined ? undefined : `partial: 已蒸馏标记 ${marked} 条观察（${calls} 次模型调用）；${head}`
       result = {
         ok: true,
@@ -391,10 +448,10 @@ export class Distiller {
         marked,
         detail:
           base === undefined
-            ? filteredNote === ''
+            ? notes === ''
               ? undefined
-              : filteredNote.replace(/^；/, '')
-            : `${base}${filteredNote}`,
+              : notes.replace(/^；/, '')
+            : `${base}${notes}`,
       }
     } else {
       result = {
@@ -484,6 +541,29 @@ export class Distiller {
     if (ops.length === 0) {
       return { created: [], updated: [], marked: 0, noOps: true, callsUsed: 1 }
     }
+    // A6 §5.1 schema gate BEFORE any write: deficient creates get exactly one
+    // 补问 retry (budget-guarded), still-deficient ops are dropped and
+    // ledgered — never a silent drop. Their observations simply stay
+    // unconsumed and walk the existing GC/corrective path (three strikes).
+    const schema = await this.enforceSchema(sessionId, user, ops, budgetLeft)
+    let callsUsed = 1 + schema.retrySpent
+    for (const drop of schema.drops) {
+      await recordPipelineEvent(this.service.store.root, {
+        at: new Date().toISOString(),
+        kind: drop.kind,
+        detail: { op: drop.key, missing: drop.missing },
+      })
+    }
+    if (schema.finalOps.length === 0) {
+      return {
+        created: [],
+        updated: [],
+        marked: 0,
+        callsUsed,
+        invalidOps: schema.drops.length,
+        stallDetail: `全部 create op 未通过 schema 校验（description 必填 + triggers 3-8 条），已丢弃并落账（${schema.drops.length} 个）`,
+      }
+    }
     // observed_ids are the ONLY bridge between ops and marks — without a valid
     // id the store cannot mark anything and the batch head can never advance
     // (the real-machine zero-consumption livelock: topics landed, backlog
@@ -493,10 +573,17 @@ export class Distiller {
     // corrective retry re-emits it with fixed ids.
     const validIds = new Set(observations.map((o) => o.id))
     const idList = observations.map((o) => o.id)
-    let applied = await this.applyOps(ops, validIds)
-    let callsUsed = 1
+    // Link whitelist universe (A2): slugs existing before this batch plus
+    // every same-batch op slug (predicted; the actual create slug joins as
+    // each op lands).
+    const knownSlugs = new Set<string>(metas.map((m) => m.slug))
+    for (const op of schema.finalOps) {
+      const key = opKey(op)
+      if (key !== '') knownSlugs.add(key)
+    }
+    let applied = await this.applyOps(schema.finalOps, validIds, knownSlugs)
     if (applied.consumedIds.length === 0 && applied.droppedForIds > 0) {
-      if (budgetLeft < 2) {
+      if (budgetLeft < callsUsed + 1) {
         // No free lane: the retry must fit the same run budget.
         return {
           created: [],
@@ -504,12 +591,14 @@ export class Distiller {
           marked: 0,
           callsUsed,
           filteredIds: applied.filteredIds,
-          stallDetail: `ops 未包含有效 observed_ids（已过滤 ${applied.filteredIds} 个无效 id），且模型调用预算不足以纠错重试（剩余 ${budgetLeft - 1} 次）`,
+          rejectedLinks: applied.rejectedLinks,
+          invalidOps: schema.drops.length,
+          stallDetail: `ops 未包含有效 observed_ids（已过滤 ${applied.filteredIds} 个无效 id），且模型调用预算不足以纠错重试（剩余 ${budgetLeft - callsUsed} 次）`,
         }
       }
       const pass1 = applied
-      const { applied: pass2, why } = await this.correctiveRetry(sessionId, user, idList, validIds)
-      callsUsed = 2
+      const { applied: pass2, why } = await this.correctiveRetry(sessionId, user, idList, validIds, knownSlugs)
+      callsUsed += 1
       if (pass2 === undefined || pass2.consumedIds.length === 0) {
         const tail =
           pass2 === undefined
@@ -521,6 +610,8 @@ export class Distiller {
           marked: 0,
           callsUsed,
           filteredIds: pass1.filteredIds + (pass2?.filteredIds ?? 0),
+          rejectedLinks: pass1.rejectedLinks + (pass2?.rejectedLinks ?? 0),
+          invalidOps: schema.drops.length,
           stallDetail: `${tail}；本批 ${observations.length} 条观察零消费`,
         }
       }
@@ -531,6 +622,7 @@ export class Distiller {
         consumedSlugs: pass2.consumedSlugs,
         filteredIds: pass1.filteredIds + pass2.filteredIds,
         droppedForIds: pass2.droppedForIds,
+        rejectedLinks: pass1.rejectedLinks + pass2.rejectedLinks,
       }
     }
     let marked = 0
@@ -544,6 +636,8 @@ export class Distiller {
       marked,
       callsUsed,
       filteredIds: applied.filteredIds,
+      invalidOps: schema.drops.length,
+      rejectedLinks: applied.rejectedLinks,
       consumedIds: applied.consumedIds,
     }
   }
@@ -561,6 +655,7 @@ export class Distiller {
     originalUser: string,
     idList: readonly string[],
     validIds: ReadonlySet<string>,
+    knownSlugs: ReadonlySet<string>,
   ): Promise<{ applied?: AppliedOps; why: string }> {
     const caller = this.caller
     if (caller === undefined) return { why: 'distill caller unavailable' }
@@ -586,7 +681,115 @@ export class Distiller {
       return { why: `输出无法解析：${String(e instanceof Error ? e.message : e).slice(0, 160)}` }
     }
     if (retried.length === 0) return { why: '模型返回空 ops' }
-    return { applied: await this.applyOps(retried, validIds), why: '' }
+    return { applied: await this.applyOps(retried, validIds, knownSlugs), why: '' }
+  }
+
+  /**
+   * The A6 §5.1 schema gate, applied to the parsed batch BEFORE any write:
+   * create ops must carry description + triggers 3-8 条 (the prompt's standing
+   * requirement, now enforced). Deficient creates get exactly ONE 补问 retry
+   * that re-asks for just those ops completed — budget-guarded exactly like
+   * the corrective ids retry (`retrySpent` reports the extra call). Every
+   * still-deficient op is dropped and comes back as a SchemaDrop carrying the
+   * ledger kind: `distill-op-invalid` after a used-but-unsuccessful retry,
+   * `distill-op-retry-exhausted` when no retry could run or the retry call
+   * itself failed. Dropped ops' observations stay unconsumed — the existing
+   * GC/corrective path accounts for them, never a silent loss. Update ops
+   * keep their narrower contract (slug only).
+   */
+  private async enforceSchema(
+    sessionId: string | undefined,
+    originalUser: string,
+    ops: readonly DistillOp[],
+    budgetLeft: number,
+  ): Promise<{ finalOps: DistillOp[]; drops: SchemaDrop[]; retrySpent: number }> {
+    const valid: DistillOp[] = []
+    const invalid: { op: DistillOp; key: string; missing: string }[] = []
+    for (const op of ops) {
+      if (op.op !== 'create') {
+        valid.push(op)
+        continue
+      }
+      const check = checkCreateSchema(op)
+      if (check.valid) valid.push(op)
+      else invalid.push({ op, key: opKey(op), missing: check.missing })
+    }
+    if (invalid.length === 0) return { finalOps: valid, drops: [], retrySpent: 0 }
+    if (budgetLeft < 2) {
+      return {
+        finalOps: valid,
+        drops: invalid.map((c) => ({
+          key: c.key,
+          kind: 'distill-op-retry-exhausted' as const,
+          missing: `${c.missing}（模型调用预算不足以补问）`,
+        })),
+        retrySpent: 0,
+      }
+    }
+    const rescued = await this.schemaRetryCall(sessionId, originalUser, invalid)
+    if (rescued === undefined) {
+      return {
+        finalOps: valid,
+        drops: invalid.map((c) => ({
+          key: c.key,
+          kind: 'distill-op-retry-exhausted' as const,
+          missing: `${c.missing}（补问调用失败）`,
+        })),
+        retrySpent: 1,
+      }
+    }
+    const drops: SchemaDrop[] = []
+    for (const c of invalid) {
+      const replacement = rescued.get(c.key)
+      if (replacement !== undefined && checkCreateSchema(replacement).valid) {
+        valid.push(replacement)
+      } else {
+        drops.push({ key: c.key, kind: 'distill-op-invalid', missing: c.missing })
+      }
+    }
+    return { finalOps: valid, drops, retrySpent: 1 }
+  }
+
+  /**
+   * The one schema 补问: re-ask for exactly the deficient creates, completed.
+   * Returns key→op for what the model re-emitted (matched by slugified title),
+   * or undefined when the call itself failed / output was unparseable — the
+   * caller then ledgeres `distill-op-retry-exhausted` for every deficient op.
+   */
+  private async schemaRetryCall(
+    sessionId: string | undefined,
+    originalUser: string,
+    invalid: readonly { op: DistillOp; key: string; missing: string }[],
+  ): Promise<Map<string, DistillOp> | undefined> {
+    const caller = this.caller
+    if (caller === undefined) return undefined
+    const list = invalid.map((c) => `- create「${typeof c.op.title === 'string' ? c.op.title : ''}」（缺：${c.missing}）`).join('\n')
+    const user = [
+      originalUser,
+      '',
+      '---',
+      'schema 补问：你上一次返回的以下 create op 缺少必填字段：',
+      list,
+      '请只重新输出这些 op 的补全版本（严格 JSON，{"ops":[...]}）：每个 create 必须带 description（一句话概括）与 triggers（恰好 3-8 条具体触发短语，禁止 dsh、配置、错误 之类的泛词），并保留原有的 title/conclusion/observed_ids 等字段。无法补全的 op 不要输出。',
+    ].join('\n')
+    let raw: string
+    try {
+      raw = await caller({ system: SYSTEM_PROMPT, user, purpose: 'topics-distill', sessionId, maxTokens: 4000 })
+    } catch {
+      return undefined
+    }
+    let retried: DistillOp[]
+    try {
+      retried = parseOps(raw)
+    } catch {
+      return undefined
+    }
+    const map = new Map<string, DistillOp>()
+    for (const op of retried) {
+      const key = opKey(op)
+      if (key !== '') map.set(key, op)
+    }
+    return map
   }
 
   /**
@@ -600,8 +803,24 @@ export class Distiller {
    * failures (missing fields, unknown update slug) keep the per-op try/catch
    * isolation — one bad op never sinks the batch, and a stall they cause is
    * NOT attributed to observed_ids (no corrective retry for those).
+   *
+   * A2 links: every link target is whitelist-checked against `knownSlugs`
+   * (existing slugs ∪ same-batch op slugs); rejected refs are stripped and
+   * ledgered (`link-ref-rejected`), survivors ride the op's topic write into
+   * the store transaction (先落 topic 再建边 — one write, no separate edge
+   * pass). The set is locally seeded with this call's predicted op slugs and
+   * grows as creates land, so same-batch references resolve in op order.
    */
-  private async applyOps(ops: readonly DistillOp[], validIds: ReadonlySet<string>): Promise<AppliedOps> {
+  private async applyOps(
+    ops: readonly DistillOp[],
+    validIds: ReadonlySet<string>,
+    knownSlugs: ReadonlySet<string>,
+  ): Promise<AppliedOps> {
+    const slugs = new Set<string>(knownSlugs)
+    for (const op of ops) {
+      const key = opKey(op)
+      if (key !== '') slugs.add(key)
+    }
     const applied: AppliedOps = {
       created: [],
       updated: [],
@@ -609,6 +828,7 @@ export class Distiller {
       consumedSlugs: [],
       filteredIds: 0,
       droppedForIds: 0,
+      rejectedLinks: 0,
     }
     for (const op of ops) {
       try {
@@ -629,6 +849,8 @@ export class Distiller {
           continue
         }
         if (op.op === 'create' && typeof op.title === 'string' && typeof op.conclusion === 'string') {
+          const links = await this.acceptLinks(op, slugs)
+          applied.rejectedLinks += links.rejected
           const res = await this.service.saveTopic({
             title: op.title,
             conclusion: op.conclusion,
@@ -641,12 +863,16 @@ export class Distiller {
             recommendations: op.recommendations,
             status: op.status === 'stable' ? 'stable' : 'draft',
             source: 'distill',
+            links: links.targets,
           })
           applied.created.push(res.slug)
           applied.consumedSlugs.push(res.slug)
+          slugs.add(res.slug)
         } else if (op.op === 'update' && typeof op.slug === 'string') {
           const existing = await this.service.store.readTopic(op.slug)
           if (existing === undefined) continue
+          const links = await this.acceptLinks(op, slugs)
+          applied.rejectedLinks += links.rejected
           const res = await this.service.saveTopic({
             title: existing.fm.title,
             conclusion: typeof op.conclusion === 'string' ? op.conclusion : undefined,
@@ -654,9 +880,11 @@ export class Distiller {
             status: op.status === 'stable' || op.status === 'deprecated' ? op.status : undefined,
             slug: op.slug,
             source: 'distill',
+            links: links.targets,
           })
           applied.updated.push(res.slug)
           applied.consumedSlugs.push(res.slug)
+          slugs.add(res.slug)
         } else {
           continue
         }
@@ -666,6 +894,39 @@ export class Distiller {
       }
     }
     return applied
+  }
+
+  /**
+   * A2 links whitelist: a link survives only when its normalized target is a
+   * slug that already exists or belongs to this batch (`knownSlugs`), and not
+   * the op's own topic. Everything else is stripped and ledgered
+   * (`link-ref-rejected` — a dead edge must at least leave a trace). Returns
+   * the surviving targets (undefined when none — no Links section is written)
+   * plus the rejection count for the run detail.
+   */
+  private async acceptLinks(
+    op: DistillOp,
+    knownSlugs: ReadonlySet<string>,
+  ): Promise<{ targets?: string[]; rejected: number }> {
+    if (!Array.isArray(op.links) || op.links.length === 0) return { targets: undefined, rejected: 0 }
+    const self = opKey(op)
+    const accepted = new Set<string>()
+    let rejected = 0
+    for (const raw of op.links) {
+      if (typeof raw !== 'string') continue
+      const target = okf.normalizeLinkTarget(raw)
+      if (target === undefined || target === self || !knownSlugs.has(target)) {
+        await recordPipelineEvent(this.service.store.root, {
+          at: new Date().toISOString(),
+          kind: 'link-ref-rejected',
+          detail: { op: self, ref: raw },
+        })
+        rejected += 1
+        continue
+      }
+      accepted.add(target)
+    }
+    return { targets: accepted.size > 0 ? [...accepted] : undefined, rejected }
   }
 }
 
