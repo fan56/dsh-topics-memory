@@ -12,8 +12,11 @@
  * @module retrieval
  */
 
+import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import type { TopicMeta } from './store.ts'
 import { dependsSlugs } from './okf.ts'
+import type { EmbedResult } from './embedding.ts'
 
 export interface RetrievableTopic extends TopicMeta {
   /** `# Conclusion` section text (may be empty). */
@@ -339,4 +342,336 @@ export function searchTopics(query: string, roster: readonly RetrievableTopic[],
     }
   }
   return { hits, nearMisses, rosterSize: roster.length }
+}
+
+// ---------------------------------------------------------------------------
+// Injection-quality line (wave/injection-quality, spec §2.1/§3.1/§3.3) —
+// CAPABILITY ONLY. None of this is wired into searchTopics or any service
+// path; the caller gates it on packageMode ≠ 'off' (Phase 2 wiring). With
+// the config keys at their defaults every code path below is unreachable
+// from the hot lane, so default-off behavior stays byte-for-byte.
+// ---------------------------------------------------------------------------
+
+// --- ① Query sanitization (A4 决议 4, spec §3.3) ---------------------------
+// Pure, LLM-free, millisecond-scale. Treats the queryTokenCount p90=462
+// paste-pollution tail: fenced code blocks, URLs, line-leading shell
+// prompts, over-long lines, and a hard token cap.
+
+/**
+ * Token cap in tokenize() units — the SAME unit injections.jsonl logs as
+ * queryTokenCount (p90=462 baseline; real-query p50=153 stays untouched).
+ * Raised or lowered via SanitizeOptions.maxTokens.
+ */
+export const QUERY_TOKEN_CAP = 96
+
+/**
+ * Lines longer than this are folded to their head (log-paste guard). Sized
+ * so the 96-token cap is the binding constraint, not the fold: 96 latin
+ * tokens ≈ 650+ chars, so a legitimate long single-line query passes the
+ * fold intact and only the token cap trims it. (实现期定 constant.)
+ */
+export const MAX_LINE_CHARS = 720
+
+export interface SanitizeOptions {
+  maxTokens?: number
+  maxLineChars?: number
+}
+
+const FENCE_OPEN = /^[ \t]*(```|~~~)/
+// Line-leading shell prompt: `user@host:~/repo$ `, `C:\> `, or a bare
+// `$ `/`# `/`% `/`> `/`❯ ` marker. Requires trailing whitespace so words
+// like `$PATH` or `#tag` survive untouched.
+const LINE_PROMPT = /^[ \t]*(?:[\w.@:/\\~-]*[$#%>❯➜])[ \t]+/
+const URL_RE = /\b(?:https?:\/\/|www\.)[^\s<>"'`)\]]+/gi
+// Chunks the cap walks: one latin/digit word (or hyphenated compound) per
+// match, or one CJK run (sliced when a run alone busts the cap).
+const CHUNK_RUN = new RegExp(`${WORD_RUN.source}|${CJK_RUN.source}`, 'gu')
+
+/** Remove fenced code blocks wholesale (markers AND body): fenced code is
+ *  the paste-pollution payload; the prose around it is the actual query. */
+function stripFencedBlocks(text: string): string {
+  const out: string[] = []
+  let open: string | null = null
+  for (const line of text.split('\n')) {
+    const m = line.match(FENCE_OPEN)
+    if (open === null) {
+      if (m !== null) open = m[1]
+      else out.push(line)
+    } else if (m !== null && m[1] === open) {
+      open = null // closing fence — block fully dropped
+    }
+    // inside an open fence: drop the line
+  }
+  return out.join('\n')
+}
+
+/** Cap the sanitized text to ≤ cap distinct retrieval tokens. Fast path:
+ *  at or under the cap the text passes through VERBATIM (no re-chunking —
+ *  hyphens, punctuation and spacing survive byte-exact; retrieval scores
+ *  tokens, not bytes, but the string may be echoed into logs/injection).
+ *  Only an over-cap text rebuilds from chunks: head-first (a query's intent
+ *  leads; pollution trails), with CJK runs sliced at the character level so
+ *  a single giant run truncates instead of being dropped whole. */
+function capTokens(text: string, cap: number): string {
+  const total = tokenize(text).length
+  if (total === 0) return '' // nothing lexical survives — caller sees a zero-token query
+  if (total <= cap) return text
+  const seen = new Set<string>()
+  const kept: string[] = []
+  for (const chunk of text.match(CHUNK_RUN) ?? []) {
+    const fresh = tokenize(chunk).filter((t) => !seen.has(t))
+    if (fresh.length === 0) continue // already-covered chunk adds nothing
+    if (seen.size + fresh.length <= cap) {
+      for (const t of fresh) seen.add(t)
+      kept.push(chunk)
+      continue
+    }
+    const room = cap - seen.size
+    if (room <= 0) break
+    // Over budget: CJK runs truncate exactly (slice room+1 chars → ≤ room
+    // fresh bigrams, so the cap invariant holds). Latin chunks are single
+    // tokens by construction — they never reach here with room > 0, but if
+    // one ever does, dropping it beats busting the cap.
+    if (/^[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}]/u.test(chunk)) {
+      kept.push(chunk.slice(0, room + 1))
+    }
+    break
+  }
+  return kept.join(' ')
+}
+
+/**
+ * Sanitize a raw user query for retrieval (spec §3.3): strip fenced code
+ * blocks and URLs, fold line-leading shell prompts, fold over-long lines to
+ * their head, cap the distinct-token count. Returns '' when nothing lexical
+ * survives — the caller treats that as a zero-token query (natural skip).
+ * Pure function; the hot lane only reaches it behind packageMode.
+ */
+export function sanitizeQuery(raw: string, opts: SanitizeOptions = {}): string {
+  const cap = opts.maxTokens ?? QUERY_TOKEN_CAP
+  const maxLineChars = opts.maxLineChars ?? MAX_LINE_CHARS
+  if (raw === '') return ''
+  let text = stripFencedBlocks(raw)
+  text = text.replace(URL_RE, ' ')
+  text = text
+    .split('\n')
+    .map((line) => {
+      let l = line.replace(LINE_PROMPT, '')
+      if (l.length > maxLineChars) l = l.slice(0, maxLineChars)
+      return l
+    })
+    .join('\n')
+  text = text.replace(/\s+/g, ' ').trim()
+  if (text === '') return ''
+  return capTokens(text, cap)
+}
+
+// --- ② Embedding index (A4 决议 2, spec §3.1) -------------------------------
+// meta/embeddings.json: { slug: { model, dim, vec } }. Loading and auditing
+// never throws; a missing/corrupt index reads as EMPTY, which routes every
+// semantic path into the explicit passthrough below.
+
+export interface EmbeddingIndexEntry {
+  model: string
+  dim: number
+  vec: number[]
+}
+
+/** slug -> entry, exactly as persisted in meta/embeddings.json. */
+export type EmbeddingIndex = Record<string, EmbeddingIndexEntry>
+
+export function embeddingIndexPath(bundleDir: string): string {
+  return join(bundleDir, 'meta', 'embeddings.json')
+}
+
+function parseEmbeddingIndexEntry(value: unknown): EmbeddingIndexEntry | null {
+  if (typeof value !== 'object' || value === null) return null
+  const e = value as Record<string, unknown>
+  if (typeof e.model !== 'string' || e.model === '') return null
+  if (typeof e.dim !== 'number' || !Number.isInteger(e.dim) || e.dim <= 0) return null
+  if (!Array.isArray(e.vec) || e.vec.length !== e.dim) return null
+  if (!e.vec.every((n) => typeof n === 'number' && Number.isFinite(n))) return null
+  return { model: e.model, dim: e.dim, vec: e.vec as number[] }
+}
+
+/** Load meta/embeddings.json from a bundle dir. Missing file, corrupt JSON,
+ *  or malformed entries are skipped/empty — never throws (a broken index
+ *  must degrade to the lexical path, not break retrieval). */
+export function loadEmbeddingIndex(bundleDir: string): EmbeddingIndex {
+  let raw: string
+  try {
+    raw = readFileSync(embeddingIndexPath(bundleDir), 'utf8')
+  } catch {
+    return {}
+  }
+  try {
+    const json: unknown = JSON.parse(raw)
+    if (typeof json !== 'object' || json === null || Array.isArray(json)) return {}
+    const out: EmbeddingIndex = {}
+    for (const [slug, entry] of Object.entries(json as Record<string, unknown>)) {
+      if (slug === '') continue
+      const parsed = parseEmbeddingIndexEntry(entry)
+      if (parsed !== null) out[slug] = parsed
+    }
+    return out
+  } catch {
+    return {}
+  }
+}
+
+/** Persist the index in the canonical shape (the rebuild's write side —
+ *  embedding/rebuilding itself stays with the caller). Offline rebuild
+ *  path, not the hot lane. */
+export function saveEmbeddingIndex(bundleDir: string, index: EmbeddingIndex, mkdir = true): void {
+  if (mkdir) mkdirSync(join(bundleDir, 'meta'), { recursive: true })
+  writeFileSync(embeddingIndexPath(bundleDir), JSON.stringify(index))
+}
+
+/**
+ * An embed function bound to a config, carrying the RESOLVED model identity
+ * the index must match (build once via embedding.ts's `embedderWith`).
+ * ensureIndexFresh reads `.model` only — it never calls the function; the
+ * rebuild is the caller's job.
+ */
+export type EmbedderFn = ((texts: readonly string[]) => Promise<EmbedResult>) & { model: string }
+
+/**
+ * Freshness audit: which slugs need (re)embedding — missing from the index,
+ * built by a different model, or shape-broken (dim/vec disagree). Returns
+ * them in roster order; an EMPTY list means the index covers the roster.
+ * A '' embedder model means the semantic layer is off → nothing to maintain.
+ *
+ * NOTE the freshness boundary: content-change invalidation needs a stored
+ * content hash, which the pinned {model,dim,vec} entry shape does not carry
+ * — the rebuild trigger policy is spec-实现期定 and stays with the caller.
+ */
+export function ensureIndexFresh(index: EmbeddingIndex, topics: readonly { slug: string }[], embedFn: EmbedderFn): string[] {
+  if ((embedFn.model ?? '') === '') return []
+  const stale: string[] = []
+  for (const t of topics) {
+    const e = index[t.slug]
+    if (e === undefined || e.model !== embedFn.model || e.dim !== e.vec.length || !(e.dim > 0)) stale.push(t.slug)
+  }
+  return stale
+}
+
+// --- ③ nearFloor semantic rerank (A4 决议 2, spec §3.1) ---------------------
+// Cosine reordering of the nearFloor band ONLY (0.20–0.30 — the 93%
+// near-miss mass). Thresholds, gateScore and the structural gate are
+// untouched: the reranker reorders and tags, never re-scores.
+
+export const RERANK_FLOOR = 0.2
+export const RERANK_CEILING = 0.3
+export const SEMANTIC_RERANK_REASON = 'semantic-rerank'
+
+export interface RerankedHit extends SearchHit {
+  /** Cosine(query, slug-vector), rounded 4dp. Present only on reranked
+   *  hits; absent = the candidate rode through unchanged. */
+  similarity?: number
+}
+
+export type RerankPassthroughReason =
+  | 'no-candidates' // nothing to rank
+  | 'no-query-vector' // embed failed upstream — the explicit degradation
+  | 'empty-index' // meta/embeddings.json absent/corrupt
+  | 'no-rerankable-candidates' // band candidates lack usable index vectors
+
+export interface RerankOptions {
+  /** Expected index model; entries built by another model count as
+   *  vector-less (they ride through at the band tail). */
+  expectedModel?: string
+  floor?: number
+  ceiling?: number
+}
+
+export interface RerankResult {
+  /** Candidates in final order. On passthrough: the input array, same
+   *  order, no tags — byte-identical ordering, explicit why. */
+  hits: RerankedHit[]
+  /** true = the semantic layer engaged (order may or may not have moved). */
+  reranked: boolean
+  passthroughReason?: RerankPassthroughReason
+}
+
+/** Cosine similarity; 0 for dim mismatch or zero vectors (never throws). */
+export function cosineSimilarity(a: readonly number[], b: readonly number[]): number {
+  if (a.length === 0 || a.length !== b.length) return 0
+  let dot = 0
+  let na = 0
+  let nb = 0
+  for (let i = 0; i < a.length; i += 1) {
+    dot += a[i]! * b[i]!
+    na += a[i]! * a[i]!
+    nb += b[i]! * b[i]!
+  }
+  if (na === 0 || nb === 0) return 0
+  return dot / Math.sqrt(na * nb)
+}
+
+/**
+ * Reorder the nearFloor band (0.20–0.30 by gateScore) by cosine similarity
+ * against the query vector. Band members with a usable index vector sort by
+ * similarity (stable — ties keep input order) and gain the
+ * `semantic-rerank` reason plus their similarity; everyone else — out of
+ * band, unindexed, model-mismatched — passes through UNCHANGED at the tail
+ * in input order. Scores are never touched.
+ *
+ * Degradation is explicit and total: provider/model unconfigured, probe
+ * failure, missing query vector or missing index all return the input as-is
+ * with `reranked:false` and a passthroughReason (原序透传，不许静默 — the
+ * caller logs it into the degraded status). `queryText` rides the signature
+ * for provenance/debug parity with the caller's logging; the v1 math is
+ * vector-only.
+ */
+export function rerankNearFloor(
+  queryText: string,
+  queryVec: readonly number[] | null | undefined,
+  nearFloorCandidates: readonly SearchHit[],
+  index: EmbeddingIndex,
+  opts: RerankOptions = {},
+): RerankResult {
+  void queryText // v1 math is vector-only — see doc above
+  if (nearFloorCandidates.length === 0) {
+    return { hits: [], reranked: false, passthroughReason: 'no-candidates' }
+  }
+  if (!Array.isArray(queryVec) || queryVec.length === 0) {
+    return { hits: [...nearFloorCandidates], reranked: false, passthroughReason: 'no-query-vector' }
+  }
+  if (Object.keys(index).length === 0) {
+    return { hits: [...nearFloorCandidates], reranked: false, passthroughReason: 'empty-index' }
+  }
+  const floor = opts.floor ?? RERANK_FLOOR
+  const ceiling = opts.ceiling ?? RERANK_CEILING
+  const simOf = new Map<SearchHit, number | null>()
+  for (const hit of nearFloorCandidates) {
+    const entry = index[hit.slug]
+    const usable =
+      entry !== undefined &&
+      entry.dim === entry.vec.length &&
+      entry.dim > 0 &&
+      entry.dim === queryVec.length &&
+      (opts.expectedModel === undefined || entry.model === opts.expectedModel)
+    simOf.set(hit, usable ? cosineSimilarity(queryVec, entry.vec) : null)
+  }
+  const band = nearFloorCandidates.filter((h) => {
+    const sim = simOf.get(h)
+    return sim !== null && sim !== undefined && h.gateScore !== undefined && h.gateScore >= floor && h.gateScore < ceiling
+  })
+  if (band.length === 0) {
+    return { hits: [...nearFloorCandidates], reranked: false, passthroughReason: 'no-rerankable-candidates' }
+  }
+  const rerankedSet = new Set(band)
+  const tail = nearFloorCandidates.filter((h) => !rerankedSet.has(h))
+  // Stable sort: V8's Array#sort keeps input order for equal similarities.
+  const ordered = [...band].sort((x, y) => (simOf.get(y) as number) - (simOf.get(x) as number))
+  return {
+    hits: [
+      ...ordered.map((h) => {
+        const sim = simOf.get(h) as number
+        return { ...h, reasons: [...h.reasons, SEMANTIC_RERANK_REASON], similarity: Math.round(sim * 10_000) / 10_000 }
+      }),
+      ...tail.map((h) => ({ ...h })),
+    ],
+    reranked: true,
+  }
 }

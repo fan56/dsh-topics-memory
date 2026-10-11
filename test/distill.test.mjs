@@ -100,6 +100,7 @@ test('distiller: create + update ops land, observations marked distilled', async
           title: 'dsh-cron 定时方案',
           description: '定时任务落地方式',
           tags: ['dsh', 'cron'],
+          triggers: ['cron', '定时任务', '调度'],
           depends: [],
           open_questions: ['错过窗口是否补跑'],
           impact: ['运维流程'],
@@ -231,7 +232,7 @@ test('distiller: skipped observations stay pending', async () => {
     const o1 = await h.store.appendObservation({ kind: 'turn', source: 'auto', text: '被消费' })
     const o2 = await h.store.appendObservation({ kind: 'turn', source: 'auto', text: '被跳过' })
     const d = new Distiller(h.service, async () => JSON.stringify({
-      ops: [{ op: 'create', title: 'T', conclusion: '结论', observed_ids: [o1.id] }],
+      ops: [{ op: 'create', title: 'T', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论', observed_ids: [o1.id] }],
     }))
     const r = await d.run()
     assert.equal(r.ok, true)
@@ -395,9 +396,9 @@ async function appendObs(store, n) {
 /** Observation ids embedded in a distill prompt payload. */
 const idsIn = (user) => [...user.matchAll(/"id":"(obs-[^"]+)"/g)].map((m) => m[1])
 
-/** Valid ops JSON consuming exactly the given ids, one create per id. */
+/** Valid ops JSON consuming exactly the given ids, one create per id (schema-gate complete). */
 const consumeOps = (ids) =>
-  JSON.stringify({ ops: ids.map((id) => ({ op: 'create', title: `T ${id}`, conclusion: `结论 ${id}`, observed_ids: [id] })) })
+  JSON.stringify({ ops: ids.map((id) => ({ op: 'create', title: `T ${id}`, description: `概括 ${id}`, triggers: ['甲', '乙', '丙'], conclusion: `结论 ${id}`, observed_ids: [id] })) })
 
 test('distiller: max-tokens halves the batch, retries, and the shrink persists across runs', async () => {
   const h = make({ distillBatchSize: 8, distillMaxModelCalls: 3 })
@@ -604,7 +605,7 @@ test('distiller: all-invalid observed_ids → one corrective retry rescues the b
       calls += 1
       if (calls === 1) {
         return JSON.stringify({
-          ops: [{ op: 'create', title: '幻觉主题', conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
+          ops: [{ op: 'create', title: '幻觉主题', description: '一句话', triggers: ['幻觉甲', '幻觉乙', '幻觉丙'], conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
         })
       }
       assert.match(req.user, /纠错重试/)
@@ -631,7 +632,7 @@ test('distiller: corrective retry is capped at one — a second zero pass stalls
     const d = new Distiller(h.service, async () => {
       calls += 1
       return JSON.stringify({
-        ops: [{ op: 'create', title: '幻觉主题', conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
+        ops: [{ op: 'create', title: '幻觉主题', description: '一句话', triggers: ['幻觉甲', '幻觉乙', '幻觉丙'], conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
       })
     })
     const r = await d.run('s1')
@@ -657,8 +658,8 @@ test('distiller: partial valid ids mark without retry; filtered count lands in d
       calls += 1
       return JSON.stringify({
         ops: [
-          { op: 'create', title: '有效主题', conclusion: '结论一', observed_ids: [o.id] },
-          { op: 'create', title: '幻觉主题', conclusion: '结论二', observed_ids: ['obs-hallucinated'] },
+          { op: 'create', title: '有效主题', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论一', observed_ids: [o.id] },
+          { op: 'create', title: '幻觉主题', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论二', observed_ids: ['obs-hallucinated'] },
         ],
       })
     })
@@ -683,7 +684,7 @@ test('distiller: corrective retry respects the call budget (no free lane)', asyn
     const d = new Distiller(h.service, async () => {
       calls += 1
       return JSON.stringify({
-        ops: [{ op: 'create', title: '幻觉主题', conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
+        ops: [{ op: 'create', title: '幻觉主题', description: '一句话', triggers: ['幻觉甲', '幻觉乙', '幻觉丙'], conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
       })
     })
     const r = await d.run('s1')
@@ -707,7 +708,7 @@ test('distiller: scalar observed_ids string is normalized and rescued without re
       calls += 1
       // The commonest shape drift: the model returns a bare id, not a list.
       return JSON.stringify({
-        ops: [{ op: 'create', title: 'T', conclusion: '结论', observed_ids: ids[0] }],
+        ops: [{ op: 'create', title: 'T', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论', observed_ids: ids[0] }],
       })
     })
     const r = await d.run('s1')
@@ -732,7 +733,7 @@ test('distiller: non-array non-string observed_ids counts as dropped and fires t
         // Neither list nor string: unrescuable, but must reach droppedForIds
         // (previously a TypeError swallowed by the per-op catch — the stall
         // then misattributed and the retry gate never fired).
-        return JSON.stringify({ ops: [{ op: 'create', title: 'T', conclusion: '结论', observed_ids: 42 }] })
+        return JSON.stringify({ ops: [{ op: 'create', title: 'T', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论', observed_ids: 42 }] })
       }
       assert.match(req.user, /纠错重试/)
       return consumeOps(ids)
@@ -757,7 +758,7 @@ test('distiller: corrective retry that fails to produce ops stalls readably with
       calls += 1
       if (calls === 1) {
         return JSON.stringify({
-          ops: [{ op: 'create', title: '幻觉主题', conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
+          ops: [{ op: 'create', title: '幻觉主题', description: '一句话', triggers: ['幻觉甲', '幻觉乙', '幻觉丙'], conclusion: '结论', observed_ids: ['obs-hallucinated'] }],
         })
       }
       throw new Error('route unavailable')
@@ -808,7 +809,7 @@ test('distiller: consumed observations never accrue attempts; only the leftovers
     // follow-up batches can only stall around left — exactly one failed
     // attempt for the leftover, none for the consumed one.
     const d = new Distiller(h.service, async () =>
-      JSON.stringify({ ops: [{ op: 'create', title: 'T', conclusion: '结论', observed_ids: [kept.id] }] }),
+      JSON.stringify({ ops: [{ op: 'create', title: 'T', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论', observed_ids: [kept.id] }] }),
     )
     const r = await d.run('s1')
     assert.equal(r.ok, true)
@@ -899,7 +900,7 @@ test('distiller: stalled batches (parseable ops, zero consumption) still count t
     await h.store.ensure()
     await appendObs(h.store, 2)
     const d = new Distiller(h.service, async () =>
-      JSON.stringify({ ops: [{ op: 'create', title: '幻觉主题', conclusion: '结论', observed_ids: ['obs-hallucinated'] }] }),
+      JSON.stringify({ ops: [{ op: 'create', title: '幻觉主题', description: '一句话', triggers: ['幻觉甲', '幻觉乙', '幻觉丙'], conclusion: '结论', observed_ids: ['obs-hallucinated'] }] }),
     )
     await d.run('s1')
     await d.run('s1')
@@ -925,6 +926,7 @@ test('distiller: a failed distill-state write surfaces in the returned detail; m
           title: 'dsh-cron 定时方案',
           description: '定时任务落地方式',
           tags: ['dsh', 'cron'],
+          triggers: ['cron', '定时任务', '调度'],
           depends: [],
           open_questions: ['错过窗口是否补跑'],
           impact: ['运维流程'],
@@ -958,7 +960,7 @@ test('distiller: a failed distill-state write surfaces in the returned detail; m
     const d2 = new Distiller(
       h.service,
       async () =>
-        JSON.stringify({ ops: [{ op: 'create', title: '第二个主题', conclusion: '结论', observed_ids: [o3.id] }] }),
+        JSON.stringify({ ops: [{ op: 'create', title: '第二个主题', description: '一句话', triggers: ['甲', '乙', '丙'], conclusion: '结论', observed_ids: [o3.id] }] }),
     )
     const r2 = await d2.run('s1')
     assert.doesNotMatch(r2.detail ?? '', /写入失败/)

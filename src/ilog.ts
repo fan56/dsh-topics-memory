@@ -27,6 +27,14 @@ export interface SlowItem {
   why: string
 }
 
+/**
+ * Slow-lane full-lifecycle outcome (A4 决议 3, spec §3.2): where a slow-lane
+ * run (or round with a slow-lane stake) ended. Precedent = decisions.jsonl's
+ * outcome enum — a closed vocabulary so 「没跑」(no-run/no-claim) and 「跑了
+ * 全败」(llm-error/timeout) are finally distinguishable in the log.
+ */
+export type SlowOutcome = 'no-run' | 'no-claim' | 'no-candidates' | 'llm-error' | 'timeout' | 'delivered' | 'expired'
+
 export interface InjectionRecord {
   at: string
   sessionId?: string
@@ -60,6 +68,15 @@ export interface InjectionRecord {
   slowMs?: number
   /** Slow-lane pointers this round, in delivery order. */
   slow?: SlowItem[]
+  /**
+   * Slow-lane disposition for this round (A4 决议 3, spec §8.2): `delivered`
+   * when a pending was consumed and packed, `expired` at its hard bounds, and
+   * the producing run's failure point (no-run/no-claim/no-candidates/
+   * llm-error/timeout) when a spliced arrived with no pending. Optional —
+   * older lines predate the field and pure fast-lane rounds may omit it.
+   * Written once with the record, never backfilled (ilog append-only).
+   */
+  slowOutcome?: SlowOutcome
 }
 
 /**

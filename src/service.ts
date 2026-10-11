@@ -7,14 +7,16 @@
  */
 
 import { readFile, stat } from 'node:fs/promises'
-import { readdirSync, readFileSync, statSync } from 'node:fs'
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as okf from './okf.ts'
-import { searchTopics, scoreTopic, passesGate, tokenize, type RetrievableTopic, type RetrievalConfig, type SearchOutcome } from './retrieval.ts'
-import { assembleInjection, assemblePointer, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type SlowPointerInput } from './digest.ts'
+import { searchTopics, scoreTopic, passesGate, tokenize, sanitizeQuery, loadEmbeddingIndex, rerankNearFloor, ensureIndexFresh, saveEmbeddingIndex, type EmbeddingIndex, type RetrievableTopic, type RetrievalConfig, type SearchOutcome } from './retrieval.ts'
+import { assembleInjection, assemblePointer, assemblePackage, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type PackageCandidate, type PackageInput, type PackageResult, type SlowPointerInput } from './digest.ts'
+import { embedTexts, embedQuerySync, embedderWith, resolveEmbedModel } from './embedding.ts'
+import { resolveBundleRoot } from './paths.ts'
 import type { BundleStore, Observation, SaveResult } from './store.ts'
 import type { TopicsConfigValue } from './config.ts'
-import { aggregateStats, querySample, aggregateUsage, aggregateZeroOpen, ZERO_OPEN_TAIL, USAGE_WINDOW_DAYS, attributeOpen, OPEN_ATTRIBUTION_TAIL, type AggregateStats, type InjectionRecord, type OpenRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type UsageSignal } from './ilog.ts'
+import { aggregateStats, querySample, aggregateUsage, aggregateZeroOpen, ZERO_OPEN_TAIL, USAGE_WINDOW_DAYS, attributeOpen, OPEN_ATTRIBUTION_TAIL, type AggregateStats, type InjectionRecord, type OpenRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type SlowOutcome, type UsageSignal } from './ilog.ts'
 import { fileHistory, fileAtRev } from './git.ts'
 import type { Sync } from './sync.ts'
 
@@ -75,6 +77,8 @@ export interface SlowDelivery {
   queryBuild: QueryBuildShape
   model: string
   ms: number
+  /** Producing run's disposition (A4 全留痕) — copied into ilog.slowOutcome. */
+  outcome?: SlowOutcome
 }
 
 export class TopicsService {
@@ -310,6 +314,70 @@ export class TopicsService {
     return { zeroOpenDecay: true, zeroOpenSlugs: this.zeroOpenSlugsSync() }
   }
 
+  /** mtime-cached view of meta/embeddings.json (sync read — hot-lane caller).
+   *  Missing/corrupt index = {} → the reranker degrades to lexical order. */
+  private embedIndexCache: { mtimeMs: number; size: number; index: EmbeddingIndex } | undefined
+
+  private embeddingIndexCacheGet(): EmbeddingIndex {
+    const root = resolveBundleRoot()
+    const file = join(root, 'meta', 'embeddings.json')
+    try {
+      const st = statSync(file)
+      if (this.embedIndexCache !== undefined && this.embedIndexCache.mtimeMs === st.mtimeMs && this.embedIndexCache.size === st.size) {
+        return this.embedIndexCache.index
+      }
+      const index = loadEmbeddingIndex(root)
+      this.embedIndexCache = { mtimeMs: st.mtimeMs, size: st.size, index }
+      return index
+    } catch {
+      return this.embedIndexCache?.index ?? {}
+    }
+  }
+
+  /** Shadow bypass ledger (spec §8.3): one line per shadow round — feature
+   *  fields only, never query text (jev-log discipline). Silent on failure;
+   *  512KB truncation keeps the newest three quarters. */
+  private appendPackageShadowLedger(entry: Record<string, unknown>): void {
+    try {
+      const file = join(resolveBundleRoot(), 'meta', 'package-shadow.jsonl')
+      let lines: string[] = []
+      try {
+        const st = statSync(file)
+        if (st.size > 512 * 1024) {
+          const all = readFileSync(file, 'utf8').split('\n').filter((l) => l !== '')
+          lines = all.slice(Math.floor(all.length / 4))
+        }
+      } catch { /* first write */ }
+      lines.push(JSON.stringify(entry))
+      writeFileSync(file, lines.join('\n') + '\n')
+    } catch { /* ledger must never break the lane */ }
+  }
+
+  /** Boot-time embedding index maintenance (spec §3: boot 校验+增量重建).
+   *  Provider '' or packageMode off → no-op (default-off byte-for-byte).
+   *  Full-roster embed on rebuild (A1 §5: ~9.5s for 137 topics). */
+  async refreshEmbeddingIndex(): Promise<void> {
+    const provider = (this.cfg.embeddingProvider ?? '').trim()
+    if (provider === '' || this.cfg.packageMode === undefined || this.cfg.packageMode === 'off') return
+    const embedder = embedderWith({ provider, model: this.cfg.embeddingModel })
+    const topics = await this.roster()
+    const root = resolveBundleRoot()
+    const index = loadEmbeddingIndex(root)
+    const stale = ensureIndexFresh(index, topics, embedder)
+    if (stale.length === 0) return
+    const docs = await Promise.all(stale.map(async (slug) => (await this.readDoc(slug)) ?? ''))
+    const texts = stale.map((slug, i) => `${slug}\n${docs[i] ?? ''}`)
+    const r = await embedTexts(texts, { provider, model: this.cfg.embeddingModel })
+    if (!r.ok) return
+    const next: EmbeddingIndex = { ...index }
+    stale.forEach((slug, i) => {
+      const vec = r.vectors[i]
+      if (vec !== undefined) next[slug] = { model: r.model, dim: vec.length, vec }
+    })
+    saveEmbeddingIndex(root, next)
+    this.embedIndexCache = undefined
+  }
+
   /**
    * Full retrieval round: search → assemble → log (ADR 0006/0007). The
    * injection record is written even for zero-hit rounds — the hit-rate
@@ -425,8 +493,13 @@ export class TopicsService {
       }
       return { text: '', outcome: empty, deduped: [], echoed: [], included: [], slowIncluded: [] }
     }
+    // A-line gate (A3/A4): query cleaning + package + semantic rerank ride
+    // behind packageMode (default off = byte-for-byte legacy path).
+    const pkgMode: 'shadow' | 'on' | undefined =
+      cfg.packageMode === 'shadow' || cfg.packageMode === 'on' ? cfg.packageMode : undefined
+    const effectiveQuery = pkgMode !== undefined ? sanitizeQuery(query) : query
     const conflicts = this.store.getConflictsSync()
-    const outcome = searchTopics(query, roster, {
+    const outcome = searchTopics(effectiveQuery, roster, {
       threshold: cfg.matchThreshold,
       topK: cfg.topK,
       tagBoost: cfg.tagBoost,
@@ -437,6 +510,35 @@ export class TopicsService {
       usage: this.usageSignalsSync(),
       ...this.zeroOpenCfg(),
     })
+    // ---- A-line semantic rerank (A4 决议 2, spec §3.1) ----
+    // Reorder ONLY the 0.20–0.30 nearFloor band (the 93% near-miss mass);
+    // thresholds/gateScore/hits untouched. Any failure degrades to the
+    // original order — the fast lane never blocks on the semantic layer.
+    let nearFloorRerank: { reranked: boolean; passthroughReason?: string; orderBefore: string[]; orderAfter: string[] } | undefined
+    if (pkgMode !== undefined) {
+      const bandLo = 0.2
+      const band = outcome.nearMisses.filter((h) => h.score >= bandLo && h.score < cfg.matchThreshold)
+      const orderBefore = band.map((h) => h.slug)
+      if (band.length > 1) {
+        const index = this.embeddingIndexCacheGet()
+        const models = new Set(Object.values(index).map((e) => e.model))
+        const embedModel = resolveEmbedModel(cfg.embeddingModel)
+        if (models.size <= 1 && (models.size === 0 || models.has(embedModel))) {
+          const qv = embedQuerySync(effectiveQuery, { provider: cfg.embeddingProvider, model: cfg.embeddingModel })
+          const rr = rerankNearFloor(effectiveQuery, qv.ok ? qv.vector : null, band, index)
+          if (rr.reranked) {
+            const inBand = (h: { score: number }) => h.score >= bandLo && h.score < cfg.matchThreshold
+            const rrSlugs = new Set(rr.hits.map((h) => h.slug))
+            const merged = [...rr.hits, ...band.filter((h) => !rrSlugs.has(h.slug))]
+            let mi = 0
+            outcome.nearMisses = outcome.nearMisses.map((h) => (inBand(h) ? merged[mi++]! : h))
+            nearFloorRerank = { reranked: true, orderBefore, orderAfter: merged.map((h) => h.slug) }
+          } else {
+            nearFloorRerank = { reranked: false, passthroughReason: rr.passthroughReason, orderBefore, orderAfter: orderBefore }
+          }
+        }
+      }
+    }
     const exclude = dedup?.exclude
     const echo = dedup?.echo
     const deduped = exclude === undefined ? [] : outcome.hits.filter((h) => exclude.has(h.slug)).map((h) => h.slug)
@@ -466,7 +568,7 @@ export class TopicsService {
     let slowIncluded: string[] = []
     const consumedAt = new Date().toISOString()
     if (slow !== undefined) {
-      const queryTokens = new Set(tokenize(query))
+      const queryTokens = new Set(tokenize(effectiveQuery))
       for (const item of slow.items) {
         if (exclude?.has(item.slug)) {
           if (!deduped.includes(item.slug)) deduped.push(item.slug)
@@ -514,17 +616,74 @@ export class TopicsService {
     const pointerMode = cfg.injectMode !== 'digest'
     // Pointer budget: per-entry fixed at the design's 80, total clamped to the
     // fast-lane upper bound of 600 (I4) — totalBudget stays tunable downward.
-    const injection = pointerMode
-      ? assemblePointer(entries, { perTopicBudget: POINTER_PER_TOPIC, totalBudget: Math.min(cfg.totalBudget, POINTER_TOTAL) }, slowPointers)
-      : assembleInjection(entries, { perTopicBudget: cfg.perTopicBudget, totalBudget: cfg.totalBudget }, slowPointers)
+    let packageSkipped = false
+    let packageShadow: PackageResult | null | undefined
+    let injection: AssembleResult
+    if (!pointerMode) {
+      injection = assembleInjection(entries, { perTopicBudget: cfg.perTopicBudget, totalBudget: cfg.totalBudget }, slowPointers)
+    } else if (pkgMode === undefined) {
+      injection = assemblePointer(entries, { perTopicBudget: POINTER_PER_TOPIC, totalBudget: Math.min(cfg.totalBudget, POINTER_TOTAL) }, slowPointers)
+    } else {
+      // A-line relevance package (A3, spec §2): direct = lexical hits,
+      // neighborhood = graph hits + slow picks, weak = reranked band head.
+      const budget = { perTopicBudget: POINTER_PER_TOPIC, totalBudget: Math.min(cfg.totalBudget, POINTER_TOTAL) }
+      const legacy = assemblePointer(entries, budget, slowPointers)
+      const direct: PackageCandidate[] = []
+      const neighborhood: PackageCandidate[] = []
+      for (const e of entries) {
+        const meta = bySlug.get(e.slug)
+        const cand: PackageCandidate = {
+          slug: e.slug,
+          title: meta?.title ?? e.slug,
+          status: meta?.status ?? 'draft',
+          description: meta?.description,
+          conclusion: firstContentLine(e.doc.body),
+          score: e.hit.score,
+          reasons: e.hit.reasons,
+          via: e.hit.viaGraph ? 'graph' : undefined,
+        }
+        ;(e.hit.viaGraph ? neighborhood : direct).push(cand)
+      }
+      for (const sp of slowPointers) {
+        neighborhood.push({ slug: sp.slug, title: sp.title, status: sp.status, description: sp.description, score: 0, reasons: [], via: 'slow-pick' })
+      }
+      const weak = outcome.nearMisses
+        .filter((h) => h.score >= 0.2 && h.score < cfg.matchThreshold)
+        .slice(0, 2)
+        .map((h) => {
+          const meta = bySlug.get(h.slug)
+          return { slug: h.slug, title: meta?.title ?? h.slug, status: meta?.status ?? 'draft', score: h.score, reasons: h.reasons, via: 'weak' }
+        })
+      const usage = this.usageSignalsSync()
+      const usageBySlug = new Map<string, number>([...usage].map(([slug, sig]) => [slug, sig.opens * 3 + sig.hits]))
+      const pkgInput: PackageInput = { query: effectiveQuery, queryTokens: tokenize(effectiveQuery), direct, neighborhood, weak, usageBySlug }
+      const pkg = assemblePackage(pkgInput)
+      if (pkgMode === 'shadow') {
+        packageShadow = pkg
+        injection = legacy
+      } else if (pkg === null) {
+        // Trivial-query downgrade (A3 决议 5): emit nothing, log the why.
+        packageSkipped = true
+        injection = { text: '', usedTokens: 0, included: [], dropped: [] }
+      } else {
+        const slowSet = new Set(slowPointers.map((sp) => sp.slug))
+        injection = {
+          text: pkg.text,
+          usedTokens: pkg.usedTokens,
+          included: pkg.included,
+          dropped: pkg.dropped,
+          slowIncluded: pkg.included.filter((slug) => slowSet.has(slug)),
+        }
+      }
+    }
     slowIncluded = injection.slowIncluded ?? []
     for (const pointer of slowPointers) {
       if (slowIncluded.includes(pointer.slug)) slowDelivered.push({ slug: pointer.slug, why: pointer.why })
     }
     const record: InjectionRecord = {
       at: new Date().toISOString(),
-      queryTokenCount: tokenize(query).length,
-      querySample: querySample(query),
+      queryTokenCount: tokenize(effectiveQuery).length,
+      querySample: querySample(effectiveQuery),
       rosterSize: outcome.rosterSize,
       hits: outcome.hits.map((h) => ({ slug: h.slug, score: h.score, reasons: h.reasons, viaGraph: h.viaGraph, strong: h.strong, bodyHits: h.bodyHits })),
       // Reasons ride along: the gate-blocked marker is the replay evidence
@@ -536,10 +695,27 @@ export class TopicsService {
     if (sessionId !== undefined) record.sessionId = sessionId
     if (deduped.length > 0) record.deduped = deduped
     if (echoed.length > 0) record.echoed = echoed
+    if (packageSkipped) record.why = 'package-skipped-trivial'
     if (unreadable.length > 0) {
       record.dropped = [...(record.dropped ?? []), ...unreadable.map((slug) => ({ slug, reason: 'doc-unreadable' }))]
     }
+    if (pkgMode === 'shadow' && pointerMode) {
+      this.appendPackageShadowLedger({
+        at: record.at,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        queryTokenCount: record.queryTokenCount,
+        emitted: { tokens: injection.usedTokens, included: injection.included },
+        package:
+          packageShadow === undefined
+            ? null
+            : packageShadow === null
+              ? { skipped: 'trivial-or-empty' }
+              : { tokens: packageShadow.usedTokens, included: packageShadow.included, layers: packageShadow.layers },
+        nearFloorRerank: nearFloorRerank ?? null,
+      })
+    }
     if (slow !== undefined) {
+      if (slow.outcome !== undefined) record.slowOutcome = slow.outcome
       // Any round whose pending was consumed is a slow-participating round —
       // lane never stays undefined when the lane family is present (a
       // delivered pick with fast pointers is 'mixed'; a consumed-but-empty
@@ -725,6 +901,8 @@ export class TopicsService {
     depends?: string[]
     openQuestions?: string[]
     impact?: string[]
+    /** A2 semantic-link targets; store.saveTopic lands them as body wikilinks. */
+    links?: string[]
     status?: okf.TopicStatus
     conclusion?: string
     recommendations?: string
@@ -766,7 +944,7 @@ export class TopicsService {
     if (triggers.length > 0) fm.triggers = triggers
     if (existing !== undefined && existing.fm.verified !== undefined) fm.verified = existing.fm.verified
     const result = await this.store.saveTopic(
-      { slug, doc: { fm, body } },
+      { slug, doc: { fm, body }, links: input.links },
       { message: existing === undefined ? `topics(topic): create ${slug}` : `topics(topic): update ${slug}`, created: existing === undefined },
     )
     this.invalidate()
@@ -858,6 +1036,15 @@ function dedupePaths(paths: string[]): string[] {
     out.push(p)
   }
   return out
+}
+
+function firstContentLine(doc: string): string {
+  for (const line of doc.split('\n')) {
+    const t = line.trim()
+    if (t === '' || t.startsWith('#')) continue
+    return t.slice(0, 200)
+  }
+  return ''
 }
 
 function sanitizeTriggers(triggers: readonly string[]): string[] {

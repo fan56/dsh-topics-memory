@@ -105,6 +105,21 @@ export const TopicsConfig = z.object({
   /** laya-serve systemone endpoint for the pace-maker (default: the local
    *  laya-serve bind from the laya repo's serve mode). */
   jevLayaUrl: z.string().default('http://127.0.0.1:8000/v1/systemone').volatile(),
+  /** Local embedding provider (A4 semantic reranker, spec §3.1): ''
+   *  sentinel = the whole semantic layer is OFF (pure lexical); 'ollama' =
+   *  the local ollama embed API (localhost is the ADR 0017 local exception).
+   *  v1 ships no remote provider — a remote embedding may only ever enter a
+   *  slow-lane/offline path, never the fast lane (red line ①). */
+  embeddingProvider: z.string().default('').volatile(),
+  /** Embedding model; '' = provider default (ollama → nomic-embed-text),
+   *  same sentinel pattern as distillModel. */
+  embeddingModel: z.string().default('').volatile(),
+  /** Injection-package master gate (A-line, spec §2/§3): off | shadow | on.
+   *  Carries the WHOLE new-behavior surface — query sanitization, the
+   *  three-layer package, nearFloor semantic rerank, degradation. off = zero
+   *  behavior change anywhere (byte-for-byte legacy); shadow = compute +
+   *  bypass-ledger only, nothing lands in context; on = engage. */
+  packageMode: z.string().default('off').volatile(),
 })
 
 export type TopicsConfigValue = {
@@ -149,6 +164,13 @@ export type TopicsConfigValue = {
   jevSecretFile?: string
   jevLayaFallback?: boolean
   jevLayaUrl?: string
+  /** Injection-quality line keys (spec §7). Optional in this TS view only
+   *  (same sentinel pattern as the jev keys): index.ts's bare-harness
+   *  DEFAULTS literal predates them — consumers must treat undefined as the
+   *  documented default ('' / '' / 'off' = every new behavior zeroed). */
+  embeddingProvider?: string
+  embeddingModel?: string
+  packageMode?: 'off' | 'shadow' | 'on'
 }
 
 export const CONFIG_KEYS = [
@@ -186,6 +208,9 @@ export const CONFIG_KEYS = [
   'jevSecretFile',
   'jevLayaFallback',
   'jevLayaUrl',
+  'embeddingProvider',
+  'embeddingModel',
+  'packageMode',
 ] as const
 
 export type ConfigKey = (typeof CONFIG_KEYS)[number]
@@ -257,10 +282,19 @@ export function parseConfigValue(key: ConfigKey, raw: string): boolean | number 
     }
     case 'distillProvider':
     case 'distillModel':
+    case 'embeddingModel':
     case 'jevModel':
     case 'jevSecretFile':
     case 'jevLayaUrl':
       return raw
+    case 'embeddingProvider': {
+      if (raw === '' || raw === 'ollama') return raw
+      return { error: 'embedding-provider 仅支持 ollama（留空=语义层关；远程 provider 不进快道）' }
+    }
+    case 'packageMode': {
+      if (raw === 'off' || raw === 'shadow' || raw === 'on') return raw
+      return { error: 'package-mode 取值 off|shadow|on' }
+    }
     case 'jevLayaFallback': {
       if (raw === 'on' || raw === 'true') return true
       if (raw === 'off' || raw === 'false') return false

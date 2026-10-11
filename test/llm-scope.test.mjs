@@ -47,7 +47,10 @@ function liveLlm(modelJson) {
 }
 
 const opFor = (title, obsId) =>
-  JSON.stringify({ ops: [{ op: 'create', title, conclusion: 'probe', observed_ids: [obsId] }] })
+  // description+triggers: the A6 §5.1 create-op schema gate is always on —
+  // the probe ops must satisfy it or the lane drops them and the backlog
+  // never moves.
+  JSON.stringify({ ops: [{ op: 'create', title, description: '探针', triggers: ['探针一', '探针二', '探针三'], conclusion: 'probe', observed_ids: [obsId] }] })
 
 /**
  * Minimal fake dsh ctx for apply() (same recipe as dedup.test.mjs), with
