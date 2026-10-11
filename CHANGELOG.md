@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.25.0 - 2026-10-11
 
 B 线蒸馏 lesson 分支（wayfinder self-improve B2 决议 3①，spec 卷二 §3.1 批量通道的「提炼」环节——lessons 回路的观察经写缝①投喂后在原仓蒸馏 lane 产出 lesson ops。纯数据面增量，无新 config 键：蒸馏产 lesson 不受 `lessonInject` 闸管，闸 off 时 lesson 照产不注入，正是设计；`lessonInject`/`packageMode` 全默认时注入侧行为逐字节不变）：
 
