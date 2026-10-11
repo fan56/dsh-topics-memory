@@ -33,7 +33,7 @@ function makeService(cfgOverrides = {}) {
   const store = new BundleStore(root, { gitDisabled: true })
   const cfg = { ...BASE_CFG, ...cfgOverrides }
   const service = new TopicsService(store, () => cfg)
-  const cleanup = () => rmSync(root, { recursive: true, force: true })
+  const cleanup = () => rmRetry(root)
   return { service, store, cfg, cleanup }
 }
 
@@ -161,3 +161,17 @@ test('config: zeroOpenDecay key — schema default off, hot-editable, set parse'
   assert.equal(parseConfigValue('zeroOpenDecay', 'off'), false)
   assert.deepEqual(parseConfigValue('zeroOpenDecay', 'maybe'), { error: 'zeroOpenDecay 取值 on|off' })
 })
+
+/** macOS rmSync races an in-flight write handle (ENOTEMPTY) — the house
+ *  rmRetry lesson from quality/dedup tests; cleanup must never flake CI. */
+async function rmRetry(path, attempts = 6) {
+  for (let i = 0; ; i += 1) {
+    try {
+      rmSync(path, { recursive: true, force: true })
+      return
+    } catch (e) {
+      if (i >= attempts - 1 || (e.code !== 'ENOTEMPTY' && e.code !== 'ENOENT')) throw e
+      await new Promise((resolve) => setTimeout(resolve, 50 * (i + 1)))
+    }
+  }
+}

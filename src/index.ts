@@ -709,7 +709,10 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
     // and its own settle hook does the release.
     const run = distiller.request(sessionId, reason)
     if (run !== undefined) {
-      void run.finally(() => releaseSessionLlm(sessionId)).catch(() => undefined)
+      void run
+        .finally(() => releaseSessionLlm(sessionId))
+        .then(() => service.refreshEmbeddingIndex())
+        .catch(() => undefined)
     }
   })
 
@@ -917,7 +920,11 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
                 // no-adapter detail instead
               }
               const run = distiller.request(sessionId, 'boot-replay')
-              if (run !== undefined) void run.catch(() => undefined)
+              if (run !== undefined) {
+                void run
+                  .then(() => service.refreshEmbeddingIndex())
+                  .catch(() => undefined)
+              }
             })
             .catch(() => undefined)
           // Consolidation cadence check — after the pull (freshest pool),
@@ -1079,7 +1086,11 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
           ? { ok: false, reason: 'in-flight', created: [], updated: [], marked: 0 }
           : { ok: false, reason: 'no-model', created: [], updated: [], marked: 0 }
       }
-      return run.finally(() => releaseSessionLlm(sessionId))
+      void run
+        .finally(() => releaseSessionLlm(sessionId))
+        .then(() => service.refreshEmbeddingIndex())
+        .catch(() => undefined)
+      return run
     }
     // Manual /topics consolidate trigger: same lane as the cadence path, same
     // trigger-time llm capture and in-flight guard (the command runs inside a
