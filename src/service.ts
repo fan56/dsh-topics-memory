@@ -393,10 +393,10 @@ export class TopicsService {
       let lines: string[] = []
       try {
         const st = statSync(file)
-        if (st.size > 512 * 1024) {
-          const all = readFileSync(file, 'utf8').split('\n').filter((l) => l !== '')
-          lines = all.slice(Math.floor(all.length / 4))
-        }
+        const all = readFileSync(file, 'utf8').split('\n').filter((l) => l !== '')
+        // Append, never clobber: existing lines are always carried forward;
+        // compaction (keep newest 3/4) only bites past the 512KB cap.
+        lines = st.size > 512 * 1024 ? all.slice(Math.floor(all.length / 4)) : all
       } catch { /* first write */ }
       lines.push(JSON.stringify(entry))
       writeFileSync(file, lines.join('\n') + '\n')

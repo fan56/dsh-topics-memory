@@ -8,7 +8,7 @@
 // no 0.23.0 bundle ever carried lessons).
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, existsSync, readFileSync, readdirSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { BundleStore } from '../lib/store.js'
@@ -531,4 +531,18 @@ test('lessonInject config: parses the three states, rejects others', () => {
 test('tokenize sanity for the fixtures (triggers carry the condition)', () => {
   const q = new Set(tokenize('git commit 署名规范 submit'))
   assert.ok(q.has('git') && q.has('commit'))
+})
+
+test('shadow ledger appends without clobbering existing records (<512KB)', async () => {
+  // 两次投喂之间文件必须增长而非覆盖——N1 波发现的 clobber bug 回归守卫
+  // （appendShadowLedger 为 package/lesson 两本账共用，修一处双保护）。
+  const { service, root } = await makeService()
+  mkdirSync(join(root, 'meta'), { recursive: true })
+  const ledger = join(root, 'meta', 'package-shadow.jsonl')
+  service.appendShadowLedger(ledger, { at: 't1', n: 1 })
+  service.appendShadowLedger(ledger, { at: 't2', n: 2 })
+  const lines = readFileSync(ledger, 'utf8').split('\n').filter((l) => l !== '')
+  assert.equal(lines.length, 2, `both records must survive; got ${lines.length}`)
+  assert.deepEqual(JSON.parse(lines[0]), { at: 't1', n: 1 })
+  assert.deepEqual(JSON.parse(lines[1]), { at: 't2', n: 2 })
 })
