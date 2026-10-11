@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased（B 线缝，随 0.24.0 发版）
+
+B 线 lesson 数据面 + 双写缝（wayfinder self-improve 图 B2/C1/B4 决议，全部 default off——`lessonInject` 三态总闸 `off|shadow|on` 默认 `off`，关闭且无 lesson 数据时行为与 0.23.0 逐字节一致，守卫测试钉死）：
+
+- **lesson kind 数据面（B2，`feat(okf)`）**：store kind 枚举新增 `lesson`（`type: Lesson`，大小写不敏感识别；`TopicKind`/`topicKindOf` 落 okf、store 重导出对齐 §6.5 锚点）；frontmatter 增 `scope`（`workspace` 默认|`global`，lesson 必带）/`confidence`（`hint` 默认|`established`，**事实源**）/`source`（`distilled|correction|manual`，默认 `manual`，卸载回收按 source≠manual）/`workspaceId`（写入时记 cwd hash，MJ-2；scope=global 时空）。confidence↔status 派生（hint↔draft、established↔stable，`deriveLessonStatus`）；枚举值非法一律降级默认不炸文档（triggers 先例）。lesson 条目与 topic 在 roster 层永久分流（`roster`/`rosterSync` 跳过 lesson；`lessonsSync` 只出 established+scope 过滤后的条目，mtime 缓存与 roster 共享）——lesson 永不借道 topic 词法管线，整理 lane 与 topic_search 不触及。
+- **lessonInject 三态总闸（C1 MJ-4/B4 MJ-4，`feat(service)`）**：新键 `lessonInject`（默认 `off`，volatile 热更）。off=established lesson 不注入不 shadow（注入侧零行为）；shadow=lesson 优先席同轮双算落旁路账 `meta/lesson-shadow.jsonl`（package-shadow 同款纪律：独立文件、512KB 紧缩、写失败静默、只特征不含 query 原文），不落上下文；on=注入生效。**注入查询只认 established**（MJ-3：hint 仅供审批队列，永不注入）；命中判据=trigger 通道（triggers 承载 condition，教训不撒背景网）；dedup/suppressEcho 与 topic 同规则；scope 过滤=workspace lesson 的 workspaceId 比对当前 cwd hash（`$DSH_TOPICS_WORKSPACE_ID` 可覆写；scope=global 与缺 workspaceId 的存量条目不过滤）。与 A3 档位组合矩阵（MJ-C）：lessonInject=on 且 packageMode off/shadow（旧平铺形态）时 established lesson 以普通条目位注入（带 `lesson source:x` 标记）；packageMode on 时占直接相关层优先席——`PackageCandidate.prioritySeat`（排序置顶+豁免 ≤2 席帽，仍受预算约束，主层 ≤2 席中命中 lesson 至少 1 席）。ilog 增量字段 `lessonInject`/`lessons`（仅闸开且有命中时出现）。lesson-only 库不被 topic roster 空早退挡住。
+- **双写缝（C1 MJ-5，`feat(service)`）**：service 导出两方法，供新仓经宿主进程调用（新仓禁直写 bundle 文件）；均走 store 锁+索引重算，`opts.actor` 必填（空 actor 整调用拒绝），每次调用落 `meta/pipeline-events.jsonl` 审计行（新 kind `seam-observations-fed`/`seam-lesson-status`）：
+  - `feedObservations(obs: StructuredObservation[], opts: { actor }): Promise<FeedResult>` —— B1 §2.1 白名单结构化观察（type/at/sessionId/detail 标量特征，对话原文结构上进不来，红线⑤）追加进 observations 流：`kind:'signal'`+`source:'fed'` 来源标记+`by:actor` 审计字段，文本为排序特征行 `[type] k=v`；未知字段剥离、detail 全被剥离（对象走私）整条拒绝、近期尾部（500 条）特征键去重计 duplicates；返回 `{accepted, duplicates, rejected, ids, error?}`。
+  - `setLessonStatus(slug, to: 'established'|'deprecated'|'removed', opts: { actor }): Promise<StoreResult>` —— established 翻 confidence（事实源）派生 status=stable；deprecated 翻 status（confidence 不动，deprecatedTtlDays 清扫接管）；**removed=先归档再移出 roster**（字节级拷贝进 bundle 内 `archive/lessons/<slug>-<时间戳>.md` 后删 `topics/<slug>.md`，同一 git commit 可 revert，红线④）；not-found/not-a-lesson/未授权一律拒绝并落审计。
+  - 共享类型 `StructuredObservation`/`FeedResult`/`StoreResult` 由本仓 index.ts 导出（C1 决议 3：原仓导出，不抽共享 lib）。
+- **saveTopic lesson 入参（`feat(service)`）**：`kind:'lesson'` 切 OKF type 并按 §6.2 盖 lesson frontmatter（scope/confidence/lessonSource/workspaceId，更新保留语义，deprecated 不被 topic_save 静默复活）。
+- **测试**：512 → 529（`lesson-seams.test.mjs` 17 例：lesson 往返与派生/roster 分离/默认 off 逐字节守卫（双服务比对）/三态注入与 shadow 旁路账/hint 不注入/scope 过滤/优先席/MJ-C 组合/removed 归档（git name-status 钉 revert 面）/未授权与非法目标拒绝/白名单脱敏与去重/config 键解析）；528 过 / 0 红 / 1 skip 为既有本地语料跳过。
+
 ## 0.22.0 - 2026-10-09
 
 注入 vs 打开行为度量三连：open 事件富化、stats 面板与口径修复、零打开衰减调参开关（默认关）。
