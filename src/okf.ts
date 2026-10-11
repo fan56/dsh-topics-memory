@@ -17,6 +17,43 @@ import { parseYaml, stringifyYaml, YamlError } from './yaml.ts'
 
 export type TopicStatus = 'draft' | 'stable' | 'deprecated'
 
+/**
+ * Bundle entry kinds (B2, spec 2026-10-self-improve-topics §6.1): `topic` =
+ * factual knowledge (「是什么」), `lesson` = behavioral lesson (「怎么做事」).
+ * The kind rides the OKF `type` frontmatter field — the canonical serialized
+ * value for a lesson is `Lesson` (matching the `Topic` capitalization
+ * convention); recognition is case-insensitive so bundles written by the
+ * new repo's loop parse regardless of casing drift.
+ */
+export type TopicKind = 'topic' | 'lesson'
+
+/** lesson scope (B2 MJ-2, spec §6.2): workspace lessons inject only in the
+ *  workspace that produced them (cwd-hash match); global need no filter. */
+export type LessonScope = 'workspace' | 'global'
+/** lesson confidence (B2, spec §6.2): the FACT source — `status` derives from
+ *  it (hint↔draft, established↔stable); hint never injects (MJ-3). */
+export type LessonConfidence = 'hint' | 'established'
+/** lesson provenance (B2 BL-2, spec §6.2): machine-recognizable source tag;
+ *  uninstall reclamation keys on source≠manual (卷二 §9). */
+export type LessonSource = 'distilled' | 'correction' | 'manual'
+
+/** kind from the raw `type` frontmatter value (case-insensitive `lesson`). */
+export function topicKindOf(type: string): TopicKind {
+  return typeof type === 'string' && type.trim().toLowerCase() === 'lesson' ? 'lesson' : 'topic'
+}
+
+/** The canonical serialized `type` value per kind. */
+export function kindTypeValue(kind: TopicKind): string {
+  return kind === 'lesson' ? 'Lesson' : 'Topic'
+}
+
+/** confidence 为事实源（B2 Minor）：hint↔draft、established↔stable.
+ *  `deprecated` is a lifecycle endpoint OUTSIDE the confidence axis — callers
+ *  set it directly (setLessonStatus / consolidation / TTL sweep). */
+export function deriveLessonStatus(confidence: LessonConfidence): TopicStatus {
+  return confidence === 'established' ? 'stable' : 'draft'
+}
+
 export interface SourceEntry {
   id?: string
   resource: string
@@ -52,6 +89,15 @@ export interface TopicFrontmatter {
   verified?: TrustStamp
   stale_after?: string
   sources?: SourceEntry[]
+  // ---- lesson-kind fields (B2, spec §6.2) — present on kind=lesson docs ----
+  /** lesson 必带 scope（默认 workspace；global 需显式）。 */
+  scope?: LessonScope
+  /** confidence 事实源；status 派生（deriveLessonStatus）。默认 hint。 */
+  confidence?: LessonConfidence
+  /** provenance 标记（卸载回收按 source≠manual）。默认 manual。 */
+  source?: LessonSource
+  /** 写入时的 workspace 标识（cwd hash，MJ-2）；scope=global 时可空。 */
+  workspaceId?: string
   /** Producer-defined extras — preserved on round-trip per OKF §4.1. */
   [extra: string]: unknown
 }
@@ -148,8 +194,25 @@ export function parseTopicDoc(raw: string): TopicDoc {
       return s as SourceEntry
     })
   }
+  // ---- lesson-kind fields (B2, spec §6.2) — parsed on lesson docs only ----
+  // Invalid enum values DEGRADE TO THE DEFAULT (triggers precedent: a producer
+  // slip must never invalidate an otherwise sound doc); the seam writers own
+  // the closed vocabulary. On lesson docs these four keys join the known set
+  // so the extras loop cannot double-store a raw unvalidated value.
+  if (topicKindOf(fmRaw.type) === 'lesson') {
+    fm.scope = fmRaw.scope === 'global' ? 'global' : 'workspace'
+    fm.confidence = fmRaw.confidence === 'established' ? 'established' : 'hint'
+    fm.source = fmRaw.source === 'distilled' || fmRaw.source === 'correction' ? fmRaw.source : 'manual'
+    if (typeof fmRaw.workspaceId === 'string' && fmRaw.workspaceId !== '') fm.workspaceId = fmRaw.workspaceId
+  }
   // Preserve unknown producer-defined keys verbatim (OKF §4.1 extensions).
   const known = new Set(['type', 'title', 'description', 'tags', 'triggers', 'depends', 'open_questions', 'impact', 'status', 'generated', 'verified', 'stale_after', 'sources'])
+  if (fm.scope !== undefined || fm.confidence !== undefined || fm.source !== undefined) {
+    known.add('scope')
+    known.add('confidence')
+    known.add('source')
+    known.add('workspaceId')
+  }
   for (const [k, v] of Object.entries(fmRaw)) {
     if (!known.has(k)) fm[k] = v
   }
@@ -174,6 +237,11 @@ export function serializeTopicDoc(doc: TopicDoc): string {
   if (fm.verified !== undefined) out.verified = { by: fm.verified.by, at: fm.verified.at }
   if (fm.stale_after !== undefined) out.stale_after = fm.stale_after
   if (fm.sources !== undefined && fm.sources.length > 0) out.sources = fm.sources
+  // lesson fields serialize in a fixed slot (deterministic order, spec §6.2).
+  if (fm.scope !== undefined) out.scope = fm.scope
+  if (fm.confidence !== undefined) out.confidence = fm.confidence
+  if (fm.source !== undefined) out.source = fm.source
+  if (fm.workspaceId !== undefined) out.workspaceId = fm.workspaceId
   for (const [k, v] of Object.entries(fm)) {
     if (!(k in out)) out[k] = v
   }

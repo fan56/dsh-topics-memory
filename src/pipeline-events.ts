@@ -21,8 +21,10 @@ import { metaDir } from './paths.ts'
 
 /** Closed vocabulary, spec §8.1 + W-C wave start set. `slow-lane-outcome` is
  *  the slow lane's per-run disposition row (quality.ts); the distill/link
- *  kinds are the A2/A6 producers' contract — they import this module. */
-export type PipelineEventKind = 'slow-lane-outcome' | 'distill-op-invalid' | 'distill-op-retry-exhausted' | 'link-ref-rejected'
+ *  kinds are the A2/A6 producers' contract — they import this module. The
+ *  two `seam-*` kinds are the B-line dual-write audit trail (卷二 §6.2:
+ *  caller-identity audit — opts.actor — rides every seam call). */
+export type PipelineEventKind = 'slow-lane-outcome' | 'distill-op-invalid' | 'distill-op-retry-exhausted' | 'link-ref-rejected' | 'seam-observations-fed' | 'seam-lesson-status'
 
 /** File NAME inside the bundle's meta dir (path via pipelineEventsFile). */
 export const PIPELINE_EVENTS_FILE = 'pipeline-events.jsonl'
@@ -47,6 +49,8 @@ const KNOWN_KINDS: ReadonlySet<string> = new Set<string>([
   'distill-op-invalid',
   'distill-op-retry-exhausted',
   'link-ref-rejected',
+  'seam-observations-fed',
+  'seam-lesson-status',
 ])
 
 export function pipelineEventsFile(bundleDir: string): string {

@@ -10,13 +10,14 @@ import { readFile, stat } from 'node:fs/promises'
 import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import * as okf from './okf.ts'
-import { searchTopics, scoreTopic, passesGate, tokenize, sanitizeQuery, loadEmbeddingIndex, rerankNearFloor, ensureIndexFresh, saveEmbeddingIndex, type EmbeddingIndex, type RetrievableTopic, type RetrievalConfig, type SearchOutcome } from './retrieval.ts'
-import { assembleInjection, assemblePointer, assemblePackage, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type PackageCandidate, type PackageInput, type PackageResult, type SlowPointerInput } from './digest.ts'
+import { searchTopics, scoreTopic, passesGate, tokenize, sanitizeQuery, loadEmbeddingIndex, rerankNearFloor, ensureIndexFresh, saveEmbeddingIndex, type EmbeddingIndex, type RetrievableTopic, type RetrievalConfig, type SearchOutcome, type ScoredTopic } from './retrieval.ts'
+import { assembleInjection, assemblePointer, assemblePackage, lessonEntryText, lessonSourceTag, POINTER_PER_TOPIC, POINTER_TOTAL, type AssembleResult, type DigestInput, type LessonPointerInput, type PackageCandidate, type PackageInput, type PackageResult, type SlowPointerInput } from './digest.ts'
 import { embedTexts, embedQuerySync, embedderWith, resolveEmbedModel } from './embedding.ts'
-import { resolveBundleRoot } from './paths.ts'
+import { currentWorkspaceId, resolveBundleRoot } from './paths.ts'
 import type { BundleStore, Observation, SaveResult } from './store.ts'
 import type { TopicsConfigValue } from './config.ts'
 import { aggregateStats, querySample, aggregateUsage, aggregateZeroOpen, ZERO_OPEN_TAIL, USAGE_WINDOW_DAYS, attributeOpen, OPEN_ATTRIBUTION_TAIL, type AggregateStats, type InjectionRecord, type OpenRecord, type QueryBuildShape, type ShadowVerdict, type SlowItem, type SlowOutcome, type UsageSignal } from './ilog.ts'
+import { recordPipelineEvent } from './pipeline-events.ts'
 import { fileHistory, fileAtRev } from './git.ts'
 import type { Sync } from './sync.ts'
 
@@ -79,6 +80,49 @@ export interface SlowDelivery {
   ms: number
   /** Producing run's disposition (A4 全留痕) — copied into ilog.slowOutcome. */
   outcome?: SlowOutcome
+}
+
+// ---------------------------------------------------------------------------
+// B-line dual-write seams (卷二 §6.2 MJ-5): the new repo's ONLY write surface
+// into the bundle (禁直写 bundle 文件). Both audit the caller identity
+// (opts.actor required) into meta/pipeline-events.jsonl.
+// ---------------------------------------------------------------------------
+
+/**
+ * One structured observation from the new repo's signal layer (B1 §2.1
+ * whitelist): FEATURES ONLY, never conversation text (红线⑤). Unknown caller
+ * fields cannot pass — the whitelist copy in feedObservations is the gate.
+ */
+export interface StructuredObservation {
+  /** Signal type from the B1 closed list (`tool-error`, `turn-end-negative`,
+   *  `unused-injection`, `repeat-call`, `interruption-pair`, `jev-calibration`). */
+  type: string
+  /** ISO instant; defaults to now. */
+  at?: string
+  sessionId?: string
+  /** Bounded scalar feature fields (toolName/errorName/count/band/...). */
+  detail?: Record<string, string | number | boolean>
+}
+
+export interface FeedResult {
+  accepted: number
+  duplicates: number
+  rejected: number
+  ids: string[]
+  /** Present when the call itself was refused (missing/blank actor). */
+  error?: 'unauthorized'
+}
+
+export interface StoreResult {
+  ok: boolean
+  slug: string
+  /** Refusal reason; absent on success. */
+  reason?: 'unauthorized' | 'not-found' | 'not-a-lesson' | 'invalid-state'
+  /** confidence before the transition (when the lesson was read). */
+  from?: okf.LessonConfidence
+  /** removed only: bundle-relative archive path (git-revertable). */
+  archivedTo?: string
+  committed?: boolean
 }
 
 export class TopicsService {
@@ -155,6 +199,11 @@ export class TopicsService {
       // depends-graph walk, or a merged-away entry would keep competing
       // with its survivor for the injection budget.
       if (doc.fm.status === 'deprecated') continue
+      // Lesson-kind entries (B2) never ride the topic pipeline — they have
+      // their own gate (lessonInject), confidence rule and scope filter in
+      // lessonsSync(). Gate-independent separation: even with lessonInject
+      // off, a hint lesson must not leak through the topic lexical lane.
+      if (okf.topicKindOf(doc.fm.type) === 'lesson') continue
       out.push({
         slug: entry.slug,
         title: doc.fm.title,
@@ -336,10 +385,11 @@ export class TopicsService {
 
   /** Shadow bypass ledger (spec §8.3): one line per shadow round — feature
    *  fields only, never query text (jev-log discipline). Silent on failure;
-   *  512KB truncation keeps the newest three quarters. */
-  private appendPackageShadowLedger(entry: Record<string, unknown>): void {
+   *  512KB truncation keeps the newest three quarters. Shared by the package
+   *  shadow (meta/package-shadow.jsonl) and the lesson shadow (B2,
+   *  meta/lesson-shadow.jsonl). */
+  private appendShadowLedger(file: string, entry: Record<string, unknown>): void {
     try {
-      const file = join(resolveBundleRoot(), 'meta', 'package-shadow.jsonl')
       let lines: string[] = []
       try {
         const st = statSync(file)
@@ -351,6 +401,14 @@ export class TopicsService {
       lines.push(JSON.stringify(entry))
       writeFileSync(file, lines.join('\n') + '\n')
     } catch { /* ledger must never break the lane */ }
+  }
+
+  private packageShadowLedgerPath(): string {
+    return join(resolveBundleRoot(), 'meta', 'package-shadow.jsonl')
+  }
+
+  private lessonShadowLedgerPath(): string {
+    return join(resolveBundleRoot(), 'meta', 'lesson-shadow.jsonl')
   }
 
   /** Boot-time embedding index maintenance (spec §3: boot 校验+增量重建).
@@ -460,11 +518,17 @@ export class TopicsService {
    * already delivers THIS round is counted as slow-delivered (it entered the
    * context) but not packed twice.
    */
-  retrieveSync(query: string, sessionId?: string, dedup?: { exclude?: ReadonlySet<string>; echo?: ReadonlySet<string> }, slow?: SlowDelivery, slowExpired?: 'ttl' | 'turn-lag'): { text: string; outcome: SearchOutcome; deduped: string[]; echoed: string[]; included: string[]; slowIncluded: string[] } {
+  retrieveSync(query: string, sessionId?: string, dedup?: { exclude?: ReadonlySet<string>; echo?: ReadonlySet<string> }, slow?: SlowDelivery, slowExpired?: 'ttl' | 'turn-lag'): { text: string; outcome: SearchOutcome; deduped: string[]; echoed: string[]; included: string[]; slowIncluded: string[]; lessonIncluded: string[] } {
     const cfg = this.cfg
     const roster = this.rosterSync()
     const empty: SearchOutcome = { hits: [], nearMisses: [], rosterSize: roster.length }
-    if (!cfg.autoInject || query.trim() === '' || roster.length === 0) {
+    // Lesson gate (B2): established lessons are INDEPENDENT of the topic
+    // roster — a lesson-only bundle still injects lessons. The roster read is
+    // shared with the matching block below; gate off → no read at all.
+    const lessonGate: 'shadow' | 'on' | undefined =
+      cfg.lessonInject === 'shadow' || cfg.lessonInject === 'on' ? cfg.lessonInject : undefined
+    const lessonRoster = lessonGate !== undefined ? this.lessonsSync() : []
+    if (!cfg.autoInject || query.trim() === '' || (roster.length === 0 && lessonRoster.length === 0)) {
       // A consumed/expired pending must always leave an ilog trace (ADR 0014:
       // 过期/消费都写 ilog) — even when the fast path early-returns here
       // because the roster vanished between production and consumption.
@@ -491,7 +555,7 @@ export class TopicsService {
         }
         void this.store.appendInjectionRecord(trace).catch(() => undefined)
       }
-      return { text: '', outcome: empty, deduped: [], echoed: [], included: [], slowIncluded: [] }
+      return { text: '', outcome: empty, deduped: [], echoed: [], included: [], slowIncluded: [], lessonIncluded: [] }
     }
     // A-line gate (A3/A4): query cleaning + package + semantic rerank ride
     // behind packageMode (default off = byte-for-byte legacy path).
@@ -561,6 +625,60 @@ export class TopicsService {
       }
       entries.push({ slug: hit.slug, doc, hit })
     }
+    // ---- Lesson gate (B2, spec 卷一 §6.3): established lessons only (MJ-3:
+    // hint never injects), trigger-channel match = 条件命中 (triggers carry
+    // the condition), top-1 by score. No hit → no lesson (教训不撒背景网).
+    // dedup/echo follow the same rules as topics. ----
+    let lessonMatch: { pointer: LessonPointerInput; reasons: string[]; conclusion: string } | undefined
+    if (lessonGate !== undefined && lessonRoster.length > 0) {
+      const qTokens = new Set(tokenize(effectiveQuery))
+      let best: { l: (typeof lessonRoster)[number]; v: ScoredTopic } | undefined
+      for (const l of lessonRoster) {
+        if (exclude?.has(l.slug)) {
+          if (!deduped.includes(l.slug)) deduped.push(l.slug)
+          continue
+        }
+        if (echo?.has(l.slug)) {
+          if (!echoed.includes(l.slug)) echoed.push(l.slug)
+          continue
+        }
+        const v = scoreTopic(qTokens, l, {
+          threshold: cfg.matchThreshold,
+          topK: cfg.topK,
+          tagBoost: cfg.tagBoost,
+          graphDepth: 0,
+          recencyWindowDays: cfg.recencyWindowDays,
+          conflicts,
+          structuralGate: true,
+          usageBoost: cfg.usageBoost,
+          usage: this.usageSignalsSync(),
+          ...this.zeroOpenCfg(),
+        })
+        if (!v.reasons.some((r) => r.startsWith('triggers:'))) continue
+        if (best === undefined || v.score > best.v.score) best = { l, v }
+      }
+      if (best !== undefined) {
+        lessonMatch = {
+          pointer: {
+            slug: best.l.slug,
+            title: best.l.title,
+            status: best.l.status,
+            description: best.l.description,
+            score: best.v.score,
+            source: best.l.source,
+          },
+          reasons: best.v.reasons,
+          conclusion: best.l.conclusion,
+        }
+      }
+    }
+    // MJ-C combination matrix: lesson injection does not depend on the A3
+    // package gray-release. While the emitted shape is a flat list (digest
+    // mode, pointer mode without the package, AND the package-shadow legacy
+    // emit), lessons ride it as flat entries with the source marker; only a
+    // live package (packageMode on) gives them the direct-layer priority seat.
+    const lessonFlat: LessonPointerInput[] | undefined =
+      lessonGate === 'on' && lessonMatch !== undefined ? [lessonMatch.pointer] : undefined
     // ---- Slow-lane merge (log-only shadow gate; consumption bookkeeping) ----
     const slowPointers: SlowPointerInput[] = []
     const slowDelivered: SlowItem[] = []
@@ -620,14 +738,14 @@ export class TopicsService {
     let packageShadow: PackageResult | null | undefined
     let injection: AssembleResult
     if (!pointerMode) {
-      injection = assembleInjection(entries, { perTopicBudget: cfg.perTopicBudget, totalBudget: cfg.totalBudget }, slowPointers)
+      injection = assembleInjection(entries, { perTopicBudget: cfg.perTopicBudget, totalBudget: cfg.totalBudget }, slowPointers, lessonFlat)
     } else if (pkgMode === undefined) {
-      injection = assemblePointer(entries, { perTopicBudget: POINTER_PER_TOPIC, totalBudget: Math.min(cfg.totalBudget, POINTER_TOTAL) }, slowPointers)
+      injection = assemblePointer(entries, { perTopicBudget: POINTER_PER_TOPIC, totalBudget: Math.min(cfg.totalBudget, POINTER_TOTAL) }, slowPointers, lessonFlat)
     } else {
       // A-line relevance package (A3, spec §2): direct = lexical hits,
       // neighborhood = graph hits + slow picks, weak = reranked band head.
       const budget = { perTopicBudget: POINTER_PER_TOPIC, totalBudget: Math.min(cfg.totalBudget, POINTER_TOTAL) }
-      const legacy = assemblePointer(entries, budget, slowPointers)
+      const legacy = assemblePointer(entries, budget, slowPointers, lessonFlat)
       const direct: PackageCandidate[] = []
       const neighborhood: PackageCandidate[] = []
       for (const e of entries) {
@@ -643,6 +761,23 @@ export class TopicsService {
           via: e.hit.viaGraph ? 'graph' : undefined,
         }
         ;(e.hit.viaGraph ? neighborhood : direct).push(cand)
+      }
+      // Lesson priority seat (B2, spec 卷一 §6.3): 主层 ≤2 席中命中 lesson
+      // 至少 1 席 — sorts first and is exempt from the direct-seat cap
+      // (budget-bound). Only on the LIVE package leg; the legacy emit above
+      // carries the flat lesson entry instead (MJ-C).
+      if (lessonFlat !== undefined && lessonMatch !== undefined) {
+        direct.unshift({
+          slug: lessonMatch.pointer.slug,
+          title: lessonMatch.pointer.title,
+          status: lessonMatch.pointer.status,
+          description: lessonMatch.pointer.description,
+          conclusion: firstContentLine(lessonMatch.conclusion),
+          score: lessonMatch.pointer.score,
+          reasons: lessonMatch.reasons,
+          prioritySeat: true,
+          sourceTag: lessonSourceTag(lessonMatch.pointer.source),
+        })
       }
       for (const sp of slowPointers) {
         neighborhood.push({ slug: sp.slug, title: sp.title, status: sp.status, description: sp.description, score: 0, reasons: [], via: 'slow-pick' })
@@ -680,6 +815,14 @@ export class TopicsService {
     for (const pointer of slowPointers) {
       if (slowIncluded.includes(pointer.slug)) slowDelivered.push({ slug: pointer.slug, why: pointer.why })
     }
+    // ---- Lesson gate accounting (B2): what entered the context, the shadow
+    // bypass ledger (meta/lesson-shadow.jsonl — lesson seat vs no-lesson
+    // emitted disposition, same discipline as the package shadow), and the
+    // record fields (absent when the gate is off or nothing matched). ----
+    const lessonIncluded: string[] =
+      lessonGate === 'on' && lessonMatch !== undefined
+        ? injection.lessonIncluded ?? (injection.included.includes(lessonMatch.pointer.slug) ? [lessonMatch.pointer.slug] : [])
+        : []
     const record: InjectionRecord = {
       at: new Date().toISOString(),
       queryTokenCount: tokenize(effectiveQuery).length,
@@ -700,7 +843,7 @@ export class TopicsService {
       record.dropped = [...(record.dropped ?? []), ...unreadable.map((slug) => ({ slug, reason: 'doc-unreadable' }))]
     }
     if (pkgMode === 'shadow' && pointerMode) {
-      this.appendPackageShadowLedger({
+      this.appendShadowLedger(this.packageShadowLedgerPath(), {
         at: record.at,
         ...(sessionId !== undefined ? { sessionId } : {}),
         queryTokenCount: record.queryTokenCount,
@@ -713,6 +856,37 @@ export class TopicsService {
               : { tokens: packageShadow.usedTokens, included: packageShadow.included, layers: packageShadow.layers },
         nearFloorRerank: nearFloorRerank ?? null,
       })
+    }
+    if (lessonGate === 'shadow' && lessonMatch !== undefined) {
+      const rendered = lessonEntryText(lessonMatch.pointer, POINTER_PER_TOPIC)
+      const budgetTotal = pointerMode ? Math.min(cfg.totalBudget, POINTER_TOTAL) : cfg.totalBudget
+      this.appendShadowLedger(this.lessonShadowLedgerPath(), {
+        at: record.at,
+        ...(sessionId !== undefined ? { sessionId } : {}),
+        queryTokenCount: record.queryTokenCount,
+        lessonInject: 'shadow',
+        lessons: [
+          {
+            slug: lessonMatch.pointer.slug,
+            score: lessonMatch.pointer.score,
+            source: lessonMatch.pointer.source,
+            entryTokens: rendered.usedTokens,
+            wouldFit: injection.usedTokens + rendered.usedTokens <= budgetTotal,
+          },
+        ],
+        emitted: { tokens: injection.usedTokens, included: injection.included },
+      })
+    }
+    if (lessonGate !== undefined && lessonMatch !== undefined) {
+      record.lessonInject = lessonGate
+      record.lessons = [
+        {
+          slug: lessonMatch.pointer.slug,
+          score: lessonMatch.pointer.score,
+          source: lessonMatch.pointer.source,
+          included: lessonIncluded.length > 0,
+        },
+      ]
     }
     if (slow !== undefined) {
       if (slow.outcome !== undefined) record.slowOutcome = slow.outcome
@@ -746,7 +920,7 @@ export class TopicsService {
     if (slowExpired !== undefined && injection.text === '') record.lane = 'slow'
     if (injection.dropped.length > 0) record.dropped = [...(record.dropped ?? []), ...injection.dropped]
     void this.store.appendInjectionRecord(record).catch(() => undefined)
-    return { text: injection.text, outcome, deduped, echoed, included: injection.included, slowIncluded }
+    return { text: injection.text, outcome, deduped, echoed, included: injection.included, slowIncluded, lessonIncluded }
   }
 
   /**
@@ -860,6 +1034,9 @@ export class TopicsService {
       const doc = entry.doc
       // Same retirement rule as roster(): deprecated knowledge never injects.
       if (doc.fm.status === 'deprecated') continue
+      // Same lesson separation as roster() (B2): lessons inject only through
+      // the lessonInject gate, never the topic lane.
+      if (okf.topicKindOf(doc.fm.type) === 'lesson') continue
       out.push({
         slug: entry.slug,
         title: doc.fm.title,
@@ -871,6 +1048,69 @@ export class TopicsService {
         links: okf.bodyLinkSlugs(doc.body),
         generatedAt: doc.fm.generated.at,
         conclusion: okf.sectionOf(doc.body, okf.CONCLUSION_HEADING) ?? '',
+      })
+    }
+    return out
+  }
+
+  /** Established, scope-passing lesson entries (B2, spec 卷一 §6.3) — sync,
+   *  sharing the roster's mtime cache. Injection reads ONLY established
+   *  lessons here (MJ-3: hint 仅供审批队列展示，永不注入); scope filter =
+   *  workspace lessons must carry the current workspace id (MJ-2); scope=global
+   *  and legacy entries without a workspaceId pass (fail-open — the filter's
+   *  default is permissive, the confidence gate is the hard one). */
+  lessonsSync(): (RetrievableTopic & { confidence: okf.LessonConfidence; source: okf.LessonSource; scope: okf.LessonScope; workspaceId?: string })[] {
+    const ws = currentWorkspaceId()
+    let files: string[]
+    try {
+      files = readdirSync(this.store.topicsDir())
+    } catch {
+      return []
+    }
+    const out: (RetrievableTopic & { confidence: okf.LessonConfidence; source: okf.LessonSource; scope: okf.LessonScope; workspaceId?: string })[] = []
+    for (const file of files) {
+      if (!file.endsWith('.md') || file === 'index.md') continue
+      const path = join(this.store.topicsDir(), file)
+      let st
+      try {
+        st = statSync(path)
+      } catch {
+        continue
+      }
+      const cached = this.cache.get(file)
+      let entry = cached
+      if (cached === undefined || cached.mtimeMs !== st.mtimeMs || cached.size !== st.size) {
+        try {
+          const doc = okf.parseTopicDoc(readFileSync(path, 'utf8'))
+          entry = { mtimeMs: st.mtimeMs, size: st.size, doc, slug: file.slice(0, -3) }
+          this.cache.set(file, entry)
+        } catch {
+          this.cache.delete(file)
+          continue
+        }
+      }
+      if (entry === undefined) continue
+      const fm = entry.doc.fm
+      if (okf.topicKindOf(fm.type) !== 'lesson') continue
+      // Confidence 事实源：established ⇄ stable；deprecated 已被上面的通用
+      // 退休规则挡住，这里再兜一层（hint↔draft 永不注入）。
+      if (fm.confidence !== 'established' || fm.status === 'deprecated') continue
+      if (fm.scope === 'workspace' && fm.workspaceId !== undefined && fm.workspaceId !== ws) continue
+      out.push({
+        slug: entry.slug,
+        title: fm.title,
+        description: fm.description,
+        status: fm.status,
+        tags: fm.tags,
+        triggers: fm.triggers,
+        depends: fm.depends,
+        links: okf.bodyLinkSlugs(entry.doc.body),
+        generatedAt: fm.generated.at,
+        conclusion: okf.sectionOf(entry.doc.body, okf.CONCLUSION_HEADING) ?? '',
+        confidence: fm.confidence,
+        source: fm.source ?? 'manual',
+        scope: fm.scope ?? 'workspace',
+        ...(fm.workspaceId !== undefined ? { workspaceId: fm.workspaceId } : {}),
       })
     }
     return out
@@ -892,7 +1132,11 @@ export class TopicsService {
     }
   }
 
-  /** topic_save tool path: create or update with actor stamping. */
+  /** topic_save tool path: create or update with actor stamping. `kind:
+   *  'lesson'` (B2 data plane) switches the OKF type to Lesson and stamps the
+   *  lesson frontmatter (scope/confidence/source/workspaceId) with the
+   *  confidence↔status derivation (hint↔draft, established↔stable —
+   *  confidence is the fact source). */
   async saveTopic(input: {
     title: string
     description?: string
@@ -908,6 +1152,12 @@ export class TopicsService {
     recommendations?: string
     source?: 'model' | 'distill'
     slug?: string
+    /** B2 lesson data plane: entry kind (default topic). */
+    kind?: okf.TopicKind
+    scope?: okf.LessonScope
+    confidence?: okf.LessonConfidence
+    /** Lesson provenance (input.source above is the tool-path tag). */
+    lessonSource?: okf.LessonSource
   }): Promise<SaveResult & { slug: string }> {
     const now = new Date().toISOString()
     const existing = input.slug !== undefined ? await this.store.readTopic(input.slug) : undefined
@@ -922,9 +1172,10 @@ export class TopicsService {
     }
     const baseSlug = input.slug ?? okf.slugify(input.title)
     const slug = existing === undefined ? await this.store.uniqueSlug(baseSlug) : okf.slugify(input.slug ?? baseSlug)
+    const isLesson = input.kind === 'lesson' || (existing !== undefined && okf.topicKindOf(existing.fm.type) === 'lesson')
     // store.saveTopic stamps generated {by, at} itself (write-through actor).
     const fm: okf.TopicFrontmatter = {
-      type: 'Topic',
+      type: isLesson ? okf.kindTypeValue('lesson') : okf.kindTypeValue('topic'),
       title: input.title,
       tags: dedupeLower(input.tags ?? existing?.fm.tags ?? []),
       // normalizeDependsEntry, never bare slugToPath: the preserved-on-update
@@ -942,10 +1193,33 @@ export class TopicsService {
     // the stored list survives (same preserve-on-update semantics as tags).
     const triggers = sanitizeTriggers(input.triggers ?? existing?.fm.triggers ?? [])
     if (triggers.length > 0) fm.triggers = triggers
+    if (isLesson) {
+      // B2 frontmatter (spec 卷一 §6.2): preserve-on-update like tags; the
+      // workspace id is stamped AT WRITE TIME (MJ-2, cwd hash) and survives
+      // updates; confidence is the FACT source → status derives from it,
+      // except a deprecated lesson stays deprecated unless confidence is
+      // explicitly re-driven (no silent revival through topic_save).
+      fm.scope = input.scope ?? existing?.fm.scope ?? 'workspace'
+      fm.confidence = input.confidence ?? existing?.fm.confidence ?? 'hint'
+      fm.source = input.lessonSource ?? existing?.fm.source ?? 'manual'
+      if (fm.scope === 'workspace') {
+        const wsid = existing?.fm.workspaceId ?? currentWorkspaceId()
+        if (wsid !== undefined) fm.workspaceId = wsid
+      } else {
+        delete fm.workspaceId
+      }
+      fm.status =
+        existing?.fm.status === 'deprecated' && input.confidence === undefined
+          ? 'deprecated'
+          : okf.deriveLessonStatus(fm.confidence)
+    }
     if (existing !== undefined && existing.fm.verified !== undefined) fm.verified = existing.fm.verified
     const result = await this.store.saveTopic(
       { slug, doc: { fm, body }, links: input.links },
-      { message: existing === undefined ? `topics(topic): create ${slug}` : `topics(topic): update ${slug}`, created: existing === undefined },
+      {
+        message: existing === undefined ? `topics(${isLesson ? 'lesson' : 'topic'}): create ${slug}` : `topics(${isLesson ? 'lesson' : 'topic'}): update ${slug}`,
+        created: existing === undefined,
+      },
     )
     this.invalidate()
     void this.sync?.schedulePush()
@@ -954,6 +1228,132 @@ export class TopicsService {
 
   async observe(input: { kind: Observation['kind']; text: string; sessionId?: string; source?: 'model' | 'auto' }): Promise<Observation> {
     return this.store.appendObservation({ kind: input.kind, source: input.source ?? 'model', text: input.text, sessionId: input.sessionId })
+  }
+
+  // -------------------------------------------------------------------------
+  // Dual-write seams (卷二 §6.2 MJ-5) — the new repo's only write surface.
+  // Both run behind the store lock / index recompute; both audit the caller
+  // identity (opts.actor REQUIRED — a blank actor refuses the whole call and
+  // lands a `seam-*` audit row) into meta/pipeline-events.jsonl.
+  // -------------------------------------------------------------------------
+
+  /**
+   * ① 观察投喂: structured observations (B1 §2.1 whitelist, FEATURES ONLY —
+   * 对话原文禁入, 红线⑤) appended to the observations stream with the `fed`
+   * provenance marker and `kind: 'signal'`; each line carries `by: actor`.
+   * The whitelist copy drops unknown caller fields, caps detail entries and
+   * string sizes, and renders a sorted feature line as the observation text.
+   * Duplicates (same type+session+detail in the recent tail) are counted, not
+   * appended (重复观察由原仓去重). Fail-soft: one malformed entry is counted
+   * as rejected, never sinks the batch.
+   */
+  async feedObservations(obs: readonly StructuredObservation[], opts: { actor: string }): Promise<FeedResult> {
+    const actor = typeof opts?.actor === 'string' ? opts.actor.trim() : ''
+    const total = Array.isArray(obs) ? obs.length : 0
+    if (actor === '') {
+      await recordPipelineEvent(this.store.root, {
+        at: new Date().toISOString(),
+        kind: 'seam-observations-fed',
+        detail: { actor: '<missing>', accepted: 0, duplicates: 0, rejected: total, refused: true },
+      })
+      return { accepted: 0, duplicates: 0, rejected: total, ids: [], error: 'unauthorized' }
+    }
+    const accepted: string[] = []
+    let duplicates = 0
+    let rejected = 0
+    // Dedup window: the recent observation tail — the signal layer may retry
+    // on its own fail-open local queue (spec 卷二 §2.1) and identical feature
+    // tuples must not double-distill.
+    const recent = await this.store.allObservations(500)
+    const seenKeys = new Set(recent.map((o) => observationKey(o.kind, o.source, o.sessionId, o.text)))
+    for (const raw of obs) {
+      const clean = sanitizeStructuredObservation(raw)
+      if (clean === undefined) {
+        rejected += 1
+        continue
+      }
+      const text = renderFeatureLine(clean)
+      const key = observationKey('signal', 'fed', clean.sessionId, text)
+      if (seenKeys.has(key)) {
+        duplicates += 1
+        continue
+      }
+      seenKeys.add(key)
+      const saved = await this.store.appendObservation({
+        kind: 'signal',
+        source: 'fed',
+        text,
+        sessionId: clean.sessionId,
+        by: actor,
+      })
+      accepted.push(saved.id)
+    }
+    await recordPipelineEvent(this.store.root, {
+      at: new Date().toISOString(),
+      kind: 'seam-observations-fed',
+      detail: { actor, accepted: accepted.length, duplicates, rejected },
+    })
+    return { accepted: accepted.length, duplicates, rejected, ids: accepted }
+  }
+
+  /**
+   * ② lesson 状态变更 (B2/卷二 §6.2): hint→established / →deprecated /
+   * →removed. established flips confidence (the FACT source) and derives
+   * status (established↔stable); deprecated flips status only (the TTL sweep
+   * owns the rest); removed = archive FIRST (byte-exact copy to
+   * `archive/lessons/` inside the bundle, git-revertable — 红线④) then out of
+   * the roster, one commit. Each call lands a `seam-lesson-status` audit row.
+   */
+  async setLessonStatus(slug: string, to: 'established' | 'deprecated' | 'removed', opts: { actor: string }): Promise<StoreResult> {
+    const actor = typeof opts?.actor === 'string' ? opts.actor.trim() : ''
+    const clean = okf.slugify(slug ?? '')
+    const audit = async (ok: boolean, reason?: string, extra?: Record<string, string | number | boolean>): Promise<void> => {
+      await recordPipelineEvent(this.store.root, {
+        at: new Date().toISOString(),
+        kind: 'seam-lesson-status',
+        detail: { actor: actor === '' ? '<missing>' : actor, slug: clean, to, ok, ...(reason !== undefined ? { reason } : {}), ...(extra ?? {}) },
+      })
+    }
+    if (actor === '') {
+      await audit(false, 'unauthorized')
+      return { ok: false, slug: clean, reason: 'unauthorized' }
+    }
+    if (to !== 'established' && to !== 'deprecated' && to !== 'removed') {
+      await audit(false, 'invalid-state')
+      return { ok: false, slug: clean, reason: 'invalid-state' }
+    }
+    const doc = await this.store.readTopic(clean).catch(() => undefined)
+    if (doc === undefined) {
+      await audit(false, 'not-found')
+      return { ok: false, slug: clean, reason: 'not-found' }
+    }
+    if (okf.topicKindOf(doc.fm.type) !== 'lesson') {
+      await audit(false, 'not-a-lesson')
+      return { ok: false, slug: clean, reason: 'not-a-lesson' }
+    }
+    const from = doc.fm.confidence ?? 'hint'
+    if (to === 'removed') {
+      const r = await this.store.archiveLesson(clean, {
+        message: `topics(lesson): remove ${clean} (archive-first, by ${actor})`,
+      })
+      if (r === undefined) {
+        await audit(false, 'not-found')
+        return { ok: false, slug: clean, reason: 'not-found' }
+      }
+      await audit(true, undefined, { archivedTo: r.archivedTo, committed: r.committed })
+      this.invalidate()
+      return { ok: true, slug: clean, from, archivedTo: r.archivedTo, committed: r.committed }
+    }
+    if (to === 'established') doc.fm.confidence = 'established'
+    doc.fm.status = to === 'established' ? okf.deriveLessonStatus('established') : 'deprecated'
+    const result = await this.store.saveTopic(
+      { slug: clean, doc },
+      { message: `topics(lesson): ${to} ${clean} (by ${actor})`, actor },
+    )
+    this.invalidate()
+    void this.sync?.schedulePush()
+    await audit(true, undefined, { committed: result.committed })
+    return { ok: true, slug: clean, from, committed: result.committed }
   }
 
   async search(query: string, topK?: number): Promise<SearchOutcome> {
@@ -1001,6 +1401,61 @@ export class TopicsService {
 
 function inclusionDropped(injection: AssembleResult): boolean {
   return injection.dropped.length > 0
+}
+
+// --- feedObservations whitelist machinery (B-line seam ①) -------------------
+// jev/log REDACTION + pipeline-events discipline: whitelist copy on write,
+// bounded scalar features only — 对话原文（tool arguments、message content）
+// 结构上进不来（红线⑤）。
+
+const SEAM_TYPE_MAX_CHARS = 64
+const SEAM_SESSION_MAX_CHARS = 128
+const SEAM_DETAIL_MAX_ENTRIES = 16
+const SEAM_DETAIL_KEY_MAX_CHARS = 64
+const SEAM_DETAIL_VALUE_MAX_CHARS = 256
+
+/** Whitelist copy of one structured observation; undefined = reject. A raw
+ *  entry whose detail existed but sanitizes to EMPTY (object/array smuggle,
+ *  garbage values) is rejected outright — a type with no survivable features
+ *  is a malformed signal, not a featureless one. */
+function sanitizeStructuredObservation(raw: StructuredObservation): StructuredObservation | undefined {
+  if (raw === null || typeof raw !== 'object') return undefined
+  if (typeof raw.type !== 'string' || raw.type.trim() === '') return undefined
+  const out: StructuredObservation = { type: raw.type.trim().slice(0, SEAM_TYPE_MAX_CHARS) }
+  if (typeof raw.at === 'string' && raw.at !== '') out.at = raw.at
+  if (typeof raw.sessionId === 'string' && raw.sessionId !== '') out.sessionId = raw.sessionId.slice(0, SEAM_SESSION_MAX_CHARS)
+  const hadDetail = raw.detail !== undefined && typeof raw.detail === 'object' && !Array.isArray(raw.detail)
+  if (hadDetail) {
+    const detail: Record<string, string | number | boolean> = {}
+    for (const [k, v] of Object.entries(raw.detail as Record<string, unknown>)) {
+      if (Object.keys(detail).length >= SEAM_DETAIL_MAX_ENTRIES) break
+      if (typeof v === 'string') {
+        if (v !== '') detail[k.slice(0, SEAM_DETAIL_KEY_MAX_CHARS)] = v.slice(0, SEAM_DETAIL_VALUE_MAX_CHARS)
+      } else if (typeof v === 'number') {
+        if (Number.isFinite(v)) detail[k.slice(0, SEAM_DETAIL_KEY_MAX_CHARS)] = v
+      } else if (typeof v === 'boolean') {
+        detail[k.slice(0, SEAM_DETAIL_KEY_MAX_CHARS)] = v
+      }
+    }
+    if (Object.keys(detail).length === 0) return undefined
+    out.detail = detail
+  }
+  return out
+}
+
+/** Sorted feature line as the observation text: `[type] k=v k=v` — stable
+ *  (dedup-keyable), feature-only, bounded. */
+function renderFeatureLine(o: StructuredObservation): string {
+  const parts = Object.keys(o.detail ?? {})
+    .sort()
+    .map((k) => `${k}=${String((o.detail as Record<string, string | number | boolean>)[k])}`)
+  return `[${o.type}]${parts.length > 0 ? ` ${parts.join(' ')}` : ''}`.slice(0, 512)
+}
+
+/** Dedup key over the stored observation identity (kind/source/session/feature
+ *  line) — candidates key the same way they are stored. */
+function observationKey(kind: string, source: string, sessionId: string | undefined, text: string): string {
+  return `${kind}|${source}|${sessionId ?? ''}|${text}`
 }
 
 function firstLine(text: string): string {

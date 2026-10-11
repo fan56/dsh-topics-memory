@@ -77,6 +77,15 @@ export interface InjectionRecord {
    * Written once with the record, never backfilled (ilog append-only).
    */
   slowOutcome?: SlowOutcome
+  /**
+   * Lesson gate fields (B2, spec 卷一 §6.3/§7) — present only on rounds where
+   * lessonInject is shadow|on AND at least one established lesson matched the
+   * query. `lessons` is the trigger-channel match list with whether the entry
+   * entered the context; shadow rounds always carry included:false there (the
+   * double-compute lands in meta/lesson-shadow.jsonl instead).
+   */
+  lessonInject?: 'shadow' | 'on'
+  lessons?: { slug: string; score: number; source: string; included: boolean }[]
 }
 
 /**

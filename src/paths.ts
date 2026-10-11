@@ -13,6 +13,7 @@
  */
 
 import { existsSync, renameSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { homedir } from 'node:os'
 import { hostname as osHostname } from 'node:os'
 import { join } from 'node:path'
@@ -101,4 +102,18 @@ export function hostId(): string {
 /** The actor string stamped into `generated.by` for machine-written topics. */
 export function actorFor(): string {
   return `agent:dsh-topics-memory@${hostId()}`
+}
+
+/**
+ * Current workspace identifier for lesson scope filtering (B2 MJ-2, spec
+ * 卷一 §6.2): the sha256 prefix of the process cwd, overridable via
+ * $DSH_TOPICS_WORKSPACE_ID (tests / multi-root hosts; the override also lets
+ * a host pin one identity across chdirs). 拍板（spec 未钉死来源）: cwd hash at
+ * read time is the minimal viable source — the same derivation the lesson
+ * write path stamps into frontmatter.workspaceId, so no config plumbing.
+ */
+export function currentWorkspaceId(): string {
+  const env = process.env.DSH_TOPICS_WORKSPACE_ID?.trim()
+  if (env !== undefined && env !== '') return env
+  return createHash('sha256').update(process.cwd()).digest('hex').slice(0, 16)
 }
