@@ -9,21 +9,8 @@
 - **零打开衰减（`feat(retrieval)`，默认关、配置门控休眠上线）**：新增 `zeroOpenDecay` 键（默认 `false`，volatile 热更，`/topics set zero-open-decay on|off`）—— 滚动 30 天内真正注入 ≥5 次且 opens.jsonl 全期 0 次打开的 slug，命中分在 matchThreshold 裁剪前乘 0.5，reasons 追加 `zero-open-decay`；跌破阈值的候选自然落入 nearMisses 并带标签，日志可见原因。零打开规则抽成单一共享助手（`ilog.aggregateZeroOpen` + `renderedPointers`，stats 面板与打分衰减两消费方共用）；打分侧读 injections 尾部（`ZERO_OPEN_TAIL=500` 行，覆盖 30 天窗）+ opens 全量，mtime 缓存一轮至多读一次，读取失败 fail-open 跳过衰减。动机：24 个「注入 ≥5 次、0 打开」的高频话题长期霸榜，而 score 与打开仅弱相关（阈值 0.3 不动）。
 - **测试**：421 → 433（`aggregateZeroOpen`/`renderedPointers` 规则与 30 天窗口边界、面板窗口化零打开清单、`scoreTopic`/`searchTopics` 衰减与 nearMiss 降落、service e2e 默认关逐字节不变 / 开衰减 / 打开一次豁免 / <5 轮 / 窗外不计、config 键解析）；既有用例零改动保持绿。
 
-## Unreleased（注入质量线 wave/injection-quality；随 wave 统一发版，不单独 tag）
 
-A 线注入质量实现（wayfinder self-improve 图决议，全部 default off——`packageMode` 三态总闸 `off|shadow|on` 默认 `off`，关闭时行为与 0.22.0 逐字节一致，守卫测试钉死）：
-
-- **相关性三层信息包（A3，`feat(digest)`）**：`assemblePackage` 纯函数——直接相关（≤2×~120 tok，机器拼 why 行+指令式 topic_open 打开引导+收益预告）/邻域（≤3×~40 tok，图扩展与慢道 picks 带边来源）/弱信号（nearFloor 头部 ≤2 合并一行）；包头一句「为什么是这批」；预算分层装箱总 600 硬顶；琐碎 query 降档双臂（tokenize ≤3 或去空白 ≤16 字且无名词实体）→ 整包跳过 0 tok。pointer/digest 双模式并存，门控在 service 层。
-- **语义重排器（A4，`feat(retrieval)`）**：`sanitizeQuery`（剥 code fence/URL/提示符+96 token 上限截断，治 p90=462 的粘贴污染）；`meta/embeddings.json` 本地索引 + `rerankNearFloor`（ollama nomic-embed-text，仅重排 0.20–0.30 带，任何失败原序透传）；`embedQuerySync` 同步 query embed（250ms 硬超时，ADR 0017 本地例外）；boot 期索引校验+增量重建（packageMode 关时零动作）。新增 `embeddingProvider`（v1 仅 `ollama`）/`embeddingModel`/`packageMode` 三键（全 volatile）。
-- **慢道全留痕（A4，`feat(quality)`）**：`SlowOutcome` 七态枚举（no-run/no-claim/no-candidates/llm-error/timeout/delivered/expired）贯穿 dispatch/produce/consume/expire 全路径，随 pending 进 ilog `slowOutcome` 字段；produce 静默吞错改为「吞异常+必落 outcome」——治 484 轮零交付不可诊断。
-- **管线事件账（A2/A6/A4，`feat(pipeline)`）**：`meta/pipeline-events.jsonl`（jev-log 纪律：字段白名单/512KB 紧缩/写失败静默），kind：slow-lane-outcome / distill-op-invalid / distill-op-retry-exhausted / link-ref-rejected。
-- **蒸馏建边+op 硬校验（A2/A6，`feat(distill)`）**：SYSTEM_PROMPT create/update 增 `links` 字段（白名单=已存在 slug∪本批 op slug，非法剔除落账）；create op 的 triggers/description 缺失重试一次仍缺即丢 op 落账（被丢观察走既有纠错路径不静默）；links 落正文 `# Links` 段 wikilinks——既有 bodyLinkSlugs→backlinks→图游走链路自动纳边，零新增边类型。
-- **shadow 旁路账（A5，`feat(service)`）**：`packageMode=shadow` 时新旧注入同轮双算，对比落 `meta/package-shadow.jsonl`（特征字段不含 query 原文）。
-- **测试**：436 → 507（embedding 客户端 mock 全 outcome/query 清洗 golden/语义重排合成向量+降级/三键 config/三层包 golden 与降档/slowOutcome 全路径定性/pipeline-events 白名单紧缩/distill links 白名单与 schema 门/store links 落库）；default-off 逐字节守卫（双服务 deepEqual）沿用 zeroOpenDecay 家法。
-
-## Unreleased（dsh 0.1.7-rc.1 迁移；随 wave 统一发版，不单独 tag）
-
-### dsh 0.2.0-rc.2（0.2.0 迁移波叠加，同随 wave 发版）
+### 0.2.0-rc.2 地板抬升（勘误归档：该改动实际随 0.22.0 发布——0.22.0 的 peer 地板已是 rc.2，此节 0.22.0 发版时漏切）
 
 raise dsh host floor to 0.2.0-rc.2（peer floors：dsh-tools / dsh-llm / dsh-settings / dsh-skill / dsh-commands / dsh-util-values `>=0.1.7-rc.1` → `>=0.2.0-rc.2`；devDeps 闭包十六包同步钉 0.2.0-rc.2；`package-lock.json` 同步重生成，`npm ci` 兼容）。
 
@@ -43,6 +30,18 @@ dsh 支持下限抬到 `>= 0.1.7-rc.1`（peer floors：dsh-tools / dsh-llm / dsh
 - **Plugin Manager 展示元数据**：新增 icon.svg 与 locale/{en,zh}.json（`meta.title`/`meta.description`，官方 readPluginMeta 约定），package.json 声明 `icon` 并将两者入包。
 - **旧 settings 段一次性自动迁移（0.1.5→0.1.7 升级无感知）**：0.1.7 宿主把旧 settings.yaml 按「section 名 = entry id」一次性导入并改名 `settings.yaml.imported`，而本插件旧段名是 `topics` ≠ entry id `dsh-topics-memory`——用户的旧配置被静默丢弃。新增 `src/legacy-import.ts`：boot 时读 `settings.yaml.imported`（兜底 `settings.yaml`）的 `topics:` 平铺段（纯函数解析器：只收直接子级标量，剥引号、number/boolean 推断、单行引号包裹的流式 JSON 解析；嵌套块/折叠值保守跳过），仅把「旧值 ≠ 当前生效值」（Volatile ref `.get()` 读）的键经 `ctx.settings.update('dsh-topics-memory', patch)` 写回，成功后落审计档 `~/.dsh/storages/dsh-topics-memory/legacy-import.json`（`{at, outcome, source, imported, skipped}`，outcome 含 imported/no-op/no-legacy/no-section）——marker 已存在则整个迁移跳过（幂等防复活）；update 失败不写 marker 下次 boot 重试；settings seam 不可用不读不写；全程 try/catch 只 warn，绝不影响激活。apply() 改为 async（import 位于函数体末尾，其上全部注册保持同步；cordis 4 将返回的 promise 作为 setup barrier 等待）。测试 +18（`legacy-import.test.mjs`：解析器纯函数 7 例 + fake-seam 导入逻辑 11 例）。
 - **System One 决策层（实验，default off）**：慢车道 rerank 换 jev 批量 noul 门控、整理 lane pair 前置过滤、快道词法门 shadow 对账（verdict 只落 decisions.jsonl，不碰 ilog 注入记录）、`meta/decisions.jsonl` 三层埋点（本地 only、脱敏）、secret gate 内嵌（出网前完整 body 扫描，命中不发送）；config 新增 `jev*` 七键（前述五键 + `jevLayaFallback` / `jevLayaUrl`：本地 laya 陪跑，默认关——纯遥测对照（真实负载实测 laya 批内排序与主路一致率 0/14，不接管决策），判定行新增 `backend`/`degraded` 两列），失败一律 fail-open 回退现行为（ADR 0016–0019；设计全文 `docs/design/2026-09-25-system-one-integration.md`）。新增随包 skill `dsh-topics-memory-laya`：laya 陪跑的安装/启动/配置/验证向导。
+
+## 0.23.0 - 2026-10-11
+
+A 线注入质量实现（wayfinder self-improve 图决议，全部 default off——`packageMode` 三态总闸 `off|shadow|on` 默认 `off`，关闭时行为与 0.22.0 逐字节一致，守卫测试钉死）：
+
+- **相关性三层信息包（A3，`feat(digest)`）**：`assemblePackage` 纯函数——直接相关（≤2×~120 tok，机器拼 why 行+指令式 topic_open 打开引导+收益预告）/邻域（≤3×~40 tok，图扩展与慢道 picks 带边来源）/弱信号（nearFloor 头部 ≤2 合并一行）；包头一句「为什么是这批」；预算分层装箱总 600 硬顶；琐碎 query 降档双臂（tokenize ≤3 或去空白 ≤16 字且无名词实体）→ 整包跳过 0 tok。pointer/digest 双模式并存，门控在 service 层。
+- **语义重排器（A4，`feat(retrieval)`）**：`sanitizeQuery`（剥 code fence/URL/提示符+96 token 上限截断，治 p90=462 的粘贴污染）；`meta/embeddings.json` 本地索引 + `rerankNearFloor`（ollama nomic-embed-text，仅重排 0.20–0.30 带，任何失败原序透传）；`embedQuerySync` 同步 query embed（250ms 硬超时，ADR 0017 本地例外）；boot 期索引校验+增量重建（packageMode 关时零动作）。新增 `embeddingProvider`（v1 仅 `ollama`）/`embeddingModel`/`packageMode` 三键（全 volatile）。
+- **慢道全留痕（A4，`feat(quality)`）**：`SlowOutcome` 七态枚举（no-run/no-claim/no-candidates/llm-error/timeout/delivered/expired）贯穿 dispatch/produce/consume/expire 全路径，随 pending 进 ilog `slowOutcome` 字段；produce 静默吞错改为「吞异常+必落 outcome」——治 484 轮零交付不可诊断。
+- **管线事件账（A2/A6/A4，`feat(pipeline)`）**：`meta/pipeline-events.jsonl`（jev-log 纪律：字段白名单/512KB 紧缩/写失败静默），kind：slow-lane-outcome / distill-op-invalid / distill-op-retry-exhausted / link-ref-rejected。
+- **蒸馏建边+op 硬校验（A2/A6，`feat(distill)`）**：SYSTEM_PROMPT create/update 增 `links` 字段（白名单=已存在 slug∪本批 op slug，非法剔除落账）；create op 的 triggers/description 缺失重试一次仍缺即丢 op 落账（被丢观察走既有纠错路径不静默）；links 落正文 `# Links` 段 wikilinks——既有 bodyLinkSlugs→backlinks→图游走链路自动纳边，零新增边类型。
+- **shadow 旁路账（A5，`feat(service)`）**：`packageMode=shadow` 时新旧注入同轮双算，对比落 `meta/package-shadow.jsonl`（特征字段不含 query 原文）。
+- **测试**：436 → 507（embedding 客户端 mock 全 outcome/query 清洗 golden/语义重排合成向量+降级/三键 config/三层包 golden 与降档/slowOutcome 全路径定性/pipeline-events 白名单紧缩/distill links 白名单与 schema 门/store links 落库）；default-off 逐字节守卫（双服务 deepEqual）沿用 zeroOpenDecay 家法。
 
 ## 0.17.1 (2026-09-21)
 
