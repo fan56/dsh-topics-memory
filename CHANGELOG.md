@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+B 线蒸馏 lesson 分支（wayfinder self-improve B2 决议 3①，spec 卷二 §3.1 批量通道的「提炼」环节——lessons 回路的观察经写缝①投喂后在原仓蒸馏 lane 产出 lesson ops。纯数据面增量，无新 config 键：蒸馏产 lesson 不受 `lessonInject` 闸管，闸 off 时 lesson 照产不注入，正是设计；`lessonInject`/`packageMode` 全默认时注入侧行为逐字节不变）：
+
+- **蒸馏输入分流（`feat(distill)`）**：批处理循环按观察来源分流——`feedObservations` 投喂的 `kind:'signal'`+`source:'fed'` 结构化信号观察（排序特征行，无对话原文）进 lesson prompt 分支；普通观察走现行 `SYSTEM_PROMPT` 逐字节不动（分流判定=fed∧signal 精确组合）。混合窗口每次迭代只跑一个子池（topic 子池保有批头优先权，topic lane 的 GC/纠错/停机语义零漂移），另一子池留在池内下轮取。
+- **LESSON_PROMPT 分支（`feat(distill)`）**：判定问句「违反它会犯错误吗？」入 prompt——指向可执行行为规则的信号才立 lesson，给不出行动指令的信号批明确输出 `{"ops":[]}` 无教训可立（宁缺勿滥，空结果观察走既有 3 次 GC 不静默丢）；产出只允许 create 的 lesson op（`kind:'lesson'` + title 条件式短句 + triggers 3-8 condition 触发词 + conclusion 祈使句 action + scope `workspace|global`），非 create 形态在 lesson 分支丢弃（lesson 生命周期是审批门领地）；落库经 saveTopic lesson 分支，`confidence:'hint'`+`source:'distilled'` 由 lane 盖章（B4 审批门升 established，`setLessonStatus` 是唯一晋升写路径），scope 缺省落 workspace、global 不记 workspaceId。
+- **矛盾自查（基线版，`feat(distill)`）**：lesson 分支 prompt 附带现有 established lessons 的 slug/title/triggers 清单（hint 不入基线——未成规范无可矛盾），候选与已有教训同情境相反做法时输出 `conflictsWith:[slug]`（白名单=基线清单内 slug，幻 slug 不落账）；每条命中落 pipeline-events 新事件 `lesson-conflict-flagged`（detail 含 op/冲突清单/声明数），处置=仍产 hint 草稿、不改任何生命周期状态，新覆旧由 B4 审批门裁决；run detail 增 `conflict-flagged N lesson draft(s)` 注记。
+- **lesson op schema 门适配（`feat(distill)`）**：triggers 3-8（与 topic 同款强字段契约）+ conclusion(action) 必填 + scope 枚举校验（缺省不算缺陷——落库默认 workspace，非法值才算）；补问重试一次仍缺丢弃并落账，沿用 `distill-op-invalid`/`distill-op-retry-exhausted` 词汇；observed_ids 桥语义不变——落库后来源观察 markDistilled（distilledInto=lesson slug），纠错重试与 schema 补问均留在对应分支的 prompt 上。
+- **测试**：529 → 543（`distill-lesson.test.mjs` 14 例：LESSON_PROMPT 契约/SYSTEM_PROMPT 无 lesson 串扰/分流与混合窗口双子池隔离/lesson frontmatter 落库/consumed 闭环/判定问句空结果/update 形态丢弃/conflictsWith 落账与幻 slug/schema 门三态/observed_ids 纠错留 lesson prompt）；既有 529 例零改动全绿（含 distill/links 的 prompt 断言）。
+
 ## 0.24.0 - 2026-10-11
 
 B 线 lesson 数据面 + 双写缝（wayfinder self-improve 图 B2/C1/B4 决议，全部 default off——`lessonInject` 三态总闸 `off|shadow|on` 默认 `off`，关闭且无 lesson 数据时行为与 0.23.0 逐字节一致，守卫测试钉死）：
