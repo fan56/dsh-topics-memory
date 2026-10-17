@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **0.2.1 wave verification (`chore(deps)`)**: devDependencies `@deepseek-ai/*` host packages re-pinned `0.2.0-rc.2` → `0.2.1-rc.2` (15 of 16; `dsh-invariants` stays at `0.2.0-rc.2` — no 0.2.1 release exists upstream and the rc.2 host closure no longer depends on it). Peer-dependency floors untouched. CI dsh install restored to newest-of(latest/next) runtime resolution (reverting the 2026-10-17 pin). Full suite against the rc.2 dev closure: tsc check clean, 543 pass / 0 fail / 1 skipped, real-host smoke boot PASS.
+
 ## 0.25.0 - 2026-10-11
 
 B 线蒸馏 lesson 分支（wayfinder self-improve B2 决议 3①，spec 卷二 §3.1 批量通道的「提炼」环节——lessons 回路的观察经写缝①投喂后在原仓蒸馏 lane 产出 lesson ops。纯数据面增量，无新 config 键：蒸馏产 lesson 不受 `lessonInject` 闸管，闸 off 时 lesson 照产不注入，正是设计；`lessonInject`/`packageMode` 全默认时注入侧行为逐字节不变）：
