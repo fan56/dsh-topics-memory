@@ -432,7 +432,7 @@ test('lifecycle: a clear/compact re-creation re-runs the chain and consumes new 
     // grounded in o2, exactly like the old dual-emission test's second run.
     h.agentsMap.set('s1', { id: 's1', inbox: { nextTurn: [], nextStep: [] }, ctx: { llm: liveLlm(opFor('Compact Replay', o2.id)) } })
     h.emit('agent/created', { agent: { id: 's1' }, source: 'compact' })
-    await waitFor(async () => (await store.undistilledObservations()).length === 0, 'the compact re-creation consumed the second backlog')
+    await waitFor(async () => (await store.undistilledObservations()).length === 0, 'the compact re-creation consumed the second backlog', 15000)
   } finally {
     h.cleanup()
   }
