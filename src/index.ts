@@ -891,10 +891,11 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
   // `agent/created` listener and a throw or rejection ROLLS THE ENTIRE AGENT
   // CREATION BACK. This listener is therefore total and synchronous — it
   // never throws, never returns a promise — and the chain is deferred off
-  // the creation transaction entirely (setImmediate, unref'd): the pull /
+  // the creation transaction entirely (1.5s unref'd timer): the pull /
   // replay-distill / consolidation slow work starts only after the serial
-  // dispatch has moved on. Plugin initialization must never block, delay,
-  // or abort session startup; a chain failure at most warns.
+  // dispatch has moved on and the first frame is up. Plugin initialization
+  // must never block, delay, or abort session startup; a chain failure at
+  // most warns.
   const runBootChain = (sessionId: string) => {
     // Contained at the top too: a synchronous prologue throw (config read,
     // sync bookkeeping) must degrade to a warn, not leak toward the host.
@@ -987,11 +988,14 @@ export async function apply(ctx: Context, config: TopicsRuntimeConfig = {}): Pro
     try {
       const sessionId = String(payload?.agent?.id ?? '')
       if (sessionId === '') return
-      // Off the creation transaction: the unref'd immediate fires after the
-      // current serial dispatch slice, so the chain's synchronous prologue
-      // (config read, sync state) never delays the remaining listeners nor
-      // the loop start, and the timer cannot hold a dying process open.
-      const deferred = setImmediate(() => runBootChain(sessionId))
+      // Off the creation transaction AND off the boot window: the unref'd
+      // 1.5s timer fires after the serial dispatch has fully moved on and
+      // after the host's first frame, so the pull's git/DNS child processes
+      // never compete with startup I/O on a cold (possibly network-starved)
+      // machine — the 2026-10-19 boot-stall report showed the boot window
+      // and the fetch share the same constrained threadpool on a flaky VPN.
+      // The timer cannot hold a dying process open.
+      const deferred = setTimeout(() => runBootChain(sessionId), 1500)
       deferred.unref?.()
     } catch (error) {
       warn(`dsh-topics-memory boot 链触发失败（不影响会话启动）：${error instanceof Error ? error.message : String(error)}`)

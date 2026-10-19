@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.25.1 - 2026-10-19
+
+- fix: start the boot chain (pull → replay-distill → consolidation → TTL
+  sweep → embedding refresh) on a 1.5s unref'd timer instead of
+  setImmediate, so the pull's git/DNS child processes never compete with
+  the host's first-frame I/O on a cold, network-starved machine (the
+  2026-10-19 boot-stall report: the fetch and startup share the same
+  constrained threadpool on a flaky VPN). Chain order, single-flight gates
+  and failure handling unchanged.
+
 - **0.2.1 wave verification (`chore(deps)`)**: devDependencies `@deepseek-ai/*` host packages re-pinned `0.2.0-rc.2` → `0.2.1-rc.2` (15 of 16; `dsh-invariants` stays at `0.2.0-rc.2` — no 0.2.1 release exists upstream and the rc.2 host closure no longer depends on it). Peer-dependency floors untouched. CI dsh install restored to newest-of(latest/next) runtime resolution (reverting the 2026-10-17 pin). Full suite against the rc.2 dev closure: tsc check clean, 543 pass / 0 fail / 1 skipped, real-host smoke boot PASS.
 
 ## 0.25.0 - 2026-10-11
